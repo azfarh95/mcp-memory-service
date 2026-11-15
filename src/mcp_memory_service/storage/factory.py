@@ -127,11 +127,55 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
 
     # Create storage instance based on backend type
     if StorageClass.__name__ == "SqliteVecMemoryStorage":
-        storage = StorageClass(
-            db_path=sqlite_path,
-            embedding_model=EMBEDDING_MODEL_NAME
-        )
-        logger.info("Initialized SQLite-vec storage at %s", _sanitize_log_value(sqlite_path))
+        from ..config import EMBED_BACKEND, PARALLEL_INDEX, VOYAGE_DATABASE_PATH
+        from .mixins.embeddings import EmbeddingsMixin
+
+        effective_embed, reason = EmbeddingsMixin.resolve_embed_backend(sqlite_path)
+
+        if (EMBED_BACKEND == "voyage" and effective_embed == "voyage" and reason == "key"
+                and PARALLEL_INDEX and VOYAGE_DATABASE_PATH):
+            # Parallel index: Voyage primary in its own file (1024-dim) with the classic
+            # local index (384-dim) kept live as the fallback and complete source of truth.
+            from .parallel import ParallelSqliteVecStorage
+
+            primary = StorageClass(
+                db_path=VOYAGE_DATABASE_PATH,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="voyage",
+            )
+            secondary = StorageClass(
+                db_path=sqlite_path,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="local",
+            )
+            storage = ParallelSqliteVecStorage(primary=primary, secondary=secondary)
+            logger.info(
+                "Initialized parallel SQLite-vec storage: voyage at %s (primary) + local at %s (fallback)",
+                _sanitize_log_value(VOYAGE_DATABASE_PATH), _sanitize_log_value(sqlite_path))
+        elif EMBED_BACKEND == "voyage" and reason == "explicit-no-key":
+            # Operator named voyage but there is no key: honour it so the misconfiguration
+            # is visible, and point at the voyage file (the local one is 384-dim).
+            storage = StorageClass(
+                db_path=VOYAGE_DATABASE_PATH or sqlite_path,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="voyage",
+            )
+            logger.warning(
+                "MCP_MEMORY_EMBED_BACKEND=voyage was explicitly set but no Voyage API key is "
+                "configured; storage creation will fail with an actionable error.")
+        else:
+            # Ambient default with no key: run local so semantic search keeps working.
+            storage = StorageClass(
+                db_path=sqlite_path,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="local" if EMBED_BACKEND == "voyage" else None,
+            )
+            if EMBED_BACKEND == "voyage":
+                logger.warning(
+                    "Voyage is the default embedding backend but no API key is configured - "
+                    "using local embeddings. Set MCP_VOYAGE_API_KEY or the keyring entry, or set "
+                    "MCP_MEMORY_EMBED_BACKEND=local to silence this warning.")
+            logger.info("Initialized SQLite-vec storage at %s", _sanitize_log_value(sqlite_path))
 
     elif StorageClass.__name__ == "CloudflareStorage":
         storage = StorageClass(

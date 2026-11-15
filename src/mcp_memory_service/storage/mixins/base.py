@@ -54,12 +54,18 @@ class BaseMixin:
         """SQLite-vec backend supports content chunking with metadata linking."""
         return True
 
-    def __init__(self, db_path: str, embedding_model: str = "all-MiniLM-L6-v2"):
+    def __init__(self, db_path: str, embedding_model: str = "all-MiniLM-L6-v2", embed_backend: str = None):
         """Initialize SQLite-vec storage."""
         self.db_path = db_path
         self.embedding_model_name = embedding_model
         self.conn = None
         self.embedding_model = None
+        # Force one backend for this instance ('voyage'/'local'); the parallel wrapper
+        # runs one of each in a single process.
+        self.embed_backend_override = embed_backend
+        # Failure signal for callers distinguishing "embedder down" from "no matches".
+        self.embedding_failure_count = 0
+        self.embedding_last_error = None
         self.embedding_dimension = 384  # Default for all-MiniLM-L6-v2
         self._initialized = False
 
