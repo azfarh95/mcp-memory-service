@@ -1,0 +1,311 @@
+# Copyright 2024 Heinrich Krupp
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Parallel index storage: Voyage (cloud) primary + local MiniLM fallback.
+
+One sqlite-vec file per embedding backend — MiniLM vectors are 384-dim, Voyage
+1024-dim, and sqlite-vec bakes the dimension into the vec0 schema, so the two
+vector spaces can never share a table. This wrapper keeps BOTH indexes live:
+
+- **Writes** go to both backends (secondary first — it is the durable, always-
+  available source of truth; primary best-effort). If the Voyage write fails,
+  the memory still lands in the local index and is marked ``embed_pending``;
+  ``scripts/maintenance/voyage_backfill.py`` catches the primary up later.
+- **Semantic reads** prefer the primary; on Voyage failure they fall back to
+  the secondary index and flag every result (never a silent vector-space swap).
+- **Non-embedding reads** (by tag/time/hash) are served from the secondary,
+  which always holds the complete memory set.
+- **Deletes/updates** apply to both.
+
+Anything not explicitly overridden is delegated to the primary via
+``__getattr__`` (the primary and secondary are both full
+``SqliteVecMemoryStorage`` instances).
+"""
+
+import logging
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from ..models import Memory, MemoryQueryResult
+
+logger = logging.getLogger(__name__)
+
+# After a primary write/read failure, skip the primary for this long: one
+# Voyage outage must not add multi-second retry storms to every call. The
+# backfill script is the recovery path, not per-request retries.
+_PRIMARY_COOLDOWN_SECONDS = 60.0
+
+
+class ParallelSqliteVecStorage:
+    """Voyage-primary storage wrapper over two SqliteVecMemoryStorage instances.
+
+    Deliberately duck-typed (not a MemoryStorage subclass): the base class gives
+    every interface method a default body, which would shadow the __getattr__
+    delegation and silently serve empty results instead of delegating. The
+    wrappers below implement the interface explicitly; everything else
+    delegates to the secondary. Call sites only use type hints, never
+    isinstance checks.
+    """
+
+    def __init__(self, primary, secondary):
+        self.primary = primary
+        self.secondary = secondary
+        self.primary_last_error: Optional[str] = None
+        self._primary_down_until: float = 0.0
+
+    # ------------------------------------------------------------------ init
+
+    async def initialize(self) -> None:
+        await self.secondary.initialize()
+        await self.primary.initialize()
+
+    async def close(self) -> None:
+        for child in (self.primary, self.secondary):
+            closer = getattr(child, "close", None)
+            if closer:
+                try:
+                    result = closer()
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception as exc:
+                    logger.warning("Error closing child storage: %s", exc)
+
+    # ------------------------------------------------------- failure helpers
+
+    def _primary_available(self) -> bool:
+        return time.time() >= self._primary_down_until
+
+    def _mark_primary_down(self, error: str) -> None:
+        self.primary_last_error = error
+        self._primary_down_until = time.time() + _PRIMARY_COOLDOWN_SECONDS
+        logger.warning("Voyage primary unavailable (%s); using local index", error)
+
+    @staticmethod
+    def _mark_embed_pending(memory: Memory) -> Memory:
+        try:
+            memory.metadata = {**(memory.metadata or {}), "embed_pending": "voyage"}
+        except Exception:
+            pass
+        return memory
+
+    @staticmethod
+    def _flag_degraded(results: List[MemoryQueryResult]) -> List[MemoryQueryResult]:
+        for result in results or []:
+            try:
+                if result.memory is not None:
+                    result.memory.metadata = {
+                        **(result.memory.metadata or {}),
+                        "_degraded_backend": "local",
+                    }
+            except Exception:
+                pass
+        return results
+
+    async def _store_secondary_only(self, memory: Memory) -> Tuple[bool, str]:
+        self._mark_embed_pending(memory)
+        return await self.secondary.store(memory, store="default")
+
+    # --------------------------------------------------------------- writes
+
+    async def store(self, memory: Memory, skip_semantic_dedup: bool = False, store: Optional[str] = "default") -> Tuple[bool, str]:
+        """Write to the local index always; mirror into the Voyage index best-effort."""
+        result = await self.secondary.store(memory, skip_semantic_dedup=skip_semantic_dedup, store=store)
+        if not result[0]:
+            return result
+
+        if self._primary_available():
+            try:
+                primary_result = await self.primary.store(memory, skip_semantic_dedup=True, store=store)
+                if not primary_result[0] and "Failed to generate embedding" in primary_result[1]:
+                    self._mark_primary_down(primary_result[1])
+                    self._mark_embed_pending(memory)
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+                self._mark_embed_pending(memory)
+        return result
+
+    async def store_batch(self, memories: List[Memory]) -> List[Tuple[bool, str]]:
+        secondary_results = await self.secondary.store_batch(memories)
+        if self._primary_available():
+            try:
+                primary_results = await self.primary.store_batch(memories)
+                for i, (ok, msg) in enumerate(primary_results):
+                    if not ok and "Failed to generate embedding" in msg:
+                        self._mark_primary_down(msg)
+                        self._mark_embed_pending(memories[i])
+                        break
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+                for memory in memories:
+                    self._mark_embed_pending(memory)
+        return secondary_results
+
+    # ------------------------------------------------------ semantic reads
+
+    async def retrieve(self, query: str, n_results: int = 5, **kwargs) -> List[MemoryQueryResult]:
+        if self._primary_available():
+            try:
+                return await self.primary.retrieve(query, n_results, **kwargs)
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+        results = await self.secondary.retrieve(query, n_results, **kwargs)
+        return self._flag_degraded(results)
+
+    async def recall(self, query: str, n_results: int = 5, **kwargs) -> List[Memory]:
+        if self._primary_available():
+            try:
+                return await self.primary.recall(query, n_results, **kwargs)
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+        return await self.secondary.recall(query, n_results, **kwargs)
+
+    async def recall_memory(self, query: str, n_results: int = 5) -> List[Memory]:
+        return await self.recall(query, n_results)
+
+    async def search(self, query: str, n_results: int = 5) -> List[MemoryQueryResult]:
+        if self._primary_available():
+            try:
+                return await self.primary.search(query, n_results)
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+        return self._flag_degraded(await self.secondary.search(query, n_results))
+
+    # --------------------------------------------------------- maintenance
+
+    async def delete(self, content_hash: str) -> Tuple[bool, str]:
+        secondary_result = await self.secondary.delete(content_hash)
+        if self._primary_available():
+            try:
+                await self.primary.delete(content_hash)
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+        return secondary_result
+
+    async def delete_by_tag(self, tag: str) -> Tuple[int, str]:
+        count, msg = await self.secondary.delete_by_tag(tag)
+        if self._primary_available():
+            try:
+                await self.primary.delete_by_tag(tag)
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+        return count, msg
+
+    async def delete_by_tags(self, tags: List[str]) -> Tuple[int, str, List[str]]:
+        count, msg, hashes = await self.secondary.delete_by_tags(tags)
+        if self._primary_available():
+            try:
+                await self.primary.delete_by_tags(tags)
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+        return count, msg, hashes
+
+    async def purge_deleted(self, older_than_days: int = 30) -> int:
+        count = await self.secondary.purge_deleted(older_than_days)
+        if self._primary_available():
+            try:
+                await self.primary.purge_deleted(older_than_days)
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+        return count
+
+    async def update_memory_metadata(self, content_hash: str, updates: Dict[str, Any], preserve_timestamps: bool = True) -> Tuple[bool, str]:
+        result = await self.secondary.update_memory_metadata(content_hash, updates, preserve_timestamps)
+        if self._primary_available():
+            try:
+                await self.primary.update_memory_metadata(content_hash, updates, preserve_timestamps)
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+        return result
+
+    async def update_memory(self, memory: Memory) -> bool:
+        result = await self.secondary.update_memory(memory)
+        if self._primary_available():
+            try:
+                await self.primary.update_memory(memory)
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+        return result
+
+    # ---------------------------------------------------- status / health
+
+    async def health_probe(self) -> bool:
+        return await self.secondary.health_probe()
+
+    def get_backend_type(self) -> str:
+        return "sqlite_vec+voyage_parallel"
+
+    async def get_stats(self) -> Dict[str, Any]:
+        stats = await self.secondary.get_stats()
+        stats["storage_backend"] = self.get_backend_type()
+        stats["parallel_index"] = {
+            "primary_backend": self.primary.get_backend_type(),
+            "primary_model": getattr(self.primary, "embedding_model_name", None),
+            "primary_dimension": getattr(self.primary, "embedding_dimension", None),
+            "primary_last_error": self.primary_last_error,
+            "primary_available": self._primary_available(),
+            "secondary_model": getattr(self.secondary, "embedding_model_name", None),
+            "secondary_dimension": getattr(self.secondary, "embedding_dimension", None),
+        }
+        return stats
+
+    @property
+    def embedding_model_name(self) -> str:
+        primary_model = getattr(self.primary, "embedding_model_name", "voyage")
+        secondary_model = getattr(self.secondary, "embedding_model_name", "local")
+        return f"voyage-parallel(primary={primary_model}, fallback={secondary_model})"
+
+    # ---------------------------------------------------------- delegation
+
+    @property
+    def max_content_length(self) -> Optional[int]:
+        return self.secondary.max_content_length
+
+    @property
+    def supports_chunking(self) -> bool:
+        return self.secondary.supports_chunking
+
+    async def search_by_tag(self, tags: List[str], time_start: Optional[float] = None):
+        """Non-embedding read: served from the secondary (complete index)."""
+        return await self.secondary.search_by_tag(tags, time_start)
+
+    async def search_by_tags(self, tags: List[str], **kwargs):
+        """Non-embedding read: served from the secondary (complete index)."""
+        return await self.secondary.search_by_tags(tags, **kwargs)
+
+    async def get_by_hash(self, content_hash: str):
+        return await self.secondary.get_by_hash(content_hash)
+
+    async def get_by_exact_content(self, content: str):
+        return await self.secondary.get_by_exact_content(content)
+
+    async def cleanup_duplicates(self) -> Tuple[int, str]:
+        """Maintenance: dedup the secondary (source of truth), then mirror the purge."""
+        result = await self.secondary.cleanup_duplicates()
+        if self._primary_available():
+            try:
+                await self.primary.cleanup_duplicates()
+            except Exception as exc:
+                self._mark_primary_down(str(exc))
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate everything else to the secondary (the complete index).
+
+        Non-embedding reads (by tag/time/hash, timestamps, counts...) are served
+        from the local index because every write lands there first; the Voyage
+        index can legitimately lag after an outage until the backfill runs.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.secondary, name)

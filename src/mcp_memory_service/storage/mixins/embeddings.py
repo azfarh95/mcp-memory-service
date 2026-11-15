@@ -136,6 +136,58 @@ class EmbeddingsMixin:
             logger.info("🐳 Docker environment detected - adjusting model loading strategy")
 
         try:
+            # Voyage cloud backend (MCP_MEMORY_EMBED_BACKEND=voyage, default). Checked
+            # before every other branch; embed_backend_override lets the parallel
+            # storage wrapper run one voyage and one local instance per process.
+            embed_backend = (
+                getattr(self, 'embed_backend_override', None)
+                or os.environ.get('MCP_MEMORY_EMBED_BACKEND', 'voyage').strip().lower()
+            )
+            if embed_backend == 'voyage':
+                try:
+                    from ...embeddings.voyage_embeddings import get_voyage_embedding_model
+                    from ...config.embedding import VOYAGE_MODEL, VOYAGE_OUTPUT_DIM
+
+                    cache_key = f"voyage_{VOYAGE_MODEL}_{VOYAGE_OUTPUT_DIM}"
+                    if cache_key in _MODEL_CACHE:
+                        self.embedding_model = _MODEL_CACHE[cache_key]
+                        self.embedding_model_name = f"voyage:{VOYAGE_MODEL}"
+                        self.embedding_dimension = _DIMENSION_CACHE[cache_key]
+                        logger.info("Using cached Voyage embedding model")
+                    else:
+                        # Interactive process: fast-fail so the parallel wrapper's
+                        # fallback kicks in within seconds, not minutes.
+                        voyage_model = get_voyage_embedding_model(max_retries=4, retry_base_delay=0.5)
+                        self.embedding_model = voyage_model
+                        self.embedding_model_name = f"voyage:{VOYAGE_MODEL}"
+                        self.embedding_dimension = voyage_model.embedding_dimension
+                        _MODEL_CACHE[cache_key] = voyage_model
+                        _DIMENSION_CACHE[cache_key] = self.embedding_dimension
+                        logger.info(
+                            "Voyage embedding backend configured. Model: %s, dimension: %s",
+                            VOYAGE_MODEL, self.embedding_dimension,
+                        )
+
+                    # The vec0 schema bakes the dimension in (FLOAT[N]) — writing
+                    # 1024-dim vectors into a 384-dim table corrupts every operation.
+                    # Fail loudly instead (issue #551 contract); the parallel index
+                    # gives Voyage its own file so this only bites on opt-out.
+                    existing_dim = await self._run_in_thread(self._get_existing_db_embedding_dimension)
+                    if existing_dim is not None and existing_dim != self.embedding_dimension:
+                        raise RuntimeError(
+                            f"Voyage embedding dimension ({self.embedding_dimension}) does not "
+                            f"match the existing database schema FLOAT[{existing_dim}] "
+                            f"({getattr(self, 'db_path', 'this database')}). Refusing to start: "
+                            "use the parallel index (MCP_MEMORY_PARALLEL_INDEX=1, the default) so "
+                            "Voyage gets its own file, run scripts/maintenance/voyage_backfill.py "
+                            "to migrate, or point MCP_MEMORY_EMBED_BACKEND=local at the old file."
+                        )
+                    return
+                except ImportError as e:
+                    raise RuntimeError(
+                        f"Voyage embedding backend selected but its module failed to import: {e}"
+                    ) from e
+
             external_api_url = os.environ.get('MCP_EXTERNAL_EMBEDDING_URL')
             if external_api_url:
                 storage_backend = os.environ.get('MCP_MEMORY_STORAGE_BACKEND', 'sqlite_vec')
@@ -471,18 +523,28 @@ class EmbeddingsMixin:
         self.embedding_model = _HashEmbeddingModel(self.embedding_dimension)
         self.embedding_backend_degraded = True
 
-    def _generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding for text."""
+    def _generate_embedding(self, text: str, input_type: str = "document") -> List[float]:
+        """Generate embedding for text.
+
+        ``input_type`` (``query`` vs ``document``) only matters for asymmetric
+        cloud models like Voyage; local models ignore it.
+        """
         if not self.embedding_model:
             raise RuntimeError("No embedding model available. Ensure sentence-transformers is installed and model is loaded.")
 
         try:
+            # Key by model name too: the cache is process-global and a voyage
+            # model must never be handed a MiniLM vector for the same text
+            # (or vice versa) when both run in one process (parallel index).
             if self.enable_cache:
-                cache_key = hash(text)
+                cache_key = hash((self.embedding_model_name, text))
                 if cache_key in _EMBEDDING_CACHE:
                     return _EMBEDDING_CACHE[cache_key]
 
-            embedding = self.embedding_model.encode([text], convert_to_numpy=True)[0]
+            if getattr(self.embedding_model, 'supports_input_type', False):
+                embedding = self.embedding_model.encode([text], convert_to_numpy=True, input_type=input_type)[0]
+            else:
+                embedding = self.embedding_model.encode([text], convert_to_numpy=True)[0]
             if hasattr(embedding, "tolist"):
                 embedding_list = embedding.tolist()
             else:

@@ -125,11 +125,35 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
 
     # Create storage instance based on backend type
     if StorageClass.__name__ == "SqliteVecMemoryStorage":
-        storage = StorageClass(
-            db_path=sqlite_path,
-            embedding_model=EMBEDDING_MODEL_NAME
-        )
-        logger.info(f"Initialized SQLite-vec storage at {sqlite_path}")
+        from ..config import EMBED_BACKEND, PARALLEL_INDEX, VOYAGE_DATABASE_PATH
+
+        if EMBED_BACKEND == "voyage" and PARALLEL_INDEX and VOYAGE_DATABASE_PATH:
+            # Parallel index: Voyage primary (own file — 1024-dim vectors can never
+            # share a table with MiniLM's 384) + the classic local index as the
+            # always-available fallback and source of truth for non-embedding reads.
+            from .parallel import ParallelSqliteVecStorage
+
+            primary = StorageClass(
+                db_path=VOYAGE_DATABASE_PATH,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="voyage",
+            )
+            secondary = StorageClass(
+                db_path=sqlite_path,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="local",
+            )
+            storage = ParallelSqliteVecStorage(primary=primary, secondary=secondary)
+            logger.info(
+                f"Initialized parallel SQLite-vec storage: voyage at {VOYAGE_DATABASE_PATH} "
+                f"(primary) + local at {sqlite_path} (fallback)"
+            )
+        else:
+            storage = StorageClass(
+                db_path=sqlite_path,
+                embedding_model=EMBEDDING_MODEL_NAME
+            )
+            logger.info(f"Initialized SQLite-vec storage at {sqlite_path}")
 
     elif StorageClass.__name__ == "CloudflareStorage":
         storage = StorageClass(
