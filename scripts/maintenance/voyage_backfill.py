@@ -240,16 +240,20 @@ def embed_and_store(conn: sqlite3.Connection, model: VoyageEmbeddingModel, batch
             # malformed DB - means the flag was NOT cleared, so the row stays invisible
             # to v12's KNN filter. Swallowing those would report success on a no-op
             # (review round 2, 2026-11-16).
-            if "no such column" not in str(exc).lower():
+            if "no such column: embedding_pending" not in str(exc).lower():
                 raise
-            logger.warning(
+            logger.info(
                 "memories.embedding_pending absent in %s; skipping the flag clear", conn_path or "this DB")
         conn.commit()
         return True
     except Exception as exc:  # adapter RuntimeError, or a sqlite write error
-        print(f"  batch failed ({exc}); committing progress and stopping — rerun to resume")
+        print(f"  batch failed ({exc}); rolling back this batch and stopping — rerun to resume")
+        # ROLLBACK, not commit: the vector insert and the embedding_pending clear are one
+        # logical unit. Committing here would persist a vector whose flag clear failed,
+        # leaving the row invisible to v12's KNN filter while reporting it as backfilled
+        # (review round 3, 2026-11-16). Earlier batches already committed individually.
         try:
-            conn.commit()
+            conn.rollback()
         except sqlite3.Error:
             pass
         return False
