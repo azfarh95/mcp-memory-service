@@ -581,6 +581,7 @@ class EmbeddingsMixin:
         # indistinguishable from an empty result set. Clear on success.
         self.embedding_last_error = None
         if not self.embedding_model:
+            self.embedding_last_error = "No embedding model available"
             raise RuntimeError("No embedding model available. Ensure sentence-transformers is installed and model is loaded.")
 
         try:

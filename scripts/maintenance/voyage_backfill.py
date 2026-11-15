@@ -16,7 +16,6 @@ Model/dimension come from the same env vars as the service
 """
 
 import argparse
-import asyncio
 import os
 import sqlite3
 import sys
@@ -26,6 +25,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from mcp_memory_service.embeddings.voyage_embeddings import VoyageEmbeddingModel  # noqa: E402
+
+# Hashes copied per INSERT batch: keeps bind variables far under SQLite's limit.
+_COPY_CHUNK = 400
 
 
 def default_db_paths() -> tuple:
@@ -85,6 +87,27 @@ def main() -> None:
     if not local_path or not os.path.exists(local_path):
         raise SystemExit(f"Local DB not found: {local_path}")
 
+    # Open the voyage file read-only under --dry-run: sqlite3.connect() creates the
+    # file, so a "dry" run would otherwise leave a DB behind (review round 2).
+    if args.dry_run:
+        print(f"Local DB: {local_path}")
+        if not voyage_path or not os.path.exists(voyage_path):
+            print(f"Voyage DB: {voyage_path} (would be created)")
+            return
+        print(f"Voyage DB: {voyage_path} (exists)")
+        try:
+            ro = sqlite3.connect(f"file:{voyage_path}?mode=ro", uri=True)
+            todo = ro.execute(
+                """SELECT COUNT(*) FROM memories m
+                   WHERE m.deleted_at IS NULL
+                     AND NOT EXISTS (SELECT 1 FROM memory_embeddings me WHERE me.rowid = m.rowid)"""
+            ).fetchone()[0]
+            print(f"Voyage rows missing embeddings: {todo}")
+            ro.close()
+        except sqlite3.Error as exc:
+            print(f"Voyage DB not yet initialised: {exc}")
+        return
+
     local_conn = sqlite3.connect(local_path)
     voyage_conn = sqlite3.connect(voyage_path or (local_path + ".voyage.db"))
     # vec0 virtual tables need the sqlite-vec extension loaded on this connection.
@@ -95,23 +118,7 @@ def main() -> None:
     voyage_conn.enable_load_extension(False)
 
     model = VoyageEmbeddingModel(max_retries=8, retry_base_delay=5.0)
-    if args.dry_run:
-        # DDL autocommits in sqlite3, so a "dry" run that created the schema
-        # would still leave a DB file behind. Report what exists instead.
-        print(f"Local DB: {local_path}")
-        print(f"Voyage DB: {voyage_path} ({'exists' if os.path.exists(voyage_path) else 'would be created'})")
-        if os.path.exists(voyage_path):
-            try:
-                todo = voyage_conn.execute(
-                    """SELECT COUNT(*) FROM memories m
-                       WHERE m.deleted_at IS NULL
-                         AND NOT EXISTS (SELECT 1 FROM memory_embeddings me WHERE me.rowid = m.rowid)"""
-                ).fetchone()[0]
-                print(f"Voyage rows missing embeddings: {todo}")
-            except sqlite3.Error as exc:
-                print(f"Voyage DB not yet initialised: {exc}")
-        return
-    ensure_voyage_schema(local_conn, voyage_conn, model.embedding_dimension, args.dry_run)
+    ensure_voyage_schema(local_conn, voyage_conn, model.embedding_dimension, False)
 
     # 1. Sync memory rows that exist only in the local DB (outage-time writes).
     local_hashes = {r[0] for r in local_conn.execute("SELECT content_hash FROM memories WHERE deleted_at IS NULL")}
@@ -132,38 +139,48 @@ def main() -> None:
         )
         voyage_conn.commit()
     if missing:
-        placeholders = ",".join("?" * len(missing))
-        rows = local_conn.execute(
-            f"SELECT * FROM memories WHERE content_hash IN ({placeholders})", tuple(missing)
-        ).fetchall()
+        # Chunk the copy: one bind variable per hash blows SQLite's variable limit
+        # (999 by default) on the first real backfill (review round 2).
         local_cols = [r[1] for r in local_conn.execute("PRAGMA table_info(memories)")]
         voyage_cols = {r[1] for r in voyage_conn.execute("PRAGMA table_info(memories)")}
         shared = [c for c in local_cols if c in voyage_cols]
         col_list = ",".join(shared)
-        voyage_conn.executemany(
-            f"INSERT OR IGNORE INTO memories ({col_list}) VALUES ({','.join('?' * len(shared))})",
-            [[dict(zip(local_cols, row))[c] for c in shared] for row in rows],
+        # A row soft-deleted in the voyage index but live locally must come back:
+        # INSERT OR IGNORE would leave it dead forever and never re-embed it.
+        updates = ",".join(f"{c}=excluded.{c}" for c in shared if c not in ("id", "content_hash"))
+        stmt = (
+            f"INSERT INTO memories ({col_list}) VALUES ({','.join('?' * len(shared))}) "
+            f"ON CONFLICT(content_hash) DO UPDATE SET {updates}"
         )
+        missing_list = list(missing)
+        for start in range(0, len(missing_list), _COPY_CHUNK):
+            chunk = missing_list[start : start + _COPY_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = local_conn.execute(
+                f"SELECT * FROM memories WHERE content_hash IN ({placeholders})", tuple(chunk)
+            ).fetchall()
+            voyage_conn.executemany(
+                stmt,
+                [[dict(zip(local_cols, row))[c] for c in shared] for row in rows],
+            )
         voyage_conn.commit()
 
     # 2. Embed voyage rows lacking vectors, resumably.
-    todo = voyage_conn.execute(
-        """SELECT COUNT(*) FROM memories m
-           WHERE m.deleted_at IS NULL
-             AND NOT EXISTS (SELECT 1 FROM memory_embeddings me WHERE me.rowid = m.rowid)"""
-    ).fetchone()[0]
-    print(f"Voyage rows missing embeddings: {todo}")
-    if args.dry_run:
-        return
-
-    batch, done, failures = [], 0, 0
-    cursor = voyage_conn.execute(
+    #    Materialised up front: the loop writes to memory_embeddings on the same
+    #    connection, so a live cursor's NOT EXISTS would shift under itself.
+    todo_rows = voyage_conn.execute(
         """SELECT m.rowid, m.content FROM memories m
            WHERE m.deleted_at IS NULL
              AND NOT EXISTS (SELECT 1 FROM memory_embeddings me WHERE me.rowid = m.rowid)"""
-    )
+    ).fetchall()
+    todo = len(todo_rows)
+    print(f"Voyage rows missing embeddings: {todo}")
+    if not todo:
+        return
+
+    batch, done, failures = [], 0, 0
     t0 = time.time()
-    for rowid, content in cursor:
+    for rowid, content in todo_rows:
         batch.append((rowid, content))
         if len(batch) >= args.batch_size:
             if not embed_and_store(voyage_conn, model, batch):
@@ -190,16 +207,19 @@ def embed_and_store(conn: sqlite3.Connection, model: VoyageEmbeddingModel, batch
     """Embed one batch of (rowid, content) and write vectors; commit on success."""
     try:
         vectors = model.encode([c for _, c in batch], convert_to_numpy=True, input_type="document")
-    except Exception as exc:  # RuntimeError from the adapter, sqlite3 errors from the write
-        print(f"  batch failed ({exc}); committing progress and stopping — rerun to resume")
+        conn.executemany(
+            "INSERT OR REPLACE INTO memory_embeddings (rowid, content_embedding) VALUES (?, ?)",
+            [(rowid, vectors[i].tobytes()) for i, (rowid, _) in enumerate(batch)],
+        )
         conn.commit()
+        return True
+    except Exception as exc:  # adapter RuntimeError, or a sqlite write error
+        print(f"  batch failed ({exc}); committing progress and stopping — rerun to resume")
+        try:
+            conn.commit()
+        except sqlite3.Error:
+            pass
         return False
-    conn.executemany(
-        "INSERT INTO memory_embeddings (rowid, content_embedding) VALUES (?, ?)",
-        [(rowid, vectors[i].tobytes()) for i, (rowid, _) in enumerate(batch)],
-    )
-    conn.commit()
-    return True
 
 
 if __name__ == "__main__":

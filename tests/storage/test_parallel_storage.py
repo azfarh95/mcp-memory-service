@@ -32,6 +32,7 @@ class FakeChild:
         self.stored = []
         self.returns_empty = False
         self.embedding_last_error = None
+        self.ready = True   # mirrors _primary_ready()'s corpus-coverage verdict
         self.embed_error = None  # when set, store returns the embed-failure string
         self.retrieve_error = None
         self.db_path = f"/tmp/{name}.db"
@@ -217,6 +218,39 @@ async def test_delete_applies_to_both():
     await wrapper.delete("abc123")
     assert ("delete", "abc123") in primary.calls
     assert ("delete", "abc123") in secondary.calls
+
+
+@pytest.mark.asyncio
+async def test_stale_primary_index_falls_back_even_with_no_error():
+    """A fresh/partially-backfilled Voyage index answers [] for memories that
+    exist locally. No error is raised, so readiness (corpus coverage) is the only
+    thing that stops the silent shortfall (review round 2)."""
+    primary, secondary = FakeChild("primary", "fake-voyage"), FakeChild("secondary", "fake-local")
+    primary.ready = False
+    primary.returns_empty = True
+    wrapper = ParallelSqliteVecStorage(primary, secondary)
+    results = await wrapper.retrieve("query text")
+    assert results[0].memory.content == "hit-for:query text"
+    assert results[0].memory.metadata.get("_degraded_backend") == "local"
+
+
+@pytest.mark.asyncio
+async def test_unready_primary_is_not_queried_at_all():
+    primary, secondary = FakeChild("primary", "fake-voyage"), FakeChild("secondary", "fake-local")
+    primary.ready = False
+    wrapper = ParallelSqliteVecStorage(primary, secondary)
+    await wrapper.retrieve("query text")
+    assert ("retrieve", "query text") not in primary.calls
+
+
+@pytest.mark.asyncio
+async def test_time_only_recall_goes_to_secondary():
+    """query=None is a non-embedding read: the complete (local) index serves it."""
+    primary, secondary = FakeChild("primary", "fake-voyage"), FakeChild("secondary", "fake-local")
+    wrapper = ParallelSqliteVecStorage(primary, secondary)
+    await wrapper.recall(None, 5, start_timestamp=1.0)
+    assert ("recall", None) in secondary.calls
+    assert ("recall", None) not in primary.calls
 
 
 @pytest.mark.asyncio

@@ -46,10 +46,20 @@ class RetrieveMixin:
 
             if not self.embedding_model:
                 logger.warning("No embedding model available, cannot perform semantic search")
+                # Record the cause: callers distinguish "no matches" from "embedder
+                # unavailable" only by this attribute (review round 2, 2026-11-15).
+                self.embedding_last_error = "No embedding model available"
                 return []
 
             try:
-                query_embedding = self._generate_embedding(query, input_type="query")
+                # Off the event loop: the Voyage adapter does blocking HTTP with
+                # retries, so calling it inline would stall every other coroutine
+                # for the whole backoff (review round 2, 2026-11-15). Deliberately
+                # NOT self._run_in_thread — that holds _conn_lock, which network
+                # I/O must never hold.
+                query_embedding = await asyncio.to_thread(
+                    self._generate_embedding, query, "query"
+                )
             except Exception as e:
                 logger.error("Failed to generate query embedding: %s", _sanitize_log_value(e))
                 return []

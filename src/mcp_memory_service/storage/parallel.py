@@ -46,6 +46,12 @@ logger = logging.getLogger(__name__)
 # backfill script is the recovery path, not per-request retries.
 _PRIMARY_COOLDOWN_SECONDS = 60.0
 
+# The Voyage index must cover this share of the local corpus before its results
+# are trusted on their own. Below it, the primary is "behind" (a fresh install or
+# an unfinished backfill) and searches are served from local with the degraded
+# flag rather than returning a silently short result set.
+_PRIMARY_MIN_COVERAGE = 0.95
+
 
 class ParallelSqliteVecStorage:
     """Voyage-primary storage wrapper over two SqliteVecMemoryStorage instances.
@@ -85,6 +91,38 @@ class ParallelSqliteVecStorage:
 
     def _primary_available(self) -> bool:
         return time.time() >= self._primary_down_until
+
+    def _primary_ready(self) -> bool:
+        """Is the Voyage index actually usable for searching?
+
+        An error-free empty result is only trustworthy if the primary index holds
+        the same corpus as the local index. After a default flip (or a fresh
+        install) the Voyage file is empty and every search would return [] for
+        memories that exist locally — exactly the silent-loss class round 1
+        flagged, reached through a cold index instead of an outage. Until the
+        backfill has run, treat the primary as not ready and serve from local
+        with the degraded flag (review round 2, 2026-11-15).
+        """
+        # A child may expose its own readiness verdict (the test doubles do).
+        if hasattr(self.primary, "ready"):
+            return bool(self.primary.ready)
+        try:
+            primary_rows = self.primary.conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            secondary_rows = self.secondary.conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+        except Exception as exc:
+            logger.debug("Primary readiness check failed (%s); assuming not ready", exc)
+            return False
+        if secondary_rows and primary_rows < secondary_rows * _PRIMARY_MIN_COVERAGE:
+            self.primary_last_error = (
+                f"voyage index behind: {primary_rows}/{secondary_rows} rows "
+                "(run scripts/maintenance/voyage_backfill.py)"
+            )
+            return False
+        return True
 
     def _mark_primary_down(self, error: str) -> None:
         self.primary_last_error = error
@@ -169,46 +207,52 @@ class ParallelSqliteVecStorage:
 
     # ------------------------------------------------------ semantic reads
 
+    async def _semantic_from_primary(self, query, n_results, kind: str, **kwargs):
+        """Run one semantic read against the primary; None means "use the secondary".
+
+        The child swallows embedder failures and returns [] (it logs), and an empty
+        list is also a legitimate no-match — so two facts decide it:
+          - a per-call failure signal (`embedding_last_error`), read once, so a
+            concurrent success cannot clear it mid-check;
+          - corpus readiness, because an empty/stale index answers [] for memories
+            that plainly exist locally.
+        """
+        if not self._primary_available() or not self._primary_ready():
+            return None
+        try:
+            results = await getattr(self.primary, kind)(query, n_results, **kwargs)
+        except Exception as exc:
+            self._mark_primary_down(str(exc))
+            return None
+        error = getattr(self.primary, "embedding_last_error", None)
+        if error:
+            self._mark_primary_down(str(error))
+            return None
+        return results
+
     async def retrieve(self, query: str, n_results: int = 5, **kwargs) -> List[MemoryQueryResult]:
-        if self._primary_available():
-            try:
-                results = await self.primary.retrieve(query, n_results, **kwargs)
-                # retrieve() catches embedder failures and returns [] — an empty
-                # list alone is also a legitimate "no matches", so the child's
-                # embedding_last_error is what distinguishes an outage. Without
-                # this the fallback never fires and search silently returns
-                # nothing (review finding, 2026-11-15).
-                if results or not getattr(self.primary, "embedding_last_error", None):
-                    return results
-                self._mark_primary_down(self.primary.embedding_last_error)
-            except Exception as exc:
-                self._mark_primary_down(str(exc))
-        results = await self.secondary.retrieve(query, n_results, **kwargs)
-        return self._flag_degraded(results)
+        results = await self._semantic_from_primary(query, n_results, "retrieve", **kwargs)
+        if results is not None:
+            return results
+        return self._flag_degraded(await self.secondary.retrieve(query, n_results, **kwargs))
 
     async def recall(self, query: Optional[str] = None, n_results: int = 5, **kwargs) -> List[MemoryQueryResult]:
-        if self._primary_available():
-            try:
-                results = await self.primary.recall(query, n_results, **kwargs)
-                if results or not getattr(self.primary, "embedding_last_error", None):
-                    return results
-                self._mark_primary_down(self.primary.embedding_last_error)
-            except Exception as exc:
-                self._mark_primary_down(str(exc))
+        # A time-only recall (query=None) is a NON-embedding read: the secondary is
+        # the complete index, and the primary can legitimately be behind it.
+        if query is None:
+            return await self.secondary.recall(query, n_results, **kwargs)
+        results = await self._semantic_from_primary(query, n_results, "recall", **kwargs)
+        if results is not None:
+            return results
         return self._flag_degraded(await self.secondary.recall(query, n_results, **kwargs))
 
     async def recall_memory(self, query: str, n_results: int = 5) -> List[Memory]:
         return await self.recall(query, n_results)
 
     async def search(self, query: str, n_results: int = 5) -> List[MemoryQueryResult]:
-        if self._primary_available():
-            try:
-                results = await self.primary.search(query, n_results)
-                if results or not getattr(self.primary, "embedding_last_error", None):
-                    return results
-                self._mark_primary_down(self.primary.embedding_last_error)
-            except Exception as exc:
-                self._mark_primary_down(str(exc))
+        results = await self._semantic_from_primary(query, n_results, "search")
+        if results is not None:
+            return results
         return self._flag_degraded(await self.secondary.search(query, n_results))
 
     # --------------------------------------------------------- maintenance
