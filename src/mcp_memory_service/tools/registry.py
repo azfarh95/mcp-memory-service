@@ -10,6 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+# The single source of truth for memory_graph actions. The schema enum below
+# and the write-scope exemption in server_impl both build on this list, so an
+# action added here is everywhere; tests/web/api/test_transport_consistency.py
+# pins the derivation.
+from ..server.handlers.graph import GRAPH_ACTIONS
+
 
 @dataclass(frozen=True)
 class ToolDef:
@@ -67,9 +73,17 @@ TOOL_REGISTRY: list[ToolDef] = [
                     "type": "string",
                     "description": "The memory content to store, such as a fact, note, or piece of information.",
                 },
+                "restore_deleted": {
+                    "type": "boolean",
+                    "description": "Bring back content that was deleted on this server. Default false: re-sending deleted content is refused with 'Not stored: this content was deleted on <date>; pass restore_deleted=true to bring it back'. Set true only when the user deliberately wants the deleted memory back.",
+                },
                 "conversation_id": {
                     "type": "string",
                     "description": "Optional conversation identifier. When provided, semantic deduplication is skipped, allowing multiple incremental memories from the same conversation to be stored even if their content is topically similar. Exact duplicate hashes are still rejected.",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Optional authoring agent id (defaults to the MCP_AGENT_ID env var, else unset). Stored in metadata for multi-agent attribution; null means unknown.",
                 },
                 "metadata": {
                     "type": "object",
@@ -163,6 +177,10 @@ Example:
                     "type": "string",
                     "description": "Target store partition (default: 'default'). Use 'docs' for documents, 'all' for cross-store search.",
                 },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Optional authoring agent id. Falls back to the X-Agent-ID header, then MCP_AGENT_ID. Passing it here makes the caller's author win over the server default.",
+                },
             },
             "required": ["turns"],
         },
@@ -177,6 +195,12 @@ USE THIS WHEN:
 - Looking for past decisions, preferences, context from previous sessions
 - Need semantic, exact, or time-based search
 - User references "last time we discussed", "you should know"
+
+HASH LOOKUP:
+- Provide content_hash instead of query to retrieve one memory by its exact identifier
+- Hash misses return no results; they do not fall back to semantic search
+- query and content_hash are mutually exclusive; store scoping applies to both
+- Only store, entity, limit, max_response_chars, and include_beliefs may accompany content_hash
 
 MODES:
 - semantic (default): Finds conceptually similar content even if exact words differ
@@ -199,20 +223,33 @@ TAG FILTER:
 DEBUG:
 - include_debug=true adds timing, embedding info, filter details
 
+SUMMARIZATION (opt-in):
+- summarize=true returns a query-aware LLM summary with validated source hashes
+- Requires a query and the existing HARVEST_LLM_PROVIDERS/GROQ_API_KEY configuration
+- Bounds model input at whole-memory boundaries; original memories remain stored
+- Returns raw results with a warning if summarization or source validation fails
+
 Examples:
 {"query": "python async patterns"}
+{"content_hash": "aa6caea3d060e736c8b412e6b34a1354148ec04527a4bf547cfd4185140573d0"}
 {"query": "API endpoint", "mode": "exact"}
 {"time_expr": "last week", "limit": 20}
 {"query": "database config", "time_expr": "yesterday"}
 {"query": "architecture decisions", "tags": ["important"], "quality_boost": 0.3}
 {"after": "2024-01-01", "before": "2024-06-30", "limit": 50}
-{"query": "error handling", "include_debug": true}""",
+{"query": "error handling", "include_debug": true}
+{"query": "replication consistency issue", "summarize": true}""",
         input_schema={
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query (required for semantic/exact modes, optional for time-only searches)",
+                    "description": "Text search query (required for semantic/exact modes unless content_hash is supplied, optional for time-only searches)",
+                },
+                "content_hash": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Retrieve one memory by its exact content hash instead of searching text. Only store, entity, limit, max_response_chars, and include_beliefs may accompany content_hash; query and other search arguments are rejected.",
                 },
                 "mode": {
                     "type": "string",
@@ -259,6 +296,16 @@ Examples:
                     "default": 0,
                     "description": "Quality weight for reranking (0.0-1.0)",
                 },
+                "rerank": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Opt-in second-stage ONNX rerank of the top "
+                        "MCP_RERANK_CANDIDATES results. Requires "
+                        "MCP_RERANK_ENABLED on the server; off by default and a "
+                        "no-op when the server flag is unset."
+                    ),
+                },
                 "ranking_weights": {
                     "type": "object",
                     "description": "Custom weights for ranked mode (keys: semantic, time_decay, access_frequency, quality). Values are normalized to sum=1.0.",
@@ -288,7 +335,18 @@ Examples:
                 "include_superseded": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Include memories that have been superseded by newer contradicting memories. Default: false (superseded memories are hidden).",
+                    "description": "Include memories that have been superseded by newer contradicting memories. Default: false (superseded memories are hidden). When true, each result carries a status field ('current' or 'superseded') plus superseded_by and superseded_at when superseded.",
+                },
+                "as_of": {
+                    "type": "string",
+                    "description": (
+                        "Point-in-time query (issue #1724): return what was known at this moment. "
+                        "Accepts an ISO date/datetime (e.g. '2026-09-15', '2026-09-15T10:00:00Z'), "
+                        "'YYYY' (the whole year, evaluated at its last second), or 'YYYY-MM' "
+                        "(evaluated at that month's last second). Results include memories with "
+                        "created_at <= as_of that had not been superseded by as_of. Status flags "
+                        "with include_superseded=true are evaluated at as_of as well."
+                    ),
                 },
                 "entity": {
                     "type": "string",
@@ -299,6 +357,10 @@ Examples:
                     "default": False,
                     "description": "Enable cascading fallback when semantic results are sparse. When true and fewer than 3 results are found with scores below 0.4, automatically attempts BM25 keyword match and tag intersection. Each result includes match_method field. Default: false.",
                 },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Filter to memories authored by this agent (matches metadata.agent_id or the agent:<id> tag). Opt-in; omit to search all agents.",
+                },
                 "include_beliefs": {
                     "type": "boolean",
                     "default": False,
@@ -307,6 +369,18 @@ Examples:
                 "store": {
                     "type": "string",
                     "description": "Target store partition (default: 'default'). Use 'docs' for documents, 'all' for cross-store search.",
+                },
+                "summarize": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Return a query-aware LLM summary of the retrieved memories "
+                        "with source hashes and preserved metadata instead of their "
+                        "full contents. Requires operator permission via "
+                        "MCP_SEARCH_SUMMARIZE_ENABLED=true (off by default), a query, "
+                        "and a configured LLM provider. "
+                        "Falls back to raw results with a warning on failure."
+                    ),
                 },
             },
         },
@@ -383,6 +457,10 @@ Examples:
                 "store": {
                     "type": "string",
                     "description": "Target store partition (default: 'default'). Use 'docs' for documents, 'all' for cross-store search.",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Filter to memories authored by this agent (matches metadata.agent_id or the agent:<id> tag). Opt-in; omit to search all agents.",
                 },
             },
         },
@@ -527,6 +605,16 @@ Examples:
                             "priority": "urgent",
                             "status": "active"
                         }
+                    }
+
+                    # Create a new version with updated content (sqlite_vec and milvus)
+                    {
+                        "content_hash": "abc123...",
+                        "updates": {
+                            "content": "Corrected memory content",
+                            "reason": "Fix outdated command"
+                        },
+                        "versioned": true
                     }""",
         input_schema={
             "type": "object",
@@ -537,7 +625,7 @@ Examples:
                 },
                 "updates": {
                     "type": "object",
-                    "description": "Dictionary of metadata fields to update.",
+                    "description": "Dictionary of fields to update. With versioned=true only content, tags, memory_type and reason take effect.",
                     "properties": {
                         "tags": {
                             "oneOf": [
@@ -559,19 +647,27 @@ Examples:
                         },
                         "metadata": {
                             "type": "object",
-                            "description": "Custom metadata fields to merge with existing metadata.",
+                            "description": "Custom metadata fields to merge with existing metadata. In-place updates merge with the current metadata. Versioned updates: the new version inherits the old version's custom metadata, and fields supplied here override the inherited values.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "New memory content. Required when versioned=true; dropped from in-place updates.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Reason for the change, recorded as evolution_reason on the superseded version. Only used with versioned=true; dropped from in-place updates.",
                         },
                     },
                 },
                 "preserve_timestamps": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Whether to preserve the original created_at timestamp (default: true).",
+                    "description": "In-place updates only. When true (default), the original created_at is kept. When false, created_at/updated_at may be supplied via updates. Ignored with versioned=true.",
                 },
                 "versioned": {
                     "type": "boolean",
                     "default": False,
-                    "description": "When true, creates a new version instead of overwriting. The old memory is marked as superseded. Requires content in updates to create the new version. Creates a new memory version and marks the old one as superseded. Supported backends: sqlite_vec. Unsupported backends return an error.",
+                    "description": "When true, creates a new memory version instead of overwriting and marks the old one as superseded. Requires content in updates. Supported backends: sqlite_vec, milvus. Unsupported backends return an error.",
                 },
             },
             "required": ["content_hash", "updates"],
@@ -810,6 +906,11 @@ Examples:
                     "items": {"type": "string"},
                     "description": "Specific session IDs to harvest",
                 },
+                "force_reharvest": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Re-harvest sessions already recorded in the harvest tracker (bypasses the tracker filter). Use to re-process sessions whose prior run stored nothing.",
+                },
                 "types": {
                     "type": "array",
                     "items": {
@@ -866,6 +967,7 @@ ACTIONS:
 - analyze: Analyze quality distribution across all memories
 - maintain: Run maintenance cycle (cleanup + conflicts + stale + quality)
 - maintain_status: Get stats from last maintenance run
+- rebuild_entities: Rebuild has_entity and shares_entity for ALL live memories using current extraction settings. Preview by default (dry_run=true); back up first and pause other writers before dry_run=false. Requires a graph backend.
 
 Examples:
 {"action": "rate", "content_hash": "abc123", "rating": 1, "feedback": "Very useful"}
@@ -875,13 +977,15 @@ Examples:
 {"action": "maintain"}
 {"action": "maintain", "dry_run": false}
 {"action": "maintain_status"}
+{"action": "rebuild_entities"}
+{"action": "rebuild_entities", "dry_run": false}
 """,
         input_schema={
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["rate", "get", "analyze", "maintain", "maintain_status"],
+                    "enum": ["rate", "get", "analyze", "maintain", "maintain_status", "rebuild_entities"],
                     "description": "Quality action to perform",
                 },
                 "content_hash": {
@@ -910,12 +1014,12 @@ Examples:
                 "dry_run": {
                     "type": "boolean",
                     "default": True,
-                    "description": "For 'maintain': preview mode — no modifications (default: true)",
+                    "description": "For 'maintain'/'rebuild_entities': preview mode — no modifications (default: true)",
                 },
             },
             "required": ["action"],
         },
-        annotations={"destructiveHint": False},
+        annotations={"destructiveHint": True},
     ),
     ToolDef(
         name="memory_graph",
@@ -925,8 +1029,12 @@ ACTIONS:
 - connected: Find memories connected via associations (BFS traversal)
 - path: Find shortest path between two memories
 - subgraph: Get graph structure around a memory for visualization
+- extract_entities: Manually extract and store entities for a memory (write). Params: hash (string)
 - infer: Find transitive relationships (A→B→C implies A→C). Params: rel_type (string), max_hops (int, default 2)
 - suggest: Suggest potential relationships for a memory based on shared neighbors. Params: hash (string)
+- abduct: Find plausible common-cause explanations for a memory's relationships. Params: hash (string)
+- list_entities: List known entities. Params: limit (int, default 50)
+- entity_profile: Show memories linked to one entity. Params: entity_name (string)
 
 Examples:
 {"action": "connected", "hash": "abc123", "max_hops": 2}
@@ -940,7 +1048,7 @@ Examples:
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["connected", "path", "subgraph", "infer", "suggest"],
+                    "enum": list(GRAPH_ACTIONS),
                     "description": "Graph operation to perform",
                 },
                 "hash": {
@@ -974,10 +1082,28 @@ Examples:
                     "type": "string",
                     "description": "For 'infer': relationship type to traverse",
                 },
+                "entity_name": {
+                    "type": "string",
+                    "description": "For 'entity_profile': entity to profile",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "For 'list_entities': max entities to return",
+                },
+                "as_of": {
+                    "type": "string",
+                    "description": (
+                        "For 'connected': point-in-time traversal (issue #1724). "
+                        "Only edges valid at this moment are followed (temporal "
+                        "edges carry valid_from/valid_until; untimed edges are "
+                        "always followed). Same formats as memory_search as_of."
+                    ),
+                },
             },
             "required": ["action"],
         },
-        annotations={"readOnlyHint": True},
+        annotations={"readOnlyHint": False},
     ),
     ToolDef(
         name="memory_conflicts",
@@ -1182,7 +1308,9 @@ Examples:
     ),
     ToolDef(
         name="get_bootstrap_profile",
-        description="""Generate a behavioral bootstrap profile for an ephemeral agent.""",
+        description="""Generate a behavioral bootstrap profile for an ephemeral agent.
+Requires write scope because it resets session counters when a fresh start is due.
+For a read-only profile, read memory://agent/{agent_id}/bootstrap instead.""",
         input_schema={
             "type": "object",
             "properties": {
@@ -1212,7 +1340,7 @@ Examples:
             },
             "required": ["agent_ids"],
         },
-        annotations={"readOnlyHint": True},
+        annotations={"readOnlyHint": False},
     ),
     ToolDef(
         name="get_onboarding_guide",

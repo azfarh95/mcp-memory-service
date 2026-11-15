@@ -170,28 +170,35 @@ class TestCountMemoriesByTag:
 
 
 class TestIsDeleted:
-    """Tests for native is_deleted."""
+    """Tests for native is_deleted.
+
+    is_deleted() does its own ``get`` on the collection rather than going
+    through get_by_hash(), which hides tombstones (#1261). These tests mock
+    ``_call_client`` accordingly; mocking get_by_hash here would exercise
+    nothing, and the True case would fail.
+    """
 
     @pytest.mark.asyncio
     async def test_deleted_memory_returns_true(self):
         """Memory with deleted_at in metadata returns True."""
         storage = _make_storage()
-        deleted_mem = Memory(
-            content="old content",
-            content_hash="h1",
-            tags=["t"],
-            metadata={"deleted_at": 1700000000.0},
+        storage._call_client = AsyncMock(
+            return_value=[{"metadata": json.dumps({"deleted_at": 1700000000.0})}]
         )
-        storage.get_by_hash = AsyncMock(return_value=deleted_mem)
 
         assert await storage.is_deleted("h1") is True
+        storage._call_client.assert_awaited_once_with(
+            "get",
+            collection_name="unit_test_collection",
+            ids=["h1"],
+            output_fields=["metadata"],
+        )
 
     @pytest.mark.asyncio
     async def test_non_deleted_memory_returns_false(self):
         """Memory without deleted_at returns False."""
         storage = _make_storage()
-        mem = Memory(content="content", content_hash="h1", tags=["t"], metadata={})
-        storage.get_by_hash = AsyncMock(return_value=mem)
+        storage._call_client = AsyncMock(return_value=[{"metadata": "{}"}])
 
         assert await storage.is_deleted("h1") is False
 
@@ -199,7 +206,7 @@ class TestIsDeleted:
     async def test_nonexistent_memory_returns_false(self):
         """Non-existent hash returns False."""
         storage = _make_storage()
-        storage.get_by_hash = AsyncMock(return_value=None)
+        storage._call_client = AsyncMock(return_value=[])
 
         assert await storage.is_deleted("nonexistent") is False
 
@@ -224,22 +231,20 @@ class TestPurgeDeleted:
         now = time.time()
         old_time = now - 90 * 86400  # 90 days ago
 
-        storage._call_client = AsyncMock(side_effect=[
-            # First call: query returns old memories
-            [
-                {"id": "h1", "metadata": json.dumps({"deleted_at": old_time - 100})},
-                {"id": "h2", "metadata": json.dumps({"deleted_at": old_time - 200})},
-                {"id": "h3", "metadata": json.dumps({})},  # Not deleted
-            ],
-            # Second call: delete
-            None,
+        # The candidate scan is a full iterator drain (#1785); the delete is one RPC.
+        storage._drain_rows = AsyncMock(return_value=[
+            {"id": "h1", "metadata": json.dumps({"deleted_at": old_time - 100})},
+            {"id": "h2", "metadata": json.dumps({"deleted_at": old_time - 200})},
+            {"id": "h3", "metadata": json.dumps({})},  # Not deleted
         ])
+        storage._call_client = AsyncMock(return_value=None)
 
         count = await storage.purge_deleted(older_than_days=30)
 
         assert count == 2
+        assert "created_at <=" in storage._drain_rows.call_args[0][0]
         # Verify delete was called with only the tombstoned IDs
-        delete_call = storage._call_client.call_args_list[1]
+        delete_call = storage._call_client.call_args_list[0]
         assert delete_call[0][0] == "delete"
         assert set(delete_call[1]["ids"]) == {"h1", "h2"}
 
@@ -247,7 +252,7 @@ class TestPurgeDeleted:
     async def test_no_tombstones_returns_zero(self):
         """Returns 0 when no tombstones found."""
         storage = _make_storage()
-        storage._call_client = AsyncMock(return_value=[
+        storage._drain_rows = AsyncMock(return_value=[
             {"id": "h1", "metadata": json.dumps({})},
         ])
 
@@ -259,7 +264,7 @@ class TestPurgeDeleted:
     async def test_empty_result_returns_zero(self):
         """Returns 0 when query returns no rows."""
         storage = _make_storage()
-        storage._call_client = AsyncMock(return_value=[])
+        storage._drain_rows = AsyncMock(return_value=[])
 
         count = await storage.purge_deleted(older_than_days=30)
 
@@ -269,7 +274,7 @@ class TestPurgeDeleted:
     async def test_query_failure_returns_zero(self):
         """Returns 0 on query failure."""
         storage = _make_storage()
-        storage._call_client = AsyncMock(side_effect=Exception("error"))
+        storage._drain_rows = AsyncMock(side_effect=Exception("error"))
 
         count = await storage.purge_deleted(older_than_days=30)
 

@@ -406,16 +406,35 @@ export GROQ_API_KEY="your-groq-api-key"
 export MCP_QUALITY_AI_PROVIDER=groq  # or "auto" to try all tiers
 
 # Enable Gemini API (Google)
-export GOOGLE_API_KEY="your-gemini-api-key"
+export GEMINI_API_KEY="your-gemini-api-key"
 export MCP_QUALITY_AI_PROVIDER=gemini
 ```
 
-### 3. Configuration Options
+### 3. Homelab: score with your own LLM
+
+`MCP_QUALITY_AI_PROVIDER=openai-compatible` points scoring at any OpenAI-compatible
+`/v1` endpoint — Ollama, vLLM, or a LiteLLM proxy — instead of ONNX or a cloud API. No
+API key leaves the machine, no per-call cost.
+
+```bash
+export MCP_QUALITY_AI_PROVIDER=openai-compatible
+export MCP_QUALITY_AI_BASE_URL=http://localhost:11434/v1   # Ollama
+export MCP_QUALITY_AI_MODEL=qwen2.5:7b-instruct
+# export MCP_QUALITY_AI_API_KEY=ollama                     # optional
+```
+
+Both `MCP_QUALITY_AI_BASE_URL` and `MCP_QUALITY_AI_MODEL` are required with this
+provider; the service refuses to start without them. Recommended models:
+`qwen2.5:7b-instruct` (Ollama), `mlx-community/Qwen2.5-7B-Instruct-4bit` (MLX), or any
+instruct model behind a LiteLLM proxy. If the endpoint fails, scoring falls back to
+implicit signals automatically.
+
+### 4. Configuration Options
 
 ```bash
 # Quality System Core
 export MCP_QUALITY_SYSTEM_ENABLED=true         # Default: true
-export MCP_QUALITY_AI_PROVIDER=local           # local|groq|gemini|auto|none
+export MCP_QUALITY_AI_PROVIDER=local           # local|openai-compatible|groq|gemini|auto|none
 
 # Local SLM Configuration (Tier 1)
 export MCP_QUALITY_LOCAL_MODEL=ms-marco-MiniLM-L-6-v2  # Model name
@@ -434,11 +453,17 @@ export MCP_QUALITY_BOOST_WEIGHT=0.3            # 0.0-1.0 (30% quality, 70% seman
 export MCP_QUALITY_IMPLICIT_BLEND_ENABLED=false  # Default: follows BOOST_ENABLED
 export MCP_QUALITY_IMPLICIT_WEIGHT=0.3           # 0.0-1.0 implicit share of the stored score
 
-# Quality-Based Retention (Consolidation)
+# Quality-Based Retention & Dynamic Decay
+export MCP_DECAY_ENABLED=true                  # Enable dynamic recency decay (v11.15.0+)
 export MCP_QUALITY_RETENTION_HIGH=365          # Days for quality ≥0.7
 export MCP_QUALITY_RETENTION_MEDIUM=180        # Days for quality 0.5-0.7
 export MCP_QUALITY_RETENTION_LOW_MIN=30        # Min days for quality <0.5
 export MCP_QUALITY_RETENTION_LOW_MAX=90        # Max days for quality <0.5
+
+# Memory Type Specific Relevance Decay Periods (v11.15.0+)
+# Note: These values control relevance decay periods, not guaranteed storage or deletion deadlines.
+export MCP_RETENTION_DECISION=730              # Decision relevance decay period in days
+export MCP_RETENTION_TEMPORARY=7               # Temporary relevance decay period in days
 ```
 
 ## Using the Quality System

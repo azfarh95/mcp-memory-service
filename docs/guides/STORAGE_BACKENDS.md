@@ -78,6 +78,35 @@ pip install -e ".[full]"
 ### Recommended Configuration:
 Set `MCP_HYBRID_SYNC_OWNER=http` so that **only the HTTP server** performs Cloudflare sync. The MCP server (Claude Desktop) then runs in pure SQLite-vec mode and doesn't need Cloudflare credentials in `claude_desktop_config.json`. This is the correct separation of concerns: Claude Desktop = memory access, HTTP server = sync infrastructure.
 
+### HTTP Secondary Backend (Alternative to Cloudflare):
+For self-hosted or on-premise deployments, the Hybrid backend can sync to a remote HTTP MCP Memory Service instead of Cloudflare:
+
+- Set `MCP_HYBRID_SECONDARY_BACKEND=http` to use HTTP backend
+- Configure `MCP_HYBRID_SECONDARY_URL` with the remote service's base URL
+- Optionally set `MCP_HYBRID_SECONDARY_API_KEY` for authentication
+- Use `MCP_HYBRID_SECONDARY_AUTH_STYLE=x-api-key` for services behind nginx with basic auth
+- Set `MCP_HYBRID_SECONDARY_BASIC_USER` and `MCP_HYBRID_SECONDARY_BASIC_PASS` for nginx layer authentication
+
+This provides the same local SQLite-vec read performance with background sync to your own HTTP-accessible MCP Memory Service hub, avoiding the need for Cloudflare accounts. How to run the hub itself (backend, API key, sync owner, re-embedding) is in [self-hosted-sync-hub.md](self-hosted-sync-hub.md).
+
+> **Embedding model must match.** The client and the hub must use the same
+> `MCP_EMBEDDING_MODEL`. On startup the client verifies the hub's model via
+> `GET /api/health/model` and refuses to start (fail-closed) on a mismatch or an
+> unreachable model, since divergent models produce incomparable vectors and
+> degrade recall. See the configuration guide, "Embedding model match", for details
+> and the re-embed requirement when changing models.
+
+```bash
+export MCP_MEMORY_STORAGE_BACKEND=hybrid
+export MCP_HYBRID_SECONDARY_BACKEND=http
+export MCP_HYBRID_SECONDARY_URL=https://hub.example.com:8443
+export MCP_HYBRID_SECONDARY_API_KEY=your-api-key-here
+# For service behind nginx with basic auth:
+export MCP_HYBRID_SECONDARY_AUTH_STYLE=x-api-key
+export MCP_HYBRID_SECONDARY_BASIC_USER=nginx-user
+export MCP_HYBRID_SECONDARY_BASIC_PASS=nginx-password
+```
+
 ### Example:
 ```bash
 export MCP_MEMORY_STORAGE_BACKEND=hybrid
@@ -143,6 +172,13 @@ Config:
 ```
 Recommended: hybrid (on each client) OR cloudflare (if no local disk)
 Why:         Hybrid keeps each client fast; Cloudflare is the shared ground truth.
+
+Alternative: hybrid with HTTP secondary backend (self-hosted)
+Why:         Same performance but syncs to your own MCP Memory Service hub instead of Cloudflare.
+Config:
+  MCP_MEMORY_STORAGE_BACKEND=hybrid
+  MCP_HYBRID_SECONDARY_BACKEND=http
+  MCP_HYBRID_SECONDARY_URL=https://hub.example.com
 ```
 
 ### Serverless / edge (Cloudflare Workers, no local FS)
@@ -233,15 +269,21 @@ Reads from your local `.db`, writes to D1 + Vectorize. Preserves content, embedd
 ### Cloudflare → SQLite-vec
 **No dedicated script exists.** The workaround is to run the service in `hybrid` mode temporarily: set `MCP_MEMORY_STORAGE_BACKEND=hybrid` and let the background sync populate a local SQLite-vec database from Cloudflare. Then switch `MCP_MEMORY_STORAGE_BACKEND=sqlite_vec` once the local file is populated.
 
-If you need a fully offline migration, export memories via the REST API (`GET /api/memories`) and re-import with [`mcp-migration.py`](https://github.com/doobidoo/mcp-memory-service/blob/main/scripts/migration/mcp-migration.py) or a small custom script. Open an issue if this is a blocker — a dedicated Cloudflare → SQLite-vec script is a reasonable feature request.
+If you need a fully offline migration, export memories via the REST API (`GET /api/memories`) and re-import them with a small custom script. Open an issue if this is a blocker — a dedicated Cloudflare → SQLite-vec script is a reasonable feature request.
 
 ### SQLite-vec → Hybrid / Cloudflare → Hybrid
-Set `MCP_MEMORY_STORAGE_BACKEND=hybrid` and restart. Hybrid initialization reconciles the local SQLite-vec store and the Cloudflare mirror on startup — it picks whichever side is populated and syncs the other direction on the next interval. For a clean cutover from SQLite-vec, run the SQLite-vec → Cloudflare migration above first, then switch to `hybrid`.
+Hybrid startup pulls Cloudflare memories that are missing from the local SQLite-vec store; it does not upload a local database that already exists. For a clean cutover from SQLite-vec, run the SQLite-vec → Cloudflare migration above first, then set `MCP_MEMORY_STORAGE_BACKEND=hybrid` and restart. From Cloudflare, just switching to `hybrid` is enough — the local database is repopulated from the cloud.
 
 ### ChromaDB → SQLite-vec (historical)
-ChromaDB is no longer a supported backend. If you have a legacy ChromaDB store, use:
+ChromaDB is no longer a supported backend and no current release ships a conversion script. Convert the old database with the v7.6.0 release on the [`chromadb-legacy-final`](https://github.com/doobidoo/mcp-memory-service/tree/chromadb-legacy-final) tag, then upgrade:
 ```bash
-python scripts/migration/migrate_to_sqlite_vec.py
+git clone https://github.com/doobidoo/mcp-memory-service.git mcp-memory-service-legacy
+cd mcp-memory-service-legacy
+git checkout chromadb-legacy-final
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e ".[chromadb]"
+python scripts/migration/migrate_chroma_to_sqlite.py \
+  --chroma-path /path/to/chroma_db --sqlite-path ~/chroma_export.db
 ```
 See [`chromadb-migration.md`](chromadb-migration.md) for the full legacy migration guide.
 

@@ -23,18 +23,35 @@ This implementation provides the best of both worlds:
 """
 
 import asyncio
+import inspect
 import logging
+import math
+import os
+import threading
 import time
-from typing import List, Dict, Any, Tuple, Optional
+import weakref
+from typing import List, Dict, Any, Sequence, Set, Tuple, Optional
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from .base import MemoryStorage
+from .base import MemoryStorage, recreate_kwargs
 from .sqlite_vec import SqliteVecMemoryStorage
-from .cloudflare import CloudflareStorage
 from ..models.memory import Memory, MemoryQueryResult
 from ..compat import _sanitize_log_value
+
+# Import CloudflareStorage for backwards compatibility (tests need to patch it)
+# import wrapped in try/except to tolerate environments without the cloudflare extra
+try:
+    from .cloudflare import CloudflareStorage
+except ImportError:
+    CloudflareStorage = None
+
+# Import RemoteHTTPStorage for HTTP secondary backend (tests need to patch it)
+try:
+    from .remote_http import RemoteHTTPStorage
+except ImportError:
+    RemoteHTTPStorage = None
 
 # Import SSE for real-time progress updates
 try:
@@ -76,6 +93,38 @@ HYBRID_MIN_CHECK_COUNT = _min_check if _min_check is not None else 1000
 
 logger = logging.getLogger(__name__)
 
+_tombstone_resolution_locks = weakref.WeakKeyDictionary()
+_tombstone_resolution_locks_guard = threading.Lock()
+
+
+def _get_tombstone_resolution_lock(sqlite_db_path: str) -> asyncio.Lock:
+    """Get the process-wide conflict-resolution lock for a SQLite database."""
+    loop = asyncio.get_running_loop()
+    database_key = os.path.realpath(sqlite_db_path)
+    with _tombstone_resolution_locks_guard:
+        loop_locks = _tombstone_resolution_locks.setdefault(loop, {})
+        lock_ref = loop_locks.get(database_key)
+        lock = lock_ref() if lock_ref is not None else None
+        if lock is not None:
+            return lock
+
+        lock = asyncio.Lock()
+        loop_ref = weakref.ref(loop)
+
+        def discard_lock(reference):
+            active_loop = loop_ref()
+            if active_loop is None:
+                return
+            with _tombstone_resolution_locks_guard:
+                active_locks = _tombstone_resolution_locks.get(active_loop)
+                if active_locks and active_locks.get(database_key) is reference:
+                    del active_locks[database_key]
+                    if not active_locks:
+                        _tombstone_resolution_locks.pop(active_loop, None)
+
+        loop_locks[database_key] = weakref.ref(lock, discard_lock)
+        return lock
+
 @dataclass
 class SyncOperation:
     """Represents a pending sync operation."""
@@ -91,10 +140,62 @@ class SyncOperation:
     timestamp: float = None
     retries: int = 0
     max_retries: int = 3
+    # #1560: an explicit restore (``store(recreate=True)``) is carried to the secondary
+    # so a remote that deleted the same content restores it too instead of answering 409.
+    recreate: Optional[bool] = None
+    # #1915: the store a queued 'store' operation was written to on the primary, so the
+    # secondary files it there too. None (an operation built without one) keeps the
+    # previous call, which lands in the secondary's default store.
+    store: Optional[str] = None
 
     def __post_init__(self):
         if self.timestamp is None:
             self.timestamp = time.time()
+
+
+# Secondary types already warned about a store they cannot take (#1915), so the
+# warning is logged once per type instead of once per queued memory.
+_STORE_NOT_FORWARDED_WARNED: Set[type] = set()
+
+
+def _takes_store(method: Any) -> bool:
+    """Whether ``method`` accepts a ``store`` keyword, by name or through ``**kwargs``.
+
+    A positional-only ``store`` does not count: it cannot be passed as ``store=``.
+    """
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    named = parameters.get("store")
+    if named is not None and named.kind is not inspect.Parameter.POSITIONAL_ONLY:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+
+def _store_kwargs(storage: Any, store: Optional[str]) -> Dict[str, str]:
+    """Keyword arguments that forward a queued operation's ``store`` to ``storage.store()`` (#1915).
+
+    Only a store other than ``"default"`` is forwarded. Every backend's ``store()``
+    defaults to ``"default"``, so leaving it out there changes nothing. A secondary
+    whose ``store()`` has no ``store`` parameter (a backend or test double written
+    before it existed) keeps receiving the call it received before, as with
+    ``recreate_kwargs``; the memory then lands in that secondary's default store,
+    which is logged once per type.
+    """
+    if store is None or store == "default":
+        return {}
+    if _takes_store(storage.store):
+        return {"store": store}
+    kind = type(storage)
+    if kind not in _STORE_NOT_FORWARDED_WARNED:
+        _STORE_NOT_FORWARDED_WARNED.add(kind)
+        logger.warning(
+            "Secondary %s.store() takes no store parameter; memories in named stores "
+            "are synced to its default store",
+            _sanitize_log_value(kind.__name__),
+        )
+    return {}
 
 
 def _normalize_metadata_for_cloudflare(updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -142,6 +243,227 @@ def _normalize_metadata_for_cloudflare(updates: Dict[str, Any]) -> Dict[str, Any
     return wrapped_updates
 
 
+async def _fetch_secondary_content_hashes(secondary) -> Optional[set]:
+    """Fetch all non-deleted content_hash values from the secondary (Cloudflare D1).
+
+    Returns None if the secondary does not support an efficient bulk hash fetch (any
+    backend without D1 access), which signals the caller to fall back to the previous
+    behavior. Returns an empty set if the secondary is reachable but has no memories.
+
+    Uses id-based cursor pagination rather than LIMIT/OFFSET — see
+    `get_all_memories_cursor` at cloudflare.py:1938, which documents D1's OFFSET
+    limitations (400 Bad Request at large offsets) and uses the same pattern.
+    """
+    # Only CloudflareStorage has D1 access + a _retry_request method
+    if not secondary or not hasattr(secondary, '_retry_request') or not hasattr(secondary, 'd1_database_id'):
+        return None
+
+    hashes: set = set()
+    limit = 1000
+    last_id = 0
+    while True:
+        try:
+            resp = await secondary._retry_request(
+                "POST",
+                f"{secondary.base_url}/d1/database/{secondary.d1_database_id}/query",
+                json={
+                    "sql": "SELECT id, content_hash FROM memories WHERE deleted_at IS NULL AND id > ? ORDER BY id ASC LIMIT ?",
+                    "params": [last_id, limit],
+                },
+            )
+            data = resp.json()
+            if not data.get("success"):
+                logger.warning("Secondary hash fetch failed: %s", _sanitize_log_value(data.get('errors')))
+                return None
+            batch = data["result"][0].get("results", [])
+            if not batch:
+                break
+            hashes.update(r["content_hash"] for r in batch)
+            last_id = batch[-1]["id"]
+            if len(batch) < limit:
+                break
+        except Exception as e:
+            logger.warning("Could not fetch secondary hashes: %s", _sanitize_log_value(e))
+            return None
+    return hashes
+
+
+def _has_cloudflare_d1(secondary) -> bool:
+    """Whether ``secondary`` exposes the Cloudflare D1 query path."""
+    return bool(
+        secondary
+        and hasattr(secondary, '_retry_request')
+        and hasattr(secondary, 'd1_database_id')
+    )
+
+
+async def _fetch_secondary_sync_state(secondary) -> Optional[Dict[str, Any]]:
+    """Fetch the Cloudflare live hashes and tombstones from one consistent D1 scan.
+
+    ``None`` means the D1 snapshot could not be read. Callers must fail closed for
+    Cloudflare rather than interpreting an unavailable snapshot as an empty remote.
+    Non-Cloudflare backends are not supported by this helper.
+    """
+    if not _has_cloudflare_d1(secondary):
+        return None
+
+    live_hashes: set = set()
+    tombstones: Dict[str, float] = {}
+    limit = 1000
+    last_id = 0
+    while True:
+        try:
+            resp = await secondary._retry_request(
+                "POST",
+                f"{secondary.base_url}/d1/database/{secondary.d1_database_id}/query",
+                json={
+                    "sql": (
+                        "SELECT id, content_hash, deleted_at FROM memories "
+                        "WHERE id > ? ORDER BY id ASC LIMIT ?"
+                    ),
+                    "params": [last_id, limit],
+                },
+            )
+            data = resp.json()
+            if not data.get("success"):
+                logger.warning(
+                    "Secondary sync-state fetch failed: %s",
+                    _sanitize_log_value(data.get('errors')),
+                )
+                return None
+            batch = data["result"][0].get("results", [])
+            if not batch:
+                break
+            for row in batch:
+                content_hash = row["content_hash"]
+                deleted_at = row.get("deleted_at")
+                if deleted_at is None:
+                    # A restore deletes its tombstone and inserts a new row with a
+                    # higher id. Since D1 pages are separate reads, a restore can
+                    # land between them; the later row must replace the earlier
+                    # state for this hash.
+                    tombstones.pop(content_hash, None)
+                    live_hashes.add(content_hash)
+                else:
+                    live_hashes.discard(content_hash)
+                    tombstones[content_hash] = float(deleted_at)
+            last_id = batch[-1]["id"]
+            if len(batch) < limit:
+                break
+        except Exception as e:
+            logger.warning(
+                "Could not fetch secondary sync state: %s", _sanitize_log_value(e)
+            )
+            return None
+
+    return {"live_hashes": live_hashes, "tombstones": tombstones}
+
+
+async def _reconcile_remote_tombstones(
+    primary,
+    tombstones: Dict[str, float],
+    conflicts: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """Apply remote deletes without overwriting a newer local edit.
+
+    ``tombstone_conflict_hashes`` is capped for reporting. A caller that has to act
+    on every conflict passes ``conflicts`` and gets the full set there.
+    """
+    counts = {
+        "tombstones_applied": 0,
+        "tombstone_conflicts": 0,
+        "tombstone_failures": 0,
+        "tombstone_conflict_hashes": [],
+    }
+    if not tombstones:
+        return counts
+
+    delete_if_older = getattr(primary, "delete_if_not_updated_after", None)
+    if delete_if_older is None:
+        counts["tombstone_failures"] = len(tombstones)
+        logger.error("Primary storage cannot safely reconcile remote tombstones")
+        return counts
+
+    for content_hash, deleted_at in tombstones.items():
+        try:
+            outcome = await delete_if_older(content_hash, deleted_at)
+        except Exception as e:
+            logger.warning(
+                "Failed to reconcile remote tombstone %s: %s",
+                _sanitize_log_value(content_hash[:8]),
+                _sanitize_log_value(e),
+            )
+            counts["tombstone_failures"] += 1
+            continue
+        if outcome == "applied":
+            counts["tombstones_applied"] += 1
+        elif outcome == "conflict":
+            counts["tombstone_conflicts"] += 1
+            if conflicts is not None:
+                conflicts.add(content_hash)
+            if len(counts["tombstone_conflict_hashes"]) < 100:
+                counts["tombstone_conflict_hashes"].append(content_hash)
+        elif outcome not in ("missing", "already_deleted"):
+            counts["tombstone_failures"] += 1
+    return counts
+
+
+def _select_undelivered_restores(
+    memories: List[Memory], tombstones: Dict[str, float], conflicts: Set[str]
+) -> List[Memory]:
+    """Return the conflicting rows that were stored after the remote delete (#1890).
+
+    A restore is a purge and a fresh insert, so its ``created_at`` is later than the
+    tombstone. A local edit keeps its ``created_at``, so it stays a conflict for
+    ``resolve_tombstone_conflict`` to settle. The row is read rather than the
+    ``recreate_of`` stamp in ``sync_events`` because that log is off by default.
+
+    Clocks are compared as in ``delete_if_not_updated_after``: wall clock against
+    wall clock, strictly, so an equal timestamp leaves the delete standing.
+    """
+    return [
+        memory
+        for memory in memories
+        if memory.content_hash in conflicts
+        and memory.created_at is not None
+        and memory.created_at > tombstones[memory.content_hash]
+    ]
+
+
+async def _secondary_hash_set(secondary) -> Optional[set]:
+    """Return the secondary's non-deleted content-hash set, or None if the
+    secondary cannot answer a bulk hash fetch by ANY supported mechanism.
+
+    Order of preference:
+      1. D1 fast path (Cloudflare)         -> _fetch_secondary_content_hashes
+      2. Generic serviceable path (HTTP)   -> secondary.list_content_hashes()
+    
+    INVARIANT: For Cloudflare secondaries, this MUST call _fetch_secondary_content_hashes
+    and NEVER fall back to list_content_hashes (preserves CF byte-identical path).
+    """
+    # Try CF D1 fast path first (byte-identical for CF)
+    d1_hashes = await _fetch_secondary_content_hashes(secondary)
+    if d1_hashes is not None:
+        return d1_hashes
+
+    # A Cloudflare secondary whose D1 fetch failed has no hash set. The inherited
+    # list_content_hashes() would answer with an empty set, which callers read as
+    # "the secondary holds nothing" and skip the pull, so report the failure.
+    if hasattr(secondary, '_retry_request') and hasattr(secondary, 'd1_database_id'):
+        return None
+        
+    # Fall back to generic serviceable path for non-CF secondaries (HTTP)
+    if hasattr(secondary, 'list_content_hashes'):
+        try:
+            return await secondary.list_content_hashes(include_deleted=False)
+        except NotImplementedError:
+            return None
+        except Exception as e:
+            logger.warning("Secondary list_content_hashes failed: %s", _sanitize_log_value(e))
+            return None
+    return None
+
+
 class BackgroundSyncService:
     """
     Handles background synchronization between SQLite-vec and Cloudflare.
@@ -156,12 +478,16 @@ class BackgroundSyncService:
 
     def __init__(self,
                  primary_storage: SqliteVecMemoryStorage,
-                 secondary_storage: CloudflareStorage,
+                 secondary_storage: MemoryStorage,
                  sync_interval: int = None,  # Use config default if None
                  batch_size: int = None,  # Use config default if None
                  max_queue_size: int = None):  # Use config default if None
         self.primary = primary_storage
         self.secondary = secondary_storage
+        # Serialize outbound memory stores with reconciliation scans. A store
+        # admitted before a remote tombstone scan must finish before that scan
+        # reads state; later queued stores must re-check the resulting tombstone.
+        self._store_sync_lock = asyncio.Lock()
 
         # Use config values if parameters not provided (for backward compatibility)
         # Defensive None checks to prevent Queue initialization with maxsize=None (Issue #316)
@@ -298,127 +624,44 @@ class BackgroundSyncService:
         `get_all_memories_cursor` at cloudflare.py:1938, which documents D1's OFFSET
         limitations (400 Bad Request at large offsets) and uses the same pattern.
         """
-        secondary = getattr(self, 'secondary', None)
-        # Only CloudflareStorage has D1 access + a _retry_request method
-        if not secondary or not hasattr(secondary, '_retry_request') or not hasattr(secondary, 'd1_database_id'):
-            return None
+        return await _fetch_secondary_content_hashes(getattr(self, 'secondary', None))
 
-        hashes: set = set()
-        limit = 1000
-        last_id = 0
-        while True:
-            try:
-                resp = await secondary._retry_request(
-                    "POST",
-                    f"{secondary.base_url}/d1/database/{secondary.d1_database_id}/query",
-                    json={
-                        "sql": "SELECT id, content_hash FROM memories WHERE deleted_at IS NULL AND id > ? ORDER BY id ASC LIMIT ?",
-                        "params": [last_id, limit],
-                    },
-                )
-                data = resp.json()
-                if not data.get("success"):
-                    logger.warning("Secondary hash fetch failed: %s", _sanitize_log_value(data.get('errors')))
-                    return None
-                batch = data["result"][0].get("results", [])
-                if not batch:
-                    break
-                hashes.update(r["content_hash"] for r in batch)
-                last_id = batch[-1]["id"]
-                if len(batch) < limit:
-                    break
-            except Exception as e:
-                logger.warning("Could not fetch secondary hashes for dedupe: %s", _sanitize_log_value(e))
-                return None
-        return hashes
+    async def force_sync(self) -> dict[str, Any]:
+        """Force a full sync, serialized against queued outbound stores."""
+        async with self._store_sync_lock:
+            return await self._force_sync_locked()
 
-    async def force_sync(self) -> Dict[str, Any]:
-        """Force an immediate full synchronization between backends."""
+    async def _force_sync_locked(self) -> dict[str, Any]:
+        """Run full synchronization while holding the outbound-store lock."""
         logger.info("Starting forced sync between primary and secondary storage")
         sync_start_time = time.time()
 
         try:
-            # Get all memories from primary storage
             primary_memories = await self.primary.get_all_memories()
+            state, early_result = await self._load_force_sync_state(
+                primary_memories, sync_start_time
+            )
+            if early_result is not None:
+                return early_result
 
-            # Check Cloudflare availability
-            try:
-                await self.secondary.get_stats()  # Simple health check
-                cloudflare_available = True
-            except Exception as e:
-                logger.warning("Cloudflare not available during force sync: %s", _sanitize_log_value(e))
-                self.sync_stats['cloudflare_available'] = False
-                return {
-                    'status': 'partial',
-                    'cloudflare_available': False,
-                    'primary_memories': len(primary_memories),
-                    'synced_to_secondary': 0,
-                    'duration': time.time() - sync_start_time
-                }
-
-            # Dedupe: skip memories that already exist on the secondary. Without this,
-            # force_sync calls embed+upsert for every local memory and burns the CF
-            # Workers AI quota on duplicates — the root cause of `0 synced / N failed`
-            # reported in issue #750.
-            secondary_hashes = await self._fetch_secondary_hashes()
-            if secondary_hashes is not None:
-                new_memories = [m for m in primary_memories if m.content_hash not in secondary_hashes]
-                skipped_count = len(primary_memories) - len(new_memories)
-                logger.info("Dedupe: %s of %s memories already on secondary, pushing %s", skipped_count, len(primary_memories), len(new_memories))
-            else:
-                new_memories = primary_memories
-                skipped_count = 0
-                logger.debug("Secondary hash fetch unavailable — pushing all memories")
-
-            # Sync from primary to secondary using concurrent operations
-            async def sync_memory(memory):
-                try:
-                    success, message = await self.secondary.store(memory)
-                    if success:
-                        return True, None
-                    else:
-                        logger.debug("Failed to sync memory to secondary: %s", _sanitize_log_value(message))
-                        return False, message
-                except Exception as e:
-                    logger.debug("Exception syncing memory to secondary: %s", _sanitize_log_value(e))
-                    return False, str(e)
-
-            # Process memories concurrently in batches
-            synced_count = 0
-            failed_count = 0
-
-            # Process in batches to avoid overwhelming the system
-            batch_size = self.batch_size  # Use configured batch size
-            for i in range(0, len(new_memories), batch_size):
-                batch = new_memories[i:i + batch_size]
-                results = await asyncio.gather(*[sync_memory(m) for m in batch], return_exceptions=True)
-
-                for result in results:
-                    if isinstance(result, Exception):
-                        failed_count += 1
-                        logger.debug("Exception in batch sync: %s", _sanitize_log_value(result))
-                    elif isinstance(result, tuple):
-                        success, _ = result
-                        if success:
-                            synced_count += 1
-                        else:
-                            failed_count += 1
-
-            sync_duration = time.time() - sync_start_time
-            self.sync_stats['last_sync_duration'] = sync_duration
-            self.sync_stats['cloudflare_available'] = cloudflare_available
-
-            logger.info("Force sync completed: %s synced, %s failed, %s skipped (already on secondary) in %.2fs", synced_count, failed_count, skipped_count, sync_duration)
-
-            return {
-                'status': 'completed',
-                'cloudflare_available': cloudflare_available,
-                'primary_memories': len(primary_memories),
-                'synced_to_secondary': synced_count,
-                'failed_operations': failed_count,
-                'skipped_already_present': skipped_count,
-                'duration': sync_duration
-            }
+            new_memories, skipped_count, skipped_tombstones = (
+                self._select_force_sync_memories(primary_memories, state)
+            )
+            synced_count, failed_count = await self._sync_force_sync_memories(
+                new_memories
+            )
+            restored_count, restore_failures = await self._push_undelivered_restores(
+                state
+            )
+            return self._force_sync_result(
+                primary_memories,
+                state,
+                synced_count + restored_count,
+                failed_count + restore_failures,
+                skipped_count,
+                skipped_tombstones - restored_count,
+                sync_start_time,
+            )
 
         except Exception as e:
             logger.error("Error during force sync: %s", _sanitize_log_value(e))
@@ -427,6 +670,266 @@ class BackgroundSyncService:
                 'error': str(e),
                 'duration': time.time() - sync_start_time
             }
+
+    async def _load_force_sync_state(
+        self, primary_memories: List[Memory], sync_start_time: float
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Read remote state, returning an early response when it is unavailable."""
+        try:
+            await self.secondary.get_stats()
+        except Exception as e:
+            logger.warning(
+                "Cloudflare not available during force sync: %s",
+                _sanitize_log_value(e),
+            )
+            self.sync_stats['cloudflare_available'] = False
+            return {}, {
+                'status': 'partial',
+                'cloudflare_available': False,
+                'primary_memories': len(primary_memories),
+                'synced_to_secondary': 0,
+                'duration': time.time() - sync_start_time,
+            }
+
+        remote_tombstones: Dict[str, float] = {}
+        undelivered_restores: List[Memory] = []
+        if _has_cloudflare_d1(self.secondary):
+            sync_state = await _fetch_secondary_sync_state(self.secondary)
+            if sync_state is None:
+                self.sync_stats['cloudflare_available'] = False
+                return {}, {
+                    'status': 'partial',
+                    'cloudflare_available': False,
+                    'primary_memories': len(primary_memories),
+                    'synced_to_secondary': 0,
+                    'failed_operations': 0,
+                    'skipped_already_present': 0,
+                    'skipped_remote_tombstones': 0,
+                    'tombstones_applied': 0,
+                    'tombstone_conflicts': 0,
+                    'tombstone_failures': 1,
+                    'tombstone_conflict_hashes': [],
+                    'duration': time.time() - sync_start_time,
+                    'error': (
+                        'Could not read Cloudflare tombstones; skipped push '
+                        'to prevent resurrection'
+                    ),
+                }
+            remote_tombstones = sync_state['tombstones']
+            conflicts: Set[str] = set()
+            tombstone_counts = await _reconcile_remote_tombstones(
+                self.primary, remote_tombstones, conflicts
+            )
+            undelivered_restores = _select_undelivered_restores(
+                primary_memories, remote_tombstones, conflicts
+            )
+            secondary_hashes = sync_state['live_hashes']
+        else:
+            tombstone_counts = {
+                'tombstones_applied': 0,
+                'tombstone_conflicts': 0,
+                'tombstone_failures': 0,
+                'tombstone_conflict_hashes': [],
+            }
+            secondary_hashes = await self._fetch_secondary_hashes()
+
+        return {
+            'cloudflare_available': True,
+            'remote_tombstones': remote_tombstones,
+            'secondary_hashes': secondary_hashes,
+            'tombstone_counts': tombstone_counts,
+            'undelivered_restores': undelivered_restores,
+        }, None
+
+    @staticmethod
+    def _select_force_sync_memories(
+        primary_memories: List[Memory], state: Dict[str, Any]
+    ) -> Tuple[List[Memory], int, int]:
+        """Exclude known remote rows and tombstones before pushing local memories."""
+        secondary_hashes = state['secondary_hashes']
+        if secondary_hashes is None:
+            logger.debug("Secondary hash fetch unavailable — pushing all memories")
+            return primary_memories, 0, 0
+
+        remote_tombstones = state['remote_tombstones']
+        new_memories = []
+        skipped_count = 0
+        skipped_tombstones = 0
+        for memory in primary_memories:
+            content_hash = memory.content_hash
+            if content_hash in secondary_hashes:
+                skipped_count += 1
+            if content_hash in remote_tombstones:
+                skipped_tombstones += 1
+            if (
+                content_hash not in secondary_hashes
+                and content_hash not in remote_tombstones
+            ):
+                new_memories.append(memory)
+        logger.info(
+            "Dedupe: %s already present, %s protected by remote tombstones, "
+            "pushing %s",
+            skipped_count,
+            skipped_tombstones,
+            len(new_memories),
+        )
+        return new_memories, skipped_count, skipped_tombstones
+
+    async def _push_undelivered_restores(
+        self, state: Dict[str, Any]
+    ) -> Tuple[int, int]:
+        """Deliver restores the sync queue gave up on (#1890).
+
+        A pushed restore replaces the tombstone, so it stops being a conflict. A
+        tombstone that changed after the scan is left alone and stays one. So does
+        a row that could not be read again, which is reported as a failure.
+        """
+        restored_count = 0
+        failed_count = 0
+        tombstone_counts = state['tombstone_counts']
+        for memory in state['undelivered_restores']:
+            content_hash = memory.content_hash
+            try:
+                outcome, message = await self._push_one_restore(
+                    memory, state['remote_tombstones'][content_hash]
+                )
+            except Exception as e:
+                outcome, message = 'failed', str(e)
+            if outcome in ('restored', 'deleted'):
+                tombstone_counts['tombstone_conflicts'] -= 1
+                if content_hash in tombstone_counts['tombstone_conflict_hashes']:
+                    tombstone_counts['tombstone_conflict_hashes'].remove(content_hash)
+            if outcome == 'restored':
+                restored_count += 1
+            elif outcome == 'failed':
+                failed_count += 1
+                logger.warning(
+                    "Could not push restored memory %s: %s",
+                    _sanitize_log_value(content_hash[:8]),
+                    _sanitize_log_value(message),
+                )
+        return restored_count, failed_count
+
+    async def _push_one_restore(
+        self, memory: Memory, expected_deleted_at: float
+    ) -> Tuple[str, str]:
+        """Upload one restore unless its row was deleted during this run.
+
+        The row is read again first, because a local delete does not wait for
+        force_sync. That leaves the upload itself: a delete landing while it is in
+        flight meets the old tombstone, changes nothing on Cloudflare and reports
+        success, so the upload would bring the row back. Checking the row afterwards
+        closes that gap. A delete committed before the check is sent again here, and
+        one committed after it is queued behind the upload and finds a live row.
+
+        Returns ``(outcome, message)``, where outcome is ``restored``, ``deleted``
+        (the row is gone locally, so there is no conflict left), ``changed`` (the
+        tombstone moved) or ``failed``.
+        """
+        current = await self._get_current_queued_store_memory(memory)
+        if current is None:
+            return 'deleted', 'The primary row is no longer live'
+        success, message = await self.secondary.store_if_tombstone_matches(
+            current, expected_deleted_at
+        )
+        if success is None:
+            return 'changed', message
+        if not success:
+            return 'failed', message
+        sync_state = await self.primary.get_sync_state_for_hash(current.content_hash)
+        if sync_state is None or sync_state[1] is not None:
+            await self.enqueue_operation(
+                SyncOperation(operation='delete', content_hash=current.content_hash)
+            )
+            return 'deleted', 'The primary row was deleted during the upload'
+        return 'restored', message
+
+    async def _sync_one_force_sync_memory(
+        self, memory: Memory
+    ) -> Tuple[bool, Optional[str]]:
+        """Push one memory to secondary storage without aborting its batch."""
+        try:
+            success, message = await self.secondary.store(memory)
+            if success:
+                return True, None
+            logger.debug(
+                "Failed to sync memory to secondary: %s",
+                _sanitize_log_value(message),
+            )
+            return False, message
+        except Exception as e:
+            logger.debug(
+                "Exception syncing memory to secondary: %s",
+                _sanitize_log_value(e),
+            )
+            return False, str(e)
+
+    async def _sync_force_sync_memories(
+        self, memories: List[Memory]
+    ) -> Tuple[int, int]:
+        """Push memories concurrently in configured batches and count outcomes."""
+        synced_count = 0
+        failed_count = 0
+        for start in range(0, len(memories), self.batch_size):
+            batch = memories[start:start + self.batch_size]
+            results = await asyncio.gather(
+                *(self._sync_one_force_sync_memory(memory) for memory in batch),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    failed_count += 1
+                    logger.debug(
+                        "Exception in batch sync: %s", _sanitize_log_value(result)
+                    )
+                elif isinstance(result, tuple):
+                    if result[0]:
+                        synced_count += 1
+                    else:
+                        failed_count += 1
+        return synced_count, failed_count
+
+    def _force_sync_result(
+        self,
+        primary_memories: List[Memory],
+        state: Dict[str, Any],
+        synced_count: int,
+        failed_count: int,
+        skipped_count: int,
+        skipped_tombstones: int,
+        sync_start_time: float,
+    ) -> Dict[str, Any]:
+        """Record sync metrics and return the completed force-sync response."""
+        sync_duration = time.time() - sync_start_time
+        self.sync_stats['last_sync_duration'] = sync_duration
+        self.sync_stats['cloudflare_available'] = state['cloudflare_available']
+        tombstone_counts = state['tombstone_counts']
+        logger.info(
+            "Force sync completed: %s synced, %s failed, %s skipped "
+            "(already on secondary) in %.2fs",
+            synced_count,
+            failed_count,
+            skipped_count,
+            sync_duration,
+        )
+        status = (
+            'completed'
+            if not failed_count
+            and not tombstone_counts['tombstone_conflicts']
+            and not tombstone_counts['tombstone_failures']
+            else 'partial'
+        )
+        return {
+            'status': status,
+            'cloudflare_available': state['cloudflare_available'],
+            'primary_memories': len(primary_memories),
+            'synced_to_secondary': synced_count,
+            'failed_operations': failed_count,
+            'skipped_already_present': skipped_count,
+            'skipped_remote_tombstones': skipped_tombstones,
+            **tombstone_counts,
+            'duration': sync_duration,
+        }
 
     async def get_sync_status(self) -> Dict[str, Any]:
         """Get current sync service status and statistics."""
@@ -644,8 +1147,9 @@ class BackgroundSyncService:
             self.cloudflare_stats['approaching_limits'] = True
             self.cloudflare_stats['limit_warnings'].append(f"Limit error: {error}")
 
-            # Check capacity to understand the issue
-            await self.check_cloudflare_capacity()
+            # Check capacity to understand the issue (only for backends that support monitoring)
+            if getattr(self.secondary, 'supports_capacity_monitoring', False):
+                await self.check_cloudflare_capacity()
             return
 
         # Check for temporary/network errors
@@ -671,23 +1175,96 @@ class BackgroundSyncService:
             logger.error("Permanent error for %s: %s", _sanitize_log_value(operation.operation), _sanitize_log_value(error))
             self.sync_stats['operations_failed'] += 1
 
+    async def _get_current_queued_store_memory(
+        self, memory: Memory
+    ) -> Optional[Memory]:
+        """Return a live primary snapshot for a queued create, or skip it.
+
+        Queue retries can outlive a remote tombstone reconciliation. Re-read the
+        primary row immediately before upload so neither pending nor retried store
+        operations can turn a deleted hash live again. If the queued snapshot was
+        superseded by a metadata edit, use the current row: dropping the create would
+        leave the later queued update unable to create the missing secondary row.
+        Sync-state read errors propagate to the normal retry path rather than fail open.
+        """
+        state = await self.primary.get_sync_state_for_hash(memory.content_hash)
+        if state is None:
+            logger.debug(
+                "Skipping queued store for %s because the primary row no longer exists",
+                _sanitize_log_value(memory.content_hash[:16]),
+            )
+            return None
+
+        current_updated_at, deleted_at = state
+        if deleted_at is not None:
+            logger.debug(
+                "Skipping queued store for %s because the primary row is tombstoned",
+                _sanitize_log_value(memory.content_hash[:16]),
+            )
+            return None
+
+        queued_updated_at = memory.updated_at
+        if (
+            current_updated_at is not None
+            and (
+                queued_updated_at is None
+                or float(current_updated_at) > float(queued_updated_at)
+            )
+        ):
+            current_memory = await self.primary.get_by_hash(memory.content_hash)
+            if current_memory is None:
+                # get_by_hash's public contract returns None on retrieval failures.
+                # Recheck tombstone state so real deletions stay skipped, while a
+                # still-live row with an unreadable snapshot enters retry handling.
+                latest_state = await self.primary.get_sync_state_for_hash(
+                    memory.content_hash
+                )
+                if latest_state is None or latest_state[1] is not None:
+                    logger.debug(
+                        "Skipping queued store for %s because the primary row is no longer live",
+                        _sanitize_log_value(memory.content_hash[:16]),
+                    )
+                    return None
+                raise RuntimeError(
+                    "Could not read the newer primary snapshot for queued store "
+                    f"{memory.content_hash[:16]}"
+                )
+            logger.debug(
+                "Using current primary snapshot for queued store %s; it has a newer edit",
+                _sanitize_log_value(memory.content_hash[:16]),
+            )
+            return current_memory
+        return memory
+
     async def _process_single_operation(self, operation: SyncOperation):
         """Process a single sync operation to secondary storage."""
         try:
             if operation.operation == 'store' and operation.memory:
-                # Validate memory before syncing
-                is_valid, validation_error = await self.validate_memory_for_cloudflare(operation.memory)
-                if not is_valid:
-                    logger.warning("Memory validation failed for sync: %s", _sanitize_log_value(validation_error))
-                    # Don't retry if it's a hard limit
-                    if "exceeds Cloudflare limit" in validation_error or "limit of" in validation_error:
-                        self.sync_stats['operations_failed'] += 1
-                        return  # Skip this memory permanently
-                    raise Exception(validation_error)
+                async with self._store_sync_lock:
+                    memory_to_sync = await self._get_current_queued_store_memory(
+                        operation.memory
+                    )
+                    if memory_to_sync is None:
+                        return
 
-                success, message = await self.secondary.store(operation.memory)
-                if not success:
-                    raise Exception(f"Store operation failed: {message}")
+                    # Validate memory before syncing (only for backends that support capacity monitoring)
+                    if getattr(self.secondary, 'supports_capacity_monitoring', False):
+                        is_valid, validation_error = await self.validate_memory_for_cloudflare(memory_to_sync)
+                        if not is_valid:
+                            logger.warning("Memory validation failed for sync: %s", _sanitize_log_value(validation_error))
+                            # Don't retry if it's a hard limit
+                            if "exceeds Cloudflare limit" in validation_error or "limit of" in validation_error:
+                                self.sync_stats['operations_failed'] += 1
+                                return  # Skip this memory permanently
+                            raise RuntimeError(validation_error)
+
+                    success, message = await self.secondary.store(
+                        memory_to_sync,
+                        **_store_kwargs(self.secondary, operation.store),
+                        **recreate_kwargs(self.secondary, operation.recreate),
+                    )
+                    if not success:
+                        raise RuntimeError(f"Store operation failed: {message}")
 
             elif operation.operation == 'delete' and operation.content_hash:
                 success, message = await self.secondary.delete(operation.content_hash)
@@ -695,19 +1272,23 @@ class BackgroundSyncService:
                     raise Exception(f"Delete operation failed: {message}")
 
             elif operation.operation == 'update' and operation.content_hash and operation.updates:
-                # Validate metadata size before syncing to Cloudflare
-                if 'metadata' in operation.updates:
-                    import json
-                    metadata_json = json.dumps(operation.updates['metadata'])
-                    metadata_size_kb = len(metadata_json.encode('utf-8')) / 1024
+                # Validate metadata size before syncing to Cloudflare (only for backends that require it)
+                if getattr(self.secondary, 'requires_metadata_normalization', False):
+                    if 'metadata' in operation.updates:
+                        import json
+                        metadata_json = json.dumps(operation.updates['metadata'])
+                        metadata_size_kb = len(metadata_json.encode('utf-8')) / 1024
 
-                    if metadata_size_kb > 9.5:  # 9.5KB safety margin (Cloudflare limit is 10KB)
-                        logger.warning("Skipping Cloudflare sync for %s: metadata too large (%.2fKB > 9.5KB limit)", _sanitize_log_value(operation.content_hash[:16]), metadata_size_kb)
-                        self.sync_stats['operations_failed'] += 1
-                        return  # Skip this update permanently (too large for Cloudflare)
+                        if metadata_size_kb > 9.5:  # 9.5KB safety margin (Cloudflare limit is 10KB)
+                            logger.warning("Skipping Cloudflare sync for %s: metadata too large (%.2fKB > 9.5KB limit)", _sanitize_log_value(operation.content_hash[:16]), metadata_size_kb)
+                            self.sync_stats['operations_failed'] += 1
+                            return  # Skip this update permanently (too large for Cloudflare)
 
-                # Normalize metadata for Cloudflare backend
-                normalized_updates = _normalize_metadata_for_cloudflare(operation.updates)
+                # Normalize metadata for Cloudflare backend (only for backends that require it)
+                if getattr(self.secondary, 'requires_metadata_normalization', False):
+                    normalized_updates = _normalize_metadata_for_cloudflare(operation.updates)
+                else:
+                    normalized_updates = operation.updates
 
                 success, message = await self.secondary.update_memory_metadata(
                     operation.content_hash,
@@ -718,6 +1299,9 @@ class BackgroundSyncService:
                     raise Exception(f"Update operation failed: {message}")
 
             elif operation.operation == 'delete_by_timeframe':
+                if not getattr(self.secondary, 'supports_delete_operations', False):
+                    logger.warning("Secondary %s does not support date-range deletes; skipping remote delete_by_timeframe (local delete already applied)", type(self.secondary).__name__)
+                    return
                 # Delete memories by timeframe in secondary storage
                 if operation.start_date and operation.end_date:
                     success, message = await self.secondary.delete_by_timeframe(
@@ -733,6 +1317,9 @@ class BackgroundSyncService:
                     raise ValueError("delete_by_timeframe operation missing start_date or end_date")
 
             elif operation.operation == 'delete_before_date':
+                if not getattr(self.secondary, 'supports_delete_operations', False):
+                    logger.warning("Secondary %s does not support date-range deletes; skipping remote delete_before_date (local delete already applied)", type(self.secondary).__name__)
+                    return
                 # Delete memories before date in secondary storage
                 if operation.before_date:
                     success, message = await self.secondary.delete_before_date(
@@ -751,7 +1338,7 @@ class BackgroundSyncService:
             self.backoff_time = 60
             self.sync_stats['cloudflare_available'] = True
 
-        except Exception as e:
+        except Exception:
             # Mark Cloudflare as potentially unavailable
             self.sync_stats['cloudflare_available'] = False
             raise
@@ -794,7 +1381,7 @@ class BackgroundSyncService:
                 # full table scan. Running it every cycle was the single largest
                 # source of our D1 row reads, so it now has its own cadence.
                 since_capacity_check = time.time() - self.cloudflare_stats.get('last_capacity_check', 0)
-                if healthy and since_capacity_check >= self.capacity_check_interval:
+                if healthy and since_capacity_check >= self.capacity_check_interval and getattr(self.secondary, 'supports_capacity_monitoring', False):
                     capacity_status = await self.check_cloudflare_capacity()
                     if capacity_status.get('approaching_limits'):
                         logger.warning("Cloudflare approaching capacity limits")
@@ -836,6 +1423,18 @@ class BackgroundSyncService:
         if not self.drift_check_enabled:
             return {'checked': 0, 'drift_detected': 0, 'synced': 0, 'failed': 0}
 
+        # Drift reconciliation needs the secondary to expose a bulk updated-memory
+        # listing. An HTTP secondary inherits supports_delete_operations=False and
+        # has no such listing (the base get_all_memories returns empty), so running
+        # the scan would silently advance the last-check clock without reconciling
+        # anything. Skip explicitly instead (greptile P1, PR #1474).
+        if not getattr(self.secondary, 'supports_delete_operations', False):
+            logger.debug(
+                "Secondary %s does not support bulk drift listing; skipping drift scan",
+                type(self.secondary).__name__,
+            )
+            return {'checked': 0, 'drift_detected': 0, 'synced': 0, 'failed': 0}
+
         logger.info("Starting drift detection scan (dry_run=%s)...", dry_run)
         stats = {'checked': 0, 'drift_detected': 0, 'synced': 0, 'failed': 0}
 
@@ -870,7 +1469,7 @@ class BackgroundSyncService:
                         stats['drift_detected'] += 1
                         logger.debug("Memory %s missing locally, syncing...", _sanitize_log_value(cf_memory.content_hash[:8]))
                         if not dry_run:
-                            success, _ = await self.primary.store(cf_memory)
+                            success, _ = await self.primary.store(cf_memory, skip_semantic_dedup=True)
                             if success:
                                 stats['synced'] += 1
                         else:
@@ -963,6 +1562,9 @@ class HybridMemoryStorage(MemoryStorage):
     - Full compatibility with the MemoryStorage interface
     """
 
+    # Delegates get_by_hash to the SQLite-vec primary, which scopes by ``store``.
+    get_by_hash_is_store_scoped = True
+
     @property
     def max_content_length(self) -> Optional[int]:
         """
@@ -976,14 +1578,34 @@ class HybridMemoryStorage(MemoryStorage):
         """Hybrid backend supports content chunking with metadata linking."""
         return True
 
+    async def count_untagged_memories(self) -> int:
+        """Count untagged memories in primary storage."""
+        return await self.primary.count_untagged_memories()
+
+    async def delete_untagged_memories(self, expected_count: Optional[int] = None) -> Tuple[int, str]:
+        """Delegate guarded deletion; primary storage records tombstones and sync events."""
+        return await self.primary.delete_untagged_memories(expected_count=expected_count)
+
+    async def get_db_embedding_dimension(self) -> Optional[int]:
+        """Get the embedding dimension from primary storage."""
+        if hasattr(self.primary, 'get_db_embedding_dimension'):
+            return await self.primary.get_db_embedding_dimension()
+        return None
+
     def __init__(self,
                  sqlite_db_path: str,
                  embedding_model: str = "all-MiniLM-L6-v2",
                  cloudflare_config: Dict[str, Any] = None,
                  sync_interval: int = 300,
-                 batch_size: int = 50):
+                 batch_size: int = 50,
+                 secondary_backend: Optional[str] = None,
+                 secondary_url: Optional[str] = None,
+                 secondary_api_key: Optional[str] = None,
+                 secondary_auth_style: Optional[str] = None,
+                 secondary_basic_user: Optional[str] = None,
+                 secondary_basic_pass: Optional[str] = None):
         """
-        Initialize hybrid storage with primary SQLite-vec and secondary Cloudflare.
+        Initialize hybrid storage with primary SQLite-vec and secondary backend.
 
         Args:
             sqlite_db_path: Path to SQLite-vec database file
@@ -991,21 +1613,72 @@ class HybridMemoryStorage(MemoryStorage):
             cloudflare_config: Cloudflare configuration dict
             sync_interval: Background sync interval in seconds (default: 5 minutes)
             batch_size: Batch size for sync operations (default: 50)
+            secondary_backend: Optional secondary backend type ('http' or 'cloudflare')
+            secondary_url: Optional URL for HTTP secondary backend
+            secondary_api_key: Optional API key for HTTP secondary backend
+            secondary_auth_style: Optional auth style for HTTP backend ('bearer' or 'x-api-key')
+            secondary_basic_user: Optional basic auth username for HTTP backend
+            secondary_basic_pass: Optional basic auth password for HTTP backend
         """
+        self.embedding_model = embedding_model  # Store for model validation
         self.primary = SqliteVecMemoryStorage(
             db_path=sqlite_db_path,
             embedding_model=embedding_model
         )
-
-        # Initialize Cloudflare storage if config provided
+        # Initialize secondary storage based on backend type
         self.secondary = None
         self.sync_service = None
+        # Which kind of secondary was built ('http' | 'cloudflare' | None); get_stats()
+        # reports it, so a hub-backed hybrid is not labelled "Cloudflare".
+        self.secondary_backend_type: Optional[str] = None
 
-        if cloudflare_config and all(key in cloudflare_config for key in
+        # Resolve secondary backend (kwarg takes precedence over config)
+        from ..config.storage import (MCP_HYBRID_SECONDARY_BACKEND, MCP_HYBRID_SECONDARY_URL, 
+                                     MCP_HYBRID_SECONDARY_API_KEY, MCP_HYBRID_SECONDARY_AUTH_STYLE,
+                                     MCP_HYBRID_SECONDARY_BASIC_USER, MCP_HYBRID_SECONDARY_BASIC_PASS)
+        
+        backend_type = (secondary_backend or MCP_HYBRID_SECONDARY_BACKEND or '').lower()
+        url = secondary_url or MCP_HYBRID_SECONDARY_URL
+        api_key = secondary_api_key or MCP_HYBRID_SECONDARY_API_KEY
+
+        # Fix Bug #2: Explicit error when HTTP backend requested without URL
+        if backend_type == 'http' and not url:
+            raise ValueError("HTTP backend requested but no URL provided. "
+                           "Please set secondary_url parameter or MCP_HYBRID_SECONDARY_URL environment variable.")
+
+        if backend_type == 'http' and url:
+            # HTTP backend
+            # Resolve auth parameters (kwargs take precedence over config)
+            auth_style = secondary_auth_style or MCP_HYBRID_SECONDARY_AUTH_STYLE
+            basic_user = secondary_basic_user or MCP_HYBRID_SECONDARY_BASIC_USER
+            basic_pass = secondary_basic_pass or MCP_HYBRID_SECONDARY_BASIC_PASS
+            
+            # Auto-select x-api-key when basic auth is provided (avoid bearer+basic conflict)
+            if basic_user and basic_pass and auth_style == 'bearer':
+                auth_style = 'x-api-key'
+            
+            # Build kwargs for RemoteHTTPStorage
+            http_kwargs = {
+                'base_url': url,
+                'api_key': api_key,
+                'auth_style': auth_style,
+                'expected_embedding_model': self.embedding_model  # Pass expected model for validation
+            }
+            
+            if basic_user:
+                http_kwargs['basic_user'] = basic_user
+            if basic_pass:
+                http_kwargs['basic_pass'] = basic_pass
+                
+            self.secondary = RemoteHTTPStorage(**http_kwargs)
+            self.secondary_backend_type = 'http'
+        elif cloudflare_config and all(key in cloudflare_config for key in
                                     ['api_token', 'account_id', 'vectorize_index', 'd1_database_id']):
+            # Cloudflare backend
             self.secondary = CloudflareStorage(**cloudflare_config)
+            self.secondary_backend_type = 'cloudflare'
         else:
-            logger.warning("Cloudflare config incomplete, running in SQLite-only mode")
+            logger.warning("No valid secondary backend config, running in SQLite-only mode")
 
         self.sync_interval = sync_interval
         self.batch_size = batch_size
@@ -1035,7 +1708,8 @@ class HybridMemoryStorage(MemoryStorage):
         if self.secondary:
             try:
                 await self.secondary.initialize()
-                logger.info("Secondary storage (Cloudflare) initialized")
+                secondary_name = self.secondary.__class__.__name__
+                logger.info("Secondary storage (%s) initialized", secondary_name)
 
                 # Start background sync service
                 self.sync_service = BackgroundSyncService(
@@ -1053,6 +1727,26 @@ class HybridMemoryStorage(MemoryStorage):
                     logger.info("Initial sync scheduled to run after server startup")
 
             except Exception as e:
+                # Import EmbeddingModelMismatchError to check for it
+                from .base import EmbeddingModelMismatchError
+
+                # Re-raise EmbeddingModelMismatchError - service should refuse to start on model mismatch
+                if isinstance(e, EmbeddingModelMismatchError):
+                    # Close both backends before propagating so a failed startup does not
+                    # leak the already-initialized primary or the secondary's HTTP client
+                    # (greptile P2 #1476). Best-effort: closing errors must not mask the mismatch.
+                    for backend in (self.secondary, self.primary):
+                        if backend is not None and hasattr(backend, 'close'):
+                            try:
+                                result = backend.close()
+                                if asyncio.iscoroutine(result):
+                                    await result
+                            except Exception as close_err:
+                                logger.debug("Error closing backend after model mismatch: %s",
+                                             _sanitize_log_value(close_err))
+                    raise
+
+                # For all other exceptions, log and set secondary to None (graceful degradation)
                 logger.warning("Failed to initialize secondary storage: %s", _sanitize_log_value(e))
                 self.secondary = None
 
@@ -1092,8 +1786,32 @@ class HybridMemoryStorage(MemoryStorage):
             - time_taken_seconds: float
         """
         sync_start_time = time.time()
+        tombstone_counts = {
+            'tombstones_applied': 0,
+            'tombstone_conflicts': 0,
+            'tombstone_failures': 0,
+            'tombstone_conflict_hashes': [],
+        }
 
         try:
+            sync_state = None
+            if _has_cloudflare_d1(self.secondary):
+                sync_state = await _fetch_secondary_sync_state(self.secondary)
+                if sync_state is None:
+                    # Pull-only is safe to continue through the existing live-row
+                    # cursor scan; unlike force_sync it cannot overwrite remote rows.
+                    # Surface the incomplete tombstone check so the caller does not
+                    # report a fully synchronized state.
+                    tombstone_counts['tombstone_failures'] = 1
+                    logger.warning(
+                        "Cloudflare tombstone snapshot unavailable; "
+                        "continuing pull-only scan"
+                    )
+                else:
+                    tombstone_counts = await _reconcile_remote_tombstones(
+                        self.primary, sync_state['tombstones']
+                    )
+
             # Get memory count from both storages to compare
             primary_stats = await self.primary.get_stats()
             secondary_stats = await self.secondary.get_stats()
@@ -1104,26 +1822,243 @@ class HybridMemoryStorage(MemoryStorage):
 
             logger.info("%s sync: Local=%s, Cloudflare=%s", sync_type.capitalize(), primary_count, secondary_count)
 
-            if secondary_count <= primary_count:
-                logger.info("No new memories to sync from Cloudflare (%s sync)", sync_type)
+            # Get all local hashes once for O(1) lookup and to diff against the secondary.
+            local_hashes = await self.primary.get_all_content_hashes()
+
+            # Ask the secondary for its hash set whatever the counts say: a count says nothing
+            # about WHICH hashes are missing. When the secondary holds more memories than the
+            # primary, the newest-first scan below gives up after HYBRID_MAX_EMPTY_BATCHES
+            # batches without a new memory, so old cloud-only memories buried behind thousands
+            # of shared ones would never be reached. The exact diff has no such limit.
+            secondary_hashes = (
+                sync_state['live_hashes']
+                if sync_state is not None
+                else await _secondary_hash_set(self.secondary)
+            )
+
+            if secondary_hashes is not None or secondary_count <= primary_count:
+                # A count comparison can't prove the primary already holds everything the
+                # secondary does. With divergent sets — local-only writes queued while the
+                # cloud was unreachable, plus memories another device wrote straight to the
+                # cloud — the totals can read local >= cloud while the cloud still holds
+                # hashes the primary is missing. The periodic drift scan only revisits
+                # memories updated since its last run, so an older cloud-only memory would
+                # otherwise never reach this device. Confirm with a hash diff (the same
+                # bulk-hash fetch force_sync uses for the reverse direction) before
+                # concluding there is nothing to pull. If the secondary can't answer a
+                # bulk-hash fetch (non-Cloudflare backends), keep the count-only behavior
+                # when it holds no more than the primary, and the scan below when it holds more.
+                missing_hashes = (secondary_hashes - local_hashes) if secondary_hashes is not None else None
+                if not missing_hashes:
+                    logger.info("No new memories to sync from Cloudflare (%s sync)", sync_type)
+                    has_tombstone_issues = bool(
+                        tombstone_counts['tombstone_conflicts']
+                        or tombstone_counts['tombstone_failures']
+                    )
+                    message = 'No new memories to pull from Cloudflare'
+                    if tombstone_counts['tombstone_conflicts']:
+                        message += (
+                            f"; preserved {tombstone_counts['tombstone_conflicts']} "
+                            "newer local edit(s) with tombstone conflicts"
+                        )
+                    if tombstone_counts['tombstone_failures']:
+                        message += (
+                            "; tombstone reconciliation incomplete "
+                            f"({tombstone_counts['tombstone_failures']} failure(s))"
+                        )
+                    return {
+                        'success': not has_tombstone_issues,
+                        'memories_synced': 0,
+                        'total_checked': 0,
+                        'message': message,
+                        'time_taken_seconds': round(time.time() - sync_start_time, 3),
+                        **tombstone_counts,
+                    }
+                # The exact missing hashes are known here, so pull precisely those
+                # instead of falling through to the full scan: the scan pages
+                # newest-first and gives up after HYBRID_MAX_EMPTY_BATCHES batches
+                # without a sync, so an old cloud-only memory buried behind thousands
+                # of shared ones could be skipped even though its hash is in this set.
+                # (Before the hash diff existed this branch returned without pulling
+                # at all, so skipping the drift scan here preserves the old cost
+                # profile when the sets already match.)
+                missing_count = len(missing_hashes)
+                logger.info("Pulling %s cloud-only memories from Cloudflare by hash (%s sync)", missing_count, sync_type)
+                synced_count = 0
+                failed_count = 0
+                for content_hash in missing_hashes:
+                    try:
+                        # Tombstone check, as in the scan below: deleted locally means
+                        # propagate the delete to the cloud, not re-pull the memory.
+                        if hasattr(self.primary, 'is_deleted') and await self.primary.is_deleted(content_hash):
+                            logger.debug("Memory %s was deleted locally, skipping cloud sync", _sanitize_log_value(content_hash[:8]))
+                            if self.sync_service:
+                                operation = SyncOperation(operation='delete', content_hash=content_hash)
+                                await self.sync_service.enqueue_operation(operation)
+                            continue
+                        # get_by_hash filters deleted_at IS NULL, so a memory
+                        # soft-deleted after the hash snapshot comes back None here
+                        # instead of being restored locally. (A post-fetch check on
+                        # the Memory object can't work: the model has no deleted_at
+                        # field, so a deleted row is indistinguishable from a live one.)
+                        cf_memory = await self.secondary.get_by_hash(content_hash)
+                        if cf_memory is None:
+                            failed_count += 1
+                            logger.warning("Cloud-only memory %s disappeared or was deleted before pull", _sanitize_log_value(content_hash[:8]))
+                            continue
+                        success, message = await self.primary.store(cf_memory, skip_semantic_dedup=True)
+                        if success:
+                            synced_count += 1
+                            local_hashes.add(content_hash)
+                        else:
+                            failed_count += 1
+                            logger.warning("Failed to sync memory %s: %s", _sanitize_log_value(content_hash), _sanitize_log_value(message))
+                    except Exception as e:
+                        failed_count += 1
+                        logger.warning("Error syncing memory %s: %s", _sanitize_log_value(content_hash), _sanitize_log_value(e))
+
+                time_taken = time.time() - sync_start_time
+                logger.info("%s sync completed: %s/%s cloud-only memories in %.2fs", sync_type.capitalize(), synced_count, missing_count, time_taken)
+
+                if broadcast_sse and SSE_AVAILABLE:
+                    try:
+                        completion_event = create_sync_completed_event(
+                            synced_count=synced_count,
+                            total_count=missing_count,
+                            time_taken_seconds=time_taken,
+                            sync_type=sync_type
+                        )
+                        await sse_manager.broadcast_event(completion_event)
+                    except Exception as e:
+                        logger.debug("Failed to broadcast SSE completion: %s", _sanitize_log_value(e))
+
+                has_tombstone_issues = bool(
+                    tombstone_counts['tombstone_conflicts']
+                    or tombstone_counts['tombstone_failures']
+                )
+                message = (
+                    f'Successfully pulled {synced_count} memories from Cloudflare'
+                    if failed_count == 0
+                    else (
+                        f'Pulled {synced_count} of {missing_count} memories '
+                        f'from Cloudflare ({failed_count} failed)'
+                    )
+                )
+                if tombstone_counts['tombstone_conflicts']:
+                    message += (
+                        f"; preserved {tombstone_counts['tombstone_conflicts']} "
+                        "newer local edit(s) with tombstone conflicts"
+                    )
+                if tombstone_counts['tombstone_failures']:
+                    message += (
+                        "; tombstone reconciliation incomplete "
+                        f"({tombstone_counts['tombstone_failures']} failure(s))"
+                    )
                 return {
-                    'success': True,
-                    'memories_synced': 0,
-                    'total_checked': 0,
-                    'message': 'No new memories to pull from Cloudflare',
-                    'time_taken_seconds': round(time.time() - sync_start_time, 3)
+                    'success': failed_count == 0 and not has_tombstone_issues,
+                    'memories_synced': synced_count,
+                    'total_checked': missing_count,
+                    'message': message,
+                    'time_taken_seconds': round(time_taken, 3),
+                    **tombstone_counts,
                 }
 
-            # Pull missing memories from Cloudflare using optimized batch processing
             missing_count = secondary_count - primary_count
+
+            # Check if secondary supports CF-style memory scanning
+            has_cf_scan = (hasattr(self.secondary, 'get_all_memories_cursor') or 
+                          type(self.secondary).get_all_memories is not MemoryStorage.get_all_memories)
+            
+            if not has_cf_scan:
+                # Non-CF secondary (HTTP): use serviceable hash-diff + get_by_hash path
+                logger.info("Secondary doesn't support CF scan, using hash-diff approach")
+                secondary_hashes = await _secondary_hash_set(self.secondary) 
+                missing_hashes = (secondary_hashes - local_hashes) if secondary_hashes is not None else set()
+                if not missing_hashes:
+                    logger.info("No new memories to sync from secondary (hash-diff check)")
+                    return {
+                        'success': True,
+                        'memories_synced': 0,
+                        'total_checked': 0,
+                        'message': 'No new memories to pull from secondary',
+                        'time_taken_seconds': round(time.time() - sync_start_time, 3)
+                    }
+                
+                # Pull by the specific missing hashes
+                missing_count = len(missing_hashes)
+                logger.info("Pulling %s cloud-only memories from secondary by hash (%s sync)", missing_count, sync_type)
+                synced_count = 0
+                failed_count = 0
+                for content_hash in missing_hashes:
+                    try:
+                        # Tombstone check: deleted locally means propagate the delete, not re-pull
+                        if hasattr(self.primary, 'is_deleted') and await self.primary.is_deleted(content_hash):
+                            logger.debug("Memory %s was deleted locally, skipping sync", _sanitize_log_value(content_hash[:8]))
+                            if self.sync_service:
+                                operation = SyncOperation(operation='delete', content_hash=content_hash)
+                                await self.sync_service.enqueue_operation(operation)
+                            continue
+                        # Get the memory from secondary
+                        memory = await self.secondary.get_by_hash(content_hash)
+                        if memory is None:
+                            failed_count += 1
+                            logger.warning("Secondary memory %s disappeared or was deleted before pull", _sanitize_log_value(content_hash[:8]))
+                            continue
+                        success, message = await self.primary.store(memory, skip_semantic_dedup=True)
+                        if success:
+                            synced_count += 1
+                            local_hashes.add(content_hash)
+                        else:
+                            failed_count += 1
+                            logger.warning("Failed to sync memory %s: %s", _sanitize_log_value(content_hash), _sanitize_log_value(message))
+                    except Exception as e:
+                        failed_count += 1
+                        logger.warning("Error syncing memory %s: %s", _sanitize_log_value(content_hash), _sanitize_log_value(e))
+
+                time_taken = time.time() - sync_start_time
+                logger.info("%s sync completed: %s/%s memories in %.2fs", sync_type.capitalize(), synced_count, missing_count, time_taken)
+
+                if broadcast_sse and SSE_AVAILABLE:
+                    try:
+                        completion_event = create_sync_completed_event(
+                            synced_count=synced_count,
+                            total_count=missing_count,
+                            time_taken_seconds=time_taken,
+                            sync_type=sync_type
+                        )
+                        await sse_manager.broadcast_event(completion_event)
+                    except Exception as e:
+                        logger.debug("Failed to broadcast SSE completion: %s", _sanitize_log_value(e))
+
+                has_tombstone_issues = bool(
+                    tombstone_counts['tombstone_conflicts']
+                    or tombstone_counts['tombstone_failures']
+                )
+                message = (
+                    f'Successfully pulled {synced_count} memories from secondary'
+                    if failed_count == 0
+                    else (
+                        f'Pulled {synced_count} of {missing_count} memories '
+                        f'from secondary ({failed_count} failed)'
+                    )
+                )
+                return {
+                    'success': failed_count == 0 and not has_tombstone_issues,
+                    'memories_synced': synced_count,
+                    'total_checked': missing_count,
+                    'message': message,
+                    'time_taken_seconds': round(time_taken, 3),
+                    **tombstone_counts,
+                }
+
+            # CF secondary: use original scan logic (BYTE-IDENTICAL)
+
+            # Pull missing memories from Cloudflare using optimized batch processing
             synced_count = 0
             batch_size = min(500, self.batch_size * 5)  # 5x larger batches for sync
             cursor = None
             processed_count = 0
             consecutive_empty_batches = 0
-
-            # Get all local hashes once for O(1) lookup
-            local_hashes = await self.primary.get_all_content_hashes()
             logger.info("Pulling %s potential memories from Cloudflare...", missing_count)
 
             while True:
@@ -1185,7 +2120,7 @@ class HybridMemoryStorage(MemoryStorage):
 
                                     batch_missing += 1
                                     # Memory doesn't exist locally, sync it
-                                    success, message = await self.primary.store(cf_memory)
+                                    success, message = await self.primary.store(cf_memory, skip_semantic_dedup=True)
                                     if success:
                                         batch_synced += 1
                                         synced_count += 1
@@ -1307,12 +2242,28 @@ class HybridMemoryStorage(MemoryStorage):
                 except Exception as e:
                     logger.debug("Failed to broadcast SSE completion: %s", _sanitize_log_value(e))
 
+            has_tombstone_issues = bool(
+                tombstone_counts['tombstone_conflicts']
+                or tombstone_counts['tombstone_failures']
+            )
+            message = f'Successfully pulled {synced_count} memories from Cloudflare'
+            if tombstone_counts['tombstone_conflicts']:
+                message += (
+                    f"; preserved {tombstone_counts['tombstone_conflicts']} "
+                    "newer local edit(s) with tombstone conflicts"
+                )
+            if tombstone_counts['tombstone_failures']:
+                message += (
+                    "; tombstone reconciliation incomplete "
+                    f"({tombstone_counts['tombstone_failures']} failure(s))"
+                )
             return {
-                'success': True,
+                'success': not has_tombstone_issues,
                 'memories_synced': synced_count,
                 'total_checked': processed_count,
-                'message': f'Successfully pulled {synced_count} memories from Cloudflare',
-                'time_taken_seconds': round(time_taken, 3)
+                'message': message,
+                'time_taken_seconds': round(time_taken, 3),
+                **tombstone_counts,
             }
 
         except Exception as e:
@@ -1322,7 +2273,8 @@ class HybridMemoryStorage(MemoryStorage):
                 'memories_synced': 0,
                 'total_checked': 0,
                 'message': f'Failed to pull from Cloudflare: {str(e)}',
-                'time_taken_seconds': round(time.time() - sync_start_time, 3)
+                'time_taken_seconds': round(time.time() - sync_start_time, 3),
+                **tombstone_counts,
             }
 
     async def _perform_initial_sync(self) -> None:
@@ -1388,33 +2340,86 @@ class HybridMemoryStorage(MemoryStorage):
             "progress_percentage": round((self.initial_sync_completed / max(self.initial_sync_total, 1)) * 100, 1) if self.initial_sync_total > 0 else 0
         }
 
-    async def store(self, memory: Memory, skip_semantic_dedup: bool = False, store: str = "default") -> Tuple[bool, str]:
+    @property
+    def supports_recreate_refusal(self) -> bool:
+        """Whatever the primary can refuse, the hybrid can (#1560)."""
+        return getattr(self.primary, "supports_recreate_refusal", False) is True
+
+    async def store(self, memory: Memory, skip_semantic_dedup: bool = False, store: str = "default",
+                    recreate: Optional[bool] = None) -> Tuple[bool, str]:
         """Store a memory in primary storage and queue for secondary sync.
 
         Args:
             memory: The Memory object to store.
             skip_semantic_dedup: If True, bypass semantic similarity check on primary storage.
                 Exact hash deduplication is always enforced.
+            recreate: Forwarded to the primary (sqlite-vec) store — see
+                ``MemoryStorage.store`` (#1560). A refusal never reaches the sync queue;
+                an explicit restore (``True``) travels with the queued store so the
+                secondary restores too.
         """
         # Always store in primary first for immediate availability
-        success, message = await self.primary.store(memory, skip_semantic_dedup=skip_semantic_dedup, store=store)
+        success, message = await self.primary.store(
+            memory, skip_semantic_dedup=skip_semantic_dedup, store=store,
+            **recreate_kwargs(self.primary, recreate)
+        )
 
         if success and self.sync_service:
             # Queue for background sync to secondary
-            operation = SyncOperation(operation='store', memory=memory)
+            operation = SyncOperation(
+                operation='store', memory=memory,
+                recreate=True if recreate is True else None,
+                store=store,
+            )
             await self.sync_service.enqueue_operation(operation)
 
         return success, message
 
-    async def retrieve(self, query: str, n_results: int = 5, tags: Optional[List[str]] = None, min_confidence: float = 0.0, include_superseded: bool = False, start_time: Optional[float] = None, end_time: Optional[float] = None, store: str = "default") -> List[MemoryQueryResult]:
+    async def retrieve(self, query: str, n_results: int = 5, tags: Optional[List[str]] = None, min_confidence: float = 0.0, include_superseded: bool = False, start_time: Optional[float] = None, end_time: Optional[float] = None, store: str = "default", as_of: Optional[float] = None) -> List[MemoryQueryResult]:
         """Retrieve memories from primary storage (fast)."""
-        return await self.primary.retrieve(query, n_results, tags, min_confidence=min_confidence, include_superseded=include_superseded, store=store)
+        return await self.primary.retrieve(
+            query,
+            n_results,
+            tags,
+            min_confidence=min_confidence,
+            include_superseded=include_superseded,
+            start_time=start_time,
+            end_time=end_time,
+            store=store,
+            as_of=as_of,
+        )
+
+    async def retrieve_hybrid(
+        self,
+        query: str,
+        n_results: int = 5,
+        keyword_weight: Optional[float] = None,
+        semantic_weight: Optional[float] = None,
+        include_superseded: bool = False,
+        store: Optional[str] = "default",
+        as_of: Optional[float] = None,
+    ) -> List[MemoryQueryResult]:
+        """BM25 + vector search on primary storage (#1576).
+
+        search_memories() only takes mode="hybrid" when the backend has this
+        method; without it the hybrid backend fell through to plain vector
+        search.
+        """
+        return await self.primary.retrieve_hybrid(
+            query,
+            n_results,
+            keyword_weight=keyword_weight,
+            semantic_weight=semantic_weight,
+            include_superseded=include_superseded,
+            store=store,
+            as_of=as_of,
+        )
 
     async def search(self, query: str, n_results: int = 5, min_similarity: float = 0.0) -> List[MemoryQueryResult]:
         """Search memories in primary storage."""
         return await self.primary.search(query, n_results)
 
-    async def search_by_tag(self, tags: List[str], time_start: Optional[float] = None) -> List[Memory]:
+    async def search_by_tag(self, tags: List[str], time_start: Optional[float] = None, include_superseded: bool = True) -> List[Memory]:
         """Search memories by tags in primary storage with optional time filtering.
 
         This method performs an OR search for tags. The `match_all` (AND) logic
@@ -1427,14 +2432,18 @@ class HybridMemoryStorage(MemoryStorage):
         Returns:
             List of Memory objects matching the tag criteria and time filter
         """
-        return await self.primary.search_by_tag(tags, time_start=time_start)
+        return await self.primary.search_by_tag(
+            tags, time_start=time_start, include_superseded=include_superseded
+        )
 
     async def search_by_tags(
         self,
         tags: List[str],
         operation: str = "AND",
         time_start: Optional[float] = None,
-        time_end: Optional[float] = None
+        time_end: Optional[float] = None,
+        include_pending: bool = False,
+        include_superseded: bool = True,
     ) -> List[Memory]:
         """Search memories by tags using consistent operation parameter across backends."""
         normalized_operation = operation.strip().upper() if isinstance(operation, str) else "AND"
@@ -1446,15 +2455,20 @@ class HybridMemoryStorage(MemoryStorage):
             tags,
             operation=normalized_operation,
             time_start=time_start,
-            time_end=time_end
+            time_end=time_end,
+            include_pending=include_pending,
+            include_superseded=include_superseded,
         )
 
-    async def delete(self, content_hash: str) -> Tuple[bool, str]:
+    async def delete(self, content_hash: str, store: Optional[str] = None) -> Tuple[bool, str]:
         """Delete a memory from primary storage and queue for secondary sync."""
-        success, message = await self.primary.delete(content_hash)
+        success, message = await self.primary.delete(content_hash, store=store)
 
         if success and self.sync_service:
-            # Queue for background sync to secondary
+            # Queue for background sync to secondary. Unscoped on purpose (#1915):
+            # content_hash is unique across stores on both sides and the primary has
+            # already confined the delete, while D1 rows synced before #1915 all carry
+            # "default", so a delete scoped to the real store would miss them.
             operation = SyncOperation(operation='delete', content_hash=content_hash)
             await self.sync_service.enqueue_operation(operation)
 
@@ -1463,7 +2477,7 @@ class HybridMemoryStorage(MemoryStorage):
     async def delete_by_tag(self, tag: str) -> Tuple[int, str]:
         """Delete memories by tag from primary storage and queue for secondary sync."""
         # First, get the memories with this tag to get their hashes for sync
-        memories_to_delete = await self.primary.search_by_tags([tag])
+        memories_to_delete = await self.primary.search_by_tags([tag], include_pending=True)
 
         # Delete from primary
         count_deleted, message = await self.primary.delete_by_tag(tag)
@@ -1476,7 +2490,7 @@ class HybridMemoryStorage(MemoryStorage):
 
         return count_deleted, message
 
-    async def delete_by_tags(self, tags: List[str]) -> Tuple[int, str, List[str]]:
+    async def delete_by_tags(self, tags: List[str], store: Optional[str] = None) -> Tuple[int, str, List[str]]:
         """
         Delete memories matching ANY of the given tags from primary storage and queue for secondary sync.
 
@@ -1489,26 +2503,29 @@ class HybridMemoryStorage(MemoryStorage):
         if not tags:
             return 0, "No tags provided", []
 
-        # First, get all memories with any of these tags for sync queue
-        memories_to_delete = await self.primary.search_by_tags(tags, operation="OR")
-
-        # Remove duplicates based on content_hash
-        unique_memories = {m.content_hash: m for m in memories_to_delete}.values()
-
         # Delete from primary using optimized method if available
-        count_deleted, message, deleted_hashes = await self.primary.delete_by_tags(tags)
+        count_deleted, message, deleted_hashes = await self.primary.delete_by_tags(tags, store=store)
 
-        # Queue individual deletes for secondary sync
+        # Queue individual deletes for secondary sync — ONLY the hashes actually deleted
+        # from the (store-scoped) primary. Using the unfiltered tag match would delete
+        # other stores' memories from the cloud while keeping them locally (#1466).
         if count_deleted > 0 and self.sync_service:
-            for memory in unique_memories:
-                operation = SyncOperation(operation='delete', content_hash=memory.content_hash)
+            for content_hash in deleted_hashes:
+                operation = SyncOperation(operation='delete', content_hash=content_hash)
                 await self.sync_service.enqueue_operation(operation)
 
         return count_deleted, message, deleted_hashes
 
-    async def get_by_exact_content(self, content: str) -> List[Memory]:
+    async def get_by_exact_content(self, content: str, store: Optional[str] = None) -> List[Memory]:
         """Retrieve memories by exact content match from primary storage."""
-        return await self.primary.get_by_exact_content(content)
+        return await self.primary.get_by_exact_content(content, store=store)
+
+    async def _get_supersession_map(self, content_hashes, store=None):
+        """Delegate the issue-#1724 lineage lookup to the primary SQLite storage."""
+        delegate = getattr(self.primary, "_get_supersession_map", None)
+        if delegate is not None:
+            return await delegate(content_hashes, store=store)
+        return {}
 
     async def delete_by_timeframe(self, start_date: date, end_date: date, tag: Optional[str] = None) -> Tuple[int, str]:
         """Delete memories within a specific date range in primary storage and queue for secondary sync."""
@@ -1546,9 +2563,22 @@ class HybridMemoryStorage(MemoryStorage):
         # Only cleanup primary, secondary will sync naturally
         return await self.primary.cleanup_duplicates()
 
-    async def update_memory_metadata(self, content_hash: str, updates: Dict[str, Any], preserve_timestamps: bool = True) -> Tuple[bool, str]:
-        """Update memory metadata in primary storage and queue for secondary sync."""
-        success, message = await self.primary.update_memory_metadata(content_hash, updates, preserve_timestamps)
+    async def update_memory_metadata(
+        self,
+        content_hash: str,
+        updates: Dict[str, Any],
+        preserve_timestamps: bool = True,
+        store: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Update memory metadata in primary storage and queue for secondary sync.
+
+        ``store`` confines the update in the primary. The queued operation needs
+        no store: content_hash is unique across stores, so the secondary applies
+        an update that the primary has already authorized to the same row.
+        """
+        success, message = await self.primary.update_memory_metadata(
+            content_hash, updates, preserve_timestamps, store=store
+        )
 
         # Skip enqueuing if sync is paused (v8.47.1 - fix consolidation hang)
         # Operations will be synced when sync resumes
@@ -1563,6 +2593,39 @@ class HybridMemoryStorage(MemoryStorage):
             await self.sync_service.enqueue_operation(operation)
 
         return success, message
+
+    async def mark_superseded_batch(self, pairs: list[tuple[str, str]]) -> int:
+        """Mark memories as superseded in primary storage.
+
+        Without this override the base-class no-op applies and nothing is marked.
+        Not queued for secondary sync: Cloudflare has no supersession field.
+        """
+        return await self.primary.mark_superseded_batch(pairs)
+
+    async def get_conflicts(self) -> list[dict[str, Any]]:
+        """Return unresolved conflict pairs from primary storage.
+
+        Conflicts are detected when store() writes to the primary, so they are
+        listed there too. Without this override the base default returns [].
+        """
+        return await self.primary.get_conflicts()
+
+    async def resolve_conflict(
+        self, winner_hash: str, loser_hash: str
+    ) -> tuple[bool, str]:
+        """Resolve a conflict in primary storage.
+
+        Not queued for secondary sync, like mark_superseded_batch(): the
+        supersede is logged as a sync event by the primary itself.
+        """
+        return await self.primary.resolve_conflict(winner_hash, loser_hash)
+
+    async def reconcile_conflict_tags(self, dry_run: bool = True) -> dict[str, Any]:
+        """Clear stale conflict:unresolved tags in primary storage (#1840).
+
+        Conflict tags live only in the primary; they are never synced.
+        """
+        return await self.primary.reconcile_conflict_tags(dry_run=dry_run)
 
     async def update_memories_batch(self, memories: List[Memory], preserve_timestamps: bool = False) -> List[bool]:
         """
@@ -1592,7 +2655,8 @@ class HybridMemoryStorage(MemoryStorage):
                             'tags': memory.tags,
                             'metadata': memory.metadata,
                             'memory_type': memory.memory_type
-                        }
+                        },
+                        preserve_timestamps=preserve_timestamps
                     )
                     # Don't await - queue asynchronously for background processing
                     try:
@@ -1607,15 +2671,23 @@ class HybridMemoryStorage(MemoryStorage):
         # SQLite-vec get_stats is now async
         primary_stats = await self.primary.get_stats()
 
+        secondary_label = {'http': 'HTTP', 'cloudflare': 'Cloudflare'}.get(self.secondary_backend_type)
+        if self.secondary and secondary_label:
+            storage_backend = f"Hybrid (SQLite-vec + {secondary_label})"
+        else:
+            storage_backend = "Hybrid (SQLite-vec, no secondary)"
         stats = {
-            "storage_backend": "Hybrid (SQLite-vec + Cloudflare)",
+            "storage_backend": storage_backend,
             "primary_backend": "SQLite-vec",
-            "secondary_backend": "Cloudflare" if self.secondary else "None",
+            "secondary_backend": secondary_label if (self.secondary and secondary_label) else "None",
             "total_memories": primary_stats.get("total_memories", 0),
             "unique_tags": primary_stats.get("unique_tags", 0),
             "memories_this_week": primary_stats.get("memories_this_week", 0),
             "database_size_bytes": primary_stats.get("database_size_bytes", 0),
-            "database_size_mb": primary_stats.get("database_size_mb", 0),
+            # No default: when the primary cannot read the database it returns only
+            # {"error": ...}, and a filled-in 0 would be indistinguishable from an
+            # empty database. None means "unknown" all the way to the UI.
+            "database_size_mb": primary_stats.get("database_size_mb"),
             "primary_stats": primary_stats,
             "sync_enabled": self.sync_service is not None
         }
@@ -1635,9 +2707,9 @@ class HybridMemoryStorage(MemoryStorage):
 
         return stats
 
-    async def get_all_tags_with_counts(self) -> List[Dict[str, Any]]:
+    async def get_all_tags_with_counts(self, store: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all tags with their usage counts from primary storage."""
-        return await self.primary.get_all_tags_with_counts()
+        return await self.primary.get_all_tags_with_counts(store=store)
 
     async def get_all_tags(self) -> List[str]:
         """Get all unique tags from primary storage."""
@@ -1651,7 +2723,7 @@ class HybridMemoryStorage(MemoryStorage):
         """Get largest memories by content length from primary storage."""
         return await self.primary.get_largest_memories(n)
 
-    async def get_memory_timestamps(self, days: Optional[int] = None) -> List[float]:
+    async def get_memory_timestamps(self, days: Optional[int] = None, store: Optional[str] = None) -> List[float]:
         """
         Get memory creation timestamps only, without loading full memory objects.
 
@@ -1663,7 +2735,15 @@ class HybridMemoryStorage(MemoryStorage):
         Returns:
             List of Unix timestamps (float) in descending order (newest first)
         """
-        return await self.primary.get_memory_timestamps(days)
+        return await self.primary.get_memory_timestamps(days, store)
+
+    async def list_content_hashes(self, include_deleted: bool = False) -> "Set[str]":
+        """Get all content hashes from primary storage."""
+        return await self.primary.list_content_hashes(include_deleted=include_deleted)
+
+    async def list_content_hashes_page(self, after_id: int = 0, limit: int = 1000, include_deleted: bool = False) -> "List[Tuple[int, str]]":
+        """Get paginated content hashes from primary storage."""
+        return await self.primary.list_content_hashes_page(after_id=after_id, limit=limit, include_deleted=include_deleted)
 
     async def get_relationship_type_distribution(self) -> Dict[str, int]:
         """
@@ -1679,7 +2759,8 @@ class HybridMemoryStorage(MemoryStorage):
     async def get_graph_visualization_data(
         self,
         limit: int = 100,
-        min_connections: int = 1
+        min_connections: int = 1,
+        store: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Get graph data for visualization in D3.js-compatible format.
@@ -1693,9 +2774,9 @@ class HybridMemoryStorage(MemoryStorage):
         Returns:
             Dictionary with "nodes" and "edges" keys in D3.js format
         """
-        return await self.primary.get_graph_visualization_data(limit, min_connections)
+        return await self.primary.get_graph_visualization_data(limit, min_connections, store=store)
 
-    async def recall(self, query: Optional[str] = None, n_results: int = 5, start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None) -> List[MemoryQueryResult]:
+    async def recall(self, query: Optional[str] = None, n_results: int = 5, start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None, store: Optional[str] = None) -> List[MemoryQueryResult]:
         """
         Retrieve memories with combined time filtering and optional semantic search.
 
@@ -1708,11 +2789,15 @@ class HybridMemoryStorage(MemoryStorage):
         Returns:
             List of MemoryQueryResult objects.
         """
-        return await self.primary.recall(query=query, n_results=n_results, start_timestamp=start_timestamp, end_timestamp=end_timestamp)
+        return await self.primary.recall(query=query, n_results=n_results, start_timestamp=start_timestamp, end_timestamp=end_timestamp, store=store)
 
     async def recall_memory(self, query: str, n_results: int = 5) -> List[Memory]:
         """Recall memories using natural language time expressions."""
         return await self.primary.recall_memory(query, n_results)
+
+    async def get_stores(self) -> List[str]:
+        """Store names come from primary storage, like ``get_all_memories``."""
+        return await self.primary.get_stores()
 
     async def get_all_memories(
         self,
@@ -1724,6 +2809,9 @@ class HybridMemoryStorage(MemoryStorage):
         stale_days: Optional[int] = None,
         include_embeddings: bool = False,
         store: str = "default",
+        agent_id: Optional[str] = None,
+        exclude_pending: bool = False,
+        include_superseded: bool = True,
     ) -> List[Memory]:
         """Get all memories from primary storage.
 
@@ -1739,29 +2827,35 @@ class HybridMemoryStorage(MemoryStorage):
             stale_days=stale_days,
             include_embeddings=include_embeddings,
             store=store,
+            agent_id=agent_id,
+            exclude_pending=exclude_pending,
+            include_superseded=include_superseded,
         )
 
-    async def get_by_hash(self, content_hash: str) -> Optional[Memory]:
+    async def get_by_hash(self, content_hash: str, store: Optional[str] = None) -> Optional[Memory]:
         """Get a memory by its content hash from primary storage."""
-        return await self.primary.get_by_hash(content_hash)
+        return await self.primary.get_by_hash(content_hash, store=store)
 
-    async def count_all_memories(self, memory_type: Optional[str] = None, tags: Optional[List[str]] = None, tag_match: str = "any", stale_days: Optional[int] = None, store: str = "default") -> int:
+    async def count_all_memories(self, memory_type: Optional[str] = None, tags: Optional[List[str]] = None, tag_match: str = "any", stale_days: Optional[int] = None, store: str = "default", agent_id: Optional[str] = None, include_superseded: bool = True) -> int:
         """Get total count of memories from primary storage."""
-        return await self.primary.count_all_memories(memory_type=memory_type, tags=tags, tag_match=tag_match, stale_days=stale_days, store=store)
+        return await self.primary.count_all_memories(memory_type=memory_type, tags=tags, tag_match=tag_match, stale_days=stale_days, store=store, agent_id=agent_id, include_superseded=include_superseded)
 
     async def get_memories_by_time_range(
         self,
         start_time: float,
         end_time: float,
         include_embeddings: bool = False,
+        exclude_pending: bool = False,
+        store: Optional[str] = None,
     ) -> List[Memory]:
         """Get memories within time range from primary storage.
 
-        The ``include_embeddings`` kwarg is forwarded to the primary backend.
-        See :class:`MemoryStorage` for the contract.
+        The ``include_embeddings`` and ``exclude_pending`` kwargs are forwarded to the
+        primary backend. See :class:`MemoryStorage` for the contract.
         """
         return await self.primary.get_memories_by_time_range(
             start_time, end_time, include_embeddings=include_embeddings,
+            exclude_pending=exclude_pending, store=store,
         )
 
     async def close(self):
@@ -1839,7 +2933,182 @@ class HybridMemoryStorage(MemoryStorage):
             'success': result['success'],
             'message': result['message'],
             'memories_pulled': result['memories_synced'],
-            'time_taken_seconds': result['time_taken_seconds']
+            'time_taken_seconds': result['time_taken_seconds'],
+            'tombstones_applied': result.get('tombstones_applied', 0),
+            'tombstone_conflicts': result.get('tombstone_conflicts', 0),
+            'tombstone_failures': result.get('tombstone_failures', 0),
+            'tombstone_conflict_hashes': result.get(
+                'tombstone_conflict_hashes', []
+            ),
+        }
+
+    async def resolve_tombstone_conflict(
+        self, content_hash: str, action: str
+    ) -> Dict[str, Any]:
+        """Resolve one current Cloudflare tombstone conflict explicitly."""
+        if action not in {"keep_local", "accept_delete"}:
+            raise ValueError("action must be 'keep_local' or 'accept_delete'")
+        if (
+            self.secondary_backend_type != "cloudflare"
+            or self.secondary is None
+            or not hasattr(self.secondary, "get_tombstone_for_hash")
+        ):
+            return {
+                "success": False,
+                "status": "unsupported",
+                "action": action,
+                "message": "Tombstone conflict resolution requires a Cloudflare secondary.",
+            }
+
+        async with _get_tombstone_resolution_lock(self.primary.db_path):
+            return await self._resolve_tombstone_conflict_locked(
+                content_hash, action
+            )
+
+    async def _resolve_tombstone_conflict_locked(
+        self, content_hash: str, action: str
+    ) -> Dict[str, Any]:
+        conflict = await self._read_tombstone_conflict(content_hash)
+        if conflict is None:
+            return self._tombstone_resolution_result(
+                "no_conflict",
+                action,
+                "No current tombstone conflict for this hash; no changes were made.",
+            )
+        if action == "accept_delete":
+            return await self._accept_tombstone_delete(content_hash, action, conflict)
+        return await self._keep_local_tombstone_conflict(content_hash, action)
+
+    async def _read_tombstone_conflict(
+        self, content_hash: str
+    ) -> Optional[tuple[float, float]]:
+        remote_deleted_at = await self.secondary.get_tombstone_for_hash(content_hash)
+        local_state = await self.primary.get_sync_state_for_hash(content_hash)
+        if remote_deleted_at is None or local_state is None:
+            return None
+
+        local_updated_at, local_deleted_at = local_state
+        if local_deleted_at is not None or local_updated_at is None:
+            return None
+        try:
+            remote_timestamp = float(remote_deleted_at)
+            local_timestamp = float(local_updated_at)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Invalid tombstone conflict timestamp") from exc
+        if not math.isfinite(remote_timestamp) or not math.isfinite(local_timestamp):
+            raise RuntimeError("Invalid tombstone conflict timestamp")
+        if local_timestamp <= remote_timestamp:
+            return None
+        return remote_timestamp, local_timestamp
+
+    async def _accept_tombstone_delete(
+        self, content_hash: str, action: str, conflict: tuple[float, float]
+    ) -> Dict[str, Any]:
+        outcome = await self.primary.delete_if_not_updated_after(
+            content_hash, conflict[1]
+        )
+        responses = {
+            "applied": (
+                "resolved",
+                "The current Cloudflare deletion was applied locally.",
+            ),
+            "missing": (
+                "no_conflict",
+                "The local conflict changed before resolution; no action was needed.",
+            ),
+            "already_deleted": (
+                "no_conflict",
+                "The local conflict changed before resolution; no action was needed.",
+            ),
+            "conflict": (
+                "conflict_changed",
+                "The local memory changed during resolution; it was preserved.",
+            ),
+        }
+        status, message = responses.get(
+            outcome,
+            ("failed", "The local deletion could not be applied safely."),
+        )
+        return self._tombstone_resolution_result(status, action, message)
+
+    async def _keep_local_tombstone_conflict(
+        self, content_hash: str, action: str
+    ) -> Dict[str, Any]:
+        # Retry once if the local row changes while its snapshot is read.
+        for attempt in range(2):
+            local_memory, conflict = await self._read_live_tombstone_snapshot(
+                content_hash
+            )
+            if local_memory is None or conflict is None:
+                return self._tombstone_resolution_result(
+                    "no_conflict",
+                    action,
+                    "No current tombstone conflict for this hash; no changes were made.",
+                )
+            if local_memory.updated_at != conflict[1]:
+                continue
+            return await self._store_keep_local_snapshot(
+                content_hash, action, local_memory, conflict[0]
+            )
+        return self._tombstone_resolution_result(
+            "conflict_changed",
+            action,
+            "The local memory kept changing during resolution; no upload was made.",
+        )
+
+    async def _read_live_tombstone_snapshot(
+        self, content_hash: str
+    ) -> tuple[Optional[Memory], Optional[tuple[float, float]]]:
+        local_memory = await self.primary.get_by_hash(content_hash)
+        conflict = await self._read_tombstone_conflict(content_hash)
+        if local_memory is None and conflict is not None:
+            raise RuntimeError(
+                "Could not read the live local memory for tombstone resolution"
+            )
+        return local_memory, conflict
+
+    async def _store_keep_local_snapshot(
+        self,
+        content_hash: str,
+        action: str,
+        local_memory: Memory,
+        expected_deleted_at: float,
+    ) -> Dict[str, Any]:
+        success, message = await self.secondary.store_if_tombstone_matches(
+            local_memory, expected_deleted_at
+        )
+        if success is None:
+            return self._tombstone_resolution_result(
+                "conflict_changed",
+                action,
+                "The Cloudflare tombstone changed during resolution; no memory was restored.",
+            )
+        if not success:
+            logger.warning(
+                "Could not resolve tombstone conflict for %s: %s",
+                _sanitize_log_value(content_hash[:16]),
+                _sanitize_log_value(message),
+            )
+            return self._tombstone_resolution_result(
+                "failed",
+                action,
+                "Cloudflare could not store the local memory.",
+            )
+        return self._tombstone_resolution_result(
+            "resolved",
+            action,
+            "The local memory was kept and uploaded to Cloudflare.",
+        )
+
+    @staticmethod
+    def _tombstone_resolution_result(
+        status: str, action: str, message: str
+    ) -> Dict[str, Any]:
+        return {
+            "success": status in {"resolved", "no_conflict"},
+            "status": status,
+            "action": action,
+            "message": message,
         }
 
     async def get_sync_status(self) -> Dict[str, Any]:
@@ -2008,12 +3277,16 @@ class HybridMemoryStorage(MemoryStorage):
         """
         return await self.primary.get_memory_connections()
 
-    async def get_access_patterns(self) -> Dict[str, datetime]:
+    async def get_access_patterns(
+        self, content_hashes: Optional[Sequence[str]] = None
+    ) -> Dict[str, datetime]:
         """Get memory access pattern statistics (consolidation protocol).
 
-        Proxies to primary storage.
+        Proxies to primary storage, forwarding the candidate window when one is given.
         """
-        return await self.primary.get_access_patterns()
+        if content_hashes is None:
+            return await self.primary.get_access_patterns()
+        return await self.primary.get_access_patterns(content_hashes)
 
     def sanitized(self, tags):
         """Sanitize and normalize tags to a JSON string.

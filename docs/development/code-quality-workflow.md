@@ -134,6 +134,20 @@ bash scripts/pr/quality_gate.sh <PR_NUMBER>
 3. Test coverage (code files vs test files)
 4. Breaking changes detection
 
+A breaking change that is deliberate, such as removing a field that a security advisory says leaks data, is acknowledged with a line in the PR body or a commit message:
+
+```
+Breaking-Change-Acknowledged: GHSA-xxxx-xxxx-xxxx, the statistics leaked to unauthenticated callers
+```
+
+Check 4 then prints the model's finding with that reason instead of blocking, and the summary reports the breaking change as acknowledged. The reason is required; a line without one does not count.
+
+A staged run (`quality_gate.sh --staged`) checks changes that are not committed yet, so it takes the reason from the environment instead:
+
+```bash
+BREAKING_CHANGE_ACKNOWLEDGED="GHSA-xxxx-xxxx-xxxx, the statistics leaked" bash scripts/pr/quality_gate.sh --staged
+```
+
 **Duration:** ~10-30 seconds
 
 ### Comprehensive Checks (with pyscn)
@@ -540,7 +554,7 @@ pyscn analyze --exclude "tests/*,scripts/*"
 ### Related Documentation
 
 - [CLAUDE.md](../../CLAUDE.md) - Project conventions and workflows
-- [`.claude/agents/code-quality-guard.md`](../../.claude/agents/code-quality-guard.md) - Agent workflows
+- `.claude/agents/code-quality-guard.md` - Agent workflows (local developer config, untracked since 00995fe7)
 - [scripts/README.md](../../scripts/README.md) - Script documentation
 - [Issue #240](https://github.com/doobidoo/mcp-memory-service/issues/240) - Quality improvements tracking
 

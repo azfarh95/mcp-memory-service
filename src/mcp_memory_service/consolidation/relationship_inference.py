@@ -11,7 +11,8 @@ Analyzes memory pairs to determine appropriate relationship types based on:
 This enables rich knowledge graphs with meaningful relationship types beyond "related".
 
 Fixes for GitHub issue #541:
-- Raised similarity threshold for typed labels (min_typed_similarity=0.65)
+- Raised similarity threshold for typed labels (min_typed_similarity=0.65,
+  on the normalized (cos + 1) / 2 score)
 - Tightened contradiction detection: removed weak conjunctions ("but", "yet",
   "although", "however", "nevertheless") — only strong opposition indicators kept
 - Added min_typed_confidence parameter (default 0.75) for non-"related" edges
@@ -24,10 +25,38 @@ from typing import Tuple, Optional, List, Set
 
 from ..models.ontology import (
     get_parent_type,
-    validate_relationship,
+    get_type_patterns,
+    is_allowed_pair,
 )
 
 logger = logging.getLogger(__name__)
+
+# Gates for inferred edges, chosen in issue #1457 on three hand-checked stores.
+# They limit how many typed labels get written; they do not make a label right.
+# DEFAULT_MIN_TYPED_SIMILARITY is on the score consolidation passes in,
+# (cos + 1) / 2, so 0.65 is cosine 0.3.
+DEFAULT_MIN_CONFIDENCE = 0.6
+DEFAULT_MIN_TYPED_CONFIDENCE = 0.75
+DEFAULT_MIN_TYPED_SIMILARITY = 0.65
+
+# Consolidation review policy, not calibrated probabilities. In particular,
+# keyword-only contradictions score 0.75 and must remain in the review band.
+REVIEW_LOW_CONFIDENCE = 0.60
+REVIEW_HIGH_CONFIDENCE = 0.85
+
+
+def apply_review_band(relationship_type: str, confidence: float) -> tuple[str, bool]:
+    """Return the stored label and whether an inferred edge needs review.
+
+    Scores at or below 0.60 become ``related``; scores strictly between 0.60
+    and 0.85 keep their typed label with a review flag; scores at or above
+    0.85 keep the label without that flag. Existing ``related`` results stay
+    related, preserving the inference engine's similarity and ontology guards.
+    """
+    if relationship_type == "related" or confidence <= REVIEW_LOW_CONFIDENCE:
+        return "related", False
+    return relationship_type, confidence < REVIEW_HIGH_CONFIDENCE
+
 
 # Common English stopwords excluded from domain-keyword matching
 _STOPWORDS: Set[str] = {
@@ -98,10 +127,13 @@ class RelationshipInferenceEngine:
         Issue #541 fix: separates thresholds so "related" is easy to assign
         but typed labels require stronger evidence.
     min_typed_similarity : float
-        Minimum cosine similarity required before assigning any typed label
-        (default 0.65). When similarity is below this threshold the result
-        falls back to "related". Only applies when ``similarity`` is provided
-        to ``infer_relationship_type``. Issue #541 fix.
+        Minimum similarity required before assigning any typed label
+        (default 0.65). It is compared with the ``similarity`` argument of
+        ``infer_relationship_type``, which in consolidation is the normalized
+        association score ``(cos + 1) / 2``, so the default means cosine 0.3.
+        When similarity is below this threshold the result falls back to
+        "related". Only applies when ``similarity`` is provided. Issue #541
+        fix; value chosen in issue #1457.
     """
 
     # Content patterns for relationship detection
@@ -172,9 +204,9 @@ class RelationshipInferenceEngine:
 
     def __init__(
         self,
-        min_confidence: float = 0.5,
-        min_typed_confidence: float = 0.50,
-        min_typed_similarity: float = 0.45,
+        min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+        min_typed_confidence: float = DEFAULT_MIN_TYPED_CONFIDENCE,
+        min_typed_similarity: float = DEFAULT_MIN_TYPED_SIMILARITY,
         typed_edges_enabled: bool = True,
     ):
         """
@@ -182,14 +214,16 @@ class RelationshipInferenceEngine:
 
         Args:
             min_confidence: Minimum confidence score (0.0-1.0) to assign
-                any relationship type (including ``related``).
+                any relationship type (including ``related``). Defaults to
+                0.6.
             min_typed_confidence: Minimum confidence required specifically for
                 typed labels (``fixes``, ``causes``, ``supports``,
                 ``contradicts``, ``follows``). Must be >= min_confidence.
-                Defaults to 0.75 (issue #541).
-            min_typed_similarity: When a cosine similarity is supplied, typed
-                labels are only assigned when similarity >= this threshold.
-                Defaults to 0.65 (issue #541).
+                Defaults to 0.75 (issues #541, #1457).
+            min_typed_similarity: When a similarity is supplied, typed labels
+                are only assigned when similarity >= this threshold. On the
+                score consolidation passes, ``(cos + 1) / 2``. Defaults to
+                0.65, which is cosine 0.3 (issues #541, #1457).
             typed_edges_enabled: When False, all inferred relationships are
                 returned as "related" regardless of analysis results.
                 Set via MCP_TYPED_EDGES_ENABLED=false to opt out of typed
@@ -224,8 +258,10 @@ class RelationshipInferenceEngine:
             target_timestamp: Creation timestamp of target memory (epoch)
             source_tags: Tags on source memory
             target_tags: Tags on target memory
-            similarity: Optional cosine similarity score between memory
-                embeddings. When provided, typed labels are suppressed if
+            similarity: Optional similarity between the memory embeddings,
+                on the same scale as min_typed_similarity (consolidation
+                passes ``association.similarity_score``, ``(cos + 1) / 2``).
+                When provided, typed labels are suppressed if
                 similarity < min_typed_similarity (issue #541).
 
         Returns:
@@ -253,53 +289,10 @@ class RelationshipInferenceEngine:
         source_lower = source_content.lower()
         target_lower = target_content.lower()
 
-        # Issue #541 fix: check whether memories share domain vocabulary.
-        # Typed labels require topical relevance; "related" does not.
-        # Relaxed: also accept shared tags as domain overlap signal.
-        has_shared_keywords = _shares_domain_keywords(source_lower, target_lower)
-        has_shared_tags = bool(set(source_tags) & set(target_tags)) if source_tags and target_tags else False
-        has_domain_overlap = has_shared_keywords or has_shared_tags
-
-        # Issue #541 fix: if a similarity score is supplied, typed labels
-        # require similarity >= min_typed_similarity.
-        similarity_allows_typed = (
-            similarity is None or similarity >= self.min_typed_similarity
+        candidates = self._collect_candidates(
+            source_type, target_type, source_lower, target_lower,
+            source_timestamp, target_timestamp, source_tags, target_tags,
         )
-
-        # Collect relationship type candidates with confidence scores
-        candidates = []
-
-        # 1. Analyze memory type combinations
-        type_score = self._analyze_type_combination(source_type, target_type)
-        if type_score:
-            candidates.extend(type_score)
-
-        # 2. Analyze content semantic patterns
-        content_score = self._analyze_content_semantics(
-            source_lower, target_lower, source_type, target_type
-        )
-        if content_score:
-            candidates.extend(content_score)
-
-        # 3. Analyze temporal relationships
-        if source_timestamp and target_timestamp:
-            temporal_score = self._analyze_temporal_relationship(
-                source_timestamp, target_timestamp, source_type, target_type
-            )
-            if temporal_score:
-                candidates.extend(temporal_score)
-
-        # 4. Analyze contradictions
-        contradiction_score = self._analyze_contradictions(
-            source_lower,
-            target_lower,
-            source_type,
-            target_type,
-            source_tags,
-            target_tags,
-        )
-        if contradiction_score:
-            candidates.extend(contradiction_score)
 
         # Select highest-confidence candidate
         if not candidates:
@@ -314,48 +307,99 @@ class RelationshipInferenceEngine:
 
         # Issue #541 fix: apply the stricter typed-label threshold and guards
         # before the generic min_confidence check.
-        if best_type != "related":
-            # Guard 1: similarity threshold
-            if not similarity_allows_typed:
-                logger.debug(
-                    f"Similarity {similarity:.3f} below typed threshold "
-                    f"{self.min_typed_similarity}, downgrading to 'related'"
-                )
-                return ("related", best_confidence)
-
-            # Guard 2: shared domain keywords or tags (cross-content verification)
-            if not has_domain_overlap:
-                logger.debug(
-                    "No shared domain keywords between memories, "
-                    "downgrading typed label to 'related'"
-                )
-                return ("related", best_confidence)
-
-            # Guard 3: typed confidence threshold
-            if best_confidence < self.min_typed_confidence:
-                logger.debug(
-                    f"Typed confidence {best_confidence:.2f} below typed threshold "
-                    f"{self.min_typed_confidence}, downgrading to 'related'"
-                )
-                return ("related", best_confidence)
+        if best_type != "related" and self._typed_label_blocked(
+            best_confidence, similarity, source_lower, target_lower, source_tags, target_tags
+        ):
+            return ("related", best_confidence)
 
         # Apply generic minimum confidence threshold
         if best_confidence < self.min_confidence:
             logger.debug(
-                f"Confidence {best_confidence:.2f} below threshold {self.min_confidence}, "
-                f"defaulting to 'related'"
+                "Confidence %.2f below threshold %s, defaulting to 'related'",
+                best_confidence,
+                self.min_confidence,
             )
             return ("related", best_confidence)
 
-        # Validate relationship type
-        if not validate_relationship(best_type):
-            logger.warning(f"Invalid relationship type inferred: {best_type}")
-            return ("related", best_confidence)
-
         logger.debug(
-            f"Inferred relationship type '{best_type}' with confidence {best_confidence:.2f}"
+            "Inferred relationship type '%s' with confidence %.2f", best_type, best_confidence
         )
         return (best_type, best_confidence)
+
+    def _typed_label_blocked(
+        self,
+        confidence: float,
+        similarity: Optional[float],
+        source_lower: str,
+        target_lower: str,
+        source_tags: List[str],
+        target_tags: List[str],
+    ) -> bool:
+        """Issue #541 guards: True when a typed label must downgrade to 'related'."""
+        # Guard 1: similarity threshold (only when a similarity is supplied)
+        if similarity is not None and similarity < self.min_typed_similarity:
+            logger.debug(
+                "Similarity %.3f below typed threshold %s, downgrading to 'related'",
+                similarity,
+                self.min_typed_similarity,
+            )
+            return True
+
+        # Guard 2: shared domain keywords or tags (cross-content verification).
+        # Typed labels require topical relevance; "related" does not.
+        has_shared_tags = bool(set(source_tags) & set(target_tags))
+        if not (has_shared_tags or _shares_domain_keywords(source_lower, target_lower)):
+            logger.debug(
+                "No shared domain keywords between memories, "
+                "downgrading typed label to 'related'"
+            )
+            return True
+
+        # Guard 3: typed confidence threshold
+        if confidence < self.min_typed_confidence:
+            logger.debug(
+                "Typed confidence %.2f below typed threshold %s, downgrading to 'related'",
+                confidence,
+                self.min_typed_confidence,
+            )
+            return True
+        return False
+
+    def _collect_candidates(
+        self,
+        source_type: Optional[str],
+        target_type: Optional[str],
+        source_lower: str,
+        target_lower: str,
+        source_timestamp: Optional[float],
+        target_timestamp: Optional[float],
+        source_tags: List[str],
+        target_tags: List[str],
+    ) -> List[Tuple[str, float]]:
+        """Gather (relationship_type, confidence) candidates from every analyzer,
+        keeping only those the ontology allows for this parent pair."""
+        candidates = self._analyze_type_combination(source_type, target_type)
+        candidates += self._analyze_content_semantics(
+            source_lower, target_lower, source_type, target_type
+        )
+        if source_timestamp and target_timestamp:
+            candidates += self._analyze_temporal_relationship(
+                source_timestamp, target_timestamp, source_type, target_type
+            )
+        candidates += self._analyze_contradictions(
+            source_lower, target_lower, source_type, target_type, source_tags, target_tags
+        )
+
+        # Issue #1458: drop every candidate the ontology's valid_patterns do not
+        # allow for this parent pair, before ranking, so a disallowed label can
+        # never outrank an allowed one.
+        source_parent = self._resolve_parent_type(source_type)
+        target_parent = self._resolve_parent_type(target_type)
+        return [
+            (rel_type, confidence)
+            for rel_type, confidence in candidates
+            if is_allowed_pair(rel_type, source_parent, target_parent)
+        ]
 
     @staticmethod
     def _resolve_parent_type(memory_type: str) -> Optional[str]:
@@ -392,17 +436,15 @@ class RelationshipInferenceEngine:
         """
         Analyze memory type combinations to determine relationship type.
 
-        Uses ontology-defined patterns:
-        - decision → error → uses/causes
-        - learning → error → fixes
-        - decision → decision → supports/contradicts
-        - etc.
+        Every pair here must be allowed by the ontology's valid_patterns
+        (issue #1458). Pairs are directional: the old reverse-direction lookup
+        kept the label but flipped the pair (error → learning "fixes"), which
+        no valid_patterns entry allows, so it is gone.
 
         Issue #541 fix: confidence values here feed into the typed-label gate
-        (min_typed_confidence=0.75), so only combinations that were already
-        at or above 0.75 in the original code will pass through unchanged.
-        Lower-confidence combinations will be caught by the gate and fall
-        back to "related".
+        (min_typed_confidence=0.75), so only combinations at or above 0.75
+        pass through unchanged. Lower-confidence combinations will be caught
+        by the gate and fall back to "related".
 
         Returns:
             List of (relationship_type, confidence_score) candidates
@@ -410,57 +452,14 @@ class RelationshipInferenceEngine:
         if not source_type or not target_type:
             return []
 
-        candidates = []
         source_parent = self._resolve_parent_type(source_type)
         target_parent = self._resolve_parent_type(target_type)
 
-        # High-confidence patterns from ontology
-        # Extended to cover all common memory types in production:
-        # observation (64%), note (18%), reference (5%), document (3%),
-        # configuration (1.4%), decision (1.2%), pattern/learning (<1%)
-        type_patterns = {
-            # Original high-confidence patterns
-            ("decision", "error"): ("uses", 0.7),
-            ("learning", "error"): ("fixes", 0.8),
-            ("pattern", "error"): ("fixes", 0.75),
-            ("learning", "decision"): ("supports", 0.6),
-            ("pattern", "learning"): ("supports", 0.6),
-            ("error", "error"): ("causes", 0.6),
-            # Cross-type relationships for common types
-            ("observation", "learning"): ("supports", 0.6),
-            ("observation", "decision"): ("supports", 0.55),
-            ("observation", "error"): ("causes", 0.55),
-            ("observation", "observation"): ("follows", 0.5),
-            ("note", "note"): ("follows", 0.5),
-            ("note", "decision"): ("supports", 0.55),
-            ("note", "learning"): ("supports", 0.55),
-            ("note", "error"): ("causes", 0.5),
-            ("note", "observation"): ("supports", 0.5),
-            ("reference", "reference"): ("supports", 0.5),
-            ("reference", "decision"): ("supports", 0.55),
-            ("reference", "learning"): ("supports", 0.55),
-            ("reference", "observation"): ("supports", 0.5),
-            ("document", "document"): ("supports", 0.5),
-            ("document", "reference"): ("supports", 0.55),
-            ("document", "observation"): ("supports", 0.5),
-            ("document", "learning"): ("supports", 0.55),
-            ("configuration", "error"): ("causes", 0.65),
-            ("configuration", "decision"): ("supports", 0.6),
-            ("configuration", "configuration"): ("supports", 0.5),
-            ("configuration", "observation"): ("supports", 0.5),
-            ("decision", "decision"): ("supports", 0.5),
-            ("learning", "learning"): ("supports", 0.5),
-        }
-
-        # Check both (source, target) and (target, source) directions
-        for (type1, type2), (rel_type, confidence) in type_patterns.items():
-            if source_parent == type1 and target_parent == type2:
-                candidates.append((rel_type, confidence))
-            elif source_parent == type2 and target_parent == type1:
-                # Reverse relationship - adjust confidence down
-                candidates.append((rel_type, confidence * 0.7))
-
-        return candidates
+        # Keys are base types: _resolve_parent_type maps subtypes such as note,
+        # reference, document (observation) and configuration (decision) first.
+        # TYPE_PATTERNS in models/ontology.py, plus pairs stored in the DB (#1897).
+        pattern = get_type_patterns().get((source_parent, target_parent))
+        return [pattern] if pattern else []
 
     def _analyze_content_semantics(
         self,
@@ -603,74 +602,3 @@ class RelationshipInferenceEngine:
 
         return candidates
 
-
-# Example usage
-async def test_inference():
-    """Test relationship type inference."""
-    engine = RelationshipInferenceEngine(min_confidence=0.5)
-
-    # Test 1: Learning fixes Error
-    rel_type, confidence = await engine.infer_relationship_type(
-        source_type="learning/insight",
-        target_type="error/bug",
-        source_content="Fixed authentication timeout by adjusting configuration",
-        target_content="Authentication error: Request timeout after 30 seconds",
-        source_timestamp=1234567890.0,
-        target_timestamp=1234560000.0,
-    )
-    print(f"Test 1: {rel_type} (confidence: {confidence:.2f})")
-    # Expected: "fixes" with high confidence
-
-    # Test 2: Decision causes Error
-    rel_type, confidence = await engine.infer_relationship_type(
-        source_type="decision/architecture",
-        target_type="error/bug",
-        source_content="Chose to use HTTP instead of HTTPS for testing",
-        target_content="HTTP connection refused: Port 8000 not responding",
-        source_timestamp=1234567890.0,
-        target_timestamp=1234567800.0,
-    )
-    print(f"Test 2: {rel_type} (confidence: {confidence:.2f})")
-    # Expected: "causes" with moderate-high confidence
-
-    # Test 3: Two decisions supporting each other
-    rel_type, confidence = await engine.infer_relationship_type(
-        source_type="decision/architecture",
-        target_type="decision/tool_choice",
-        source_content="Decided to use FastAPI for HTTP server",
-        target_content="Chose ONNX for embeddings due to lightweight requirements",
-        source_timestamp=1234567890.0,
-        target_timestamp=1234567900.0,
-    )
-    print(f"Test 3: {rel_type} (confidence: {confidence:.2f})")
-    # Expected: "supports" with moderate confidence
-
-    # Test 4: Sequential observations
-    rel_type, confidence = await engine.infer_relationship_type(
-        source_type="observation",
-        target_type="observation",
-        source_content="Deployed version 9.0.0",
-        target_content="Checked deployment status",
-        source_timestamp=1234567890.0,
-        target_timestamp=1234567950.0,
-    )
-    print(f"Test 4: {rel_type} (confidence: {confidence:.2f})")
-    # Expected: "follows" with low-moderate confidence
-
-    # Test 5: Default - no clear pattern
-    rel_type, confidence = await engine.infer_relationship_type(
-        source_type="observation",
-        target_type="observation",
-        source_content="Meeting notes about Q1 planning",
-        target_content="Team lunch at Italian restaurant",
-        source_timestamp=1234567890.0,
-        target_timestamp=1234567000.0,
-    )
-    print(f"Test 5: {rel_type} (confidence: {confidence:.2f})")
-    # Expected: "related" with low confidence
-
-
-if __name__ == "__main__":
-    import asyncio
-
-    asyncio.run(test_inference())

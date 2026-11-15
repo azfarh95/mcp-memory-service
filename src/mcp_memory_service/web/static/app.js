@@ -18,54 +18,56 @@ class MemoryDashboard {
             // authenticated /api/health/detailed endpoint, which is already
             // fetched by loadSystemInfo().
             sources: [{ path: 'version', api: 'detailedHealth' }],
-            formatter: (value) => value || 'N/A'
+            formatter: (value, app) => value || app.t('modal.settings.system.notAvailable', 'N/A')
         },
         settingsBackend: {
             sources: [
                 { path: 'storage.storage_backend', api: 'detailedHealth' },
                 { path: 'storage.backend', api: 'detailedHealth' }
             ],
-            formatter: (value) => value || 'N/A'
+            formatter: (value, app) => value || app.t('modal.settings.system.notAvailable', 'N/A')
         },
         settingsPrimaryBackend: {
             sources: [
                 { path: 'storage.primary_backend', api: 'detailedHealth' },
                 { path: 'storage.backend', api: 'detailedHealth' }
             ],
-            formatter: (value) => value || 'N/A'
+            formatter: (value, app) => value || app.t('modal.settings.system.notAvailable', 'N/A')
         },
         settingsEmbeddingModel: {
             sources: [
                 { path: 'storage.primary_stats.embedding_model', api: 'detailedHealth' },
                 { path: 'storage.embedding_model', api: 'detailedHealth' }
             ],
-            formatter: (value) => value || 'N/A'
+            formatter: (value, app) => value || app.t('modal.settings.system.notAvailable', 'N/A')
         },
         settingsEmbeddingDim: {
             sources: [
                 { path: 'storage.primary_stats.embedding_dimension', api: 'detailedHealth' },
                 { path: 'storage.embedding_dimension', api: 'detailedHealth' }
             ],
-            formatter: (value) => value || 'N/A'
+            formatter: (value, app) => value || app.t('modal.settings.system.notAvailable', 'N/A')
         },
         settingsDbSize: {
             sources: [
                 { path: 'storage.primary_stats.database_size_mb', api: 'detailedHealth' },
                 { path: 'storage.database_size_mb', api: 'detailedHealth' }
             ],
-            formatter: (value) => (value != null) ? `${value.toFixed(2)} MB` : 'N/A'
+            formatter: (value, app) => (value != null) ? `${value.toFixed(2)} MB` : app.t('modal.settings.system.notAvailable', 'N/A')
         },
         settingsTotalMemories: {
             sources: [{ path: 'storage.total_memories', api: 'detailedHealth' }],
-            formatter: (value) => (value != null) ? value.toLocaleString() : 'N/A'
+            formatter: (value, app) => (value != null) ? value.toLocaleString() : app.t('modal.settings.system.notAvailable', 'N/A')
         },
         settingsUptime: {
             sources: [{ path: 'uptime_seconds', api: 'detailedHealth' }],
-            formatter: (value) => (value != null) ? MemoryDashboard.formatUptime(value) : 'N/A'
+            formatter: (value, app) => (value != null) ? app.formatUptime(value) : app.t('modal.settings.system.notAvailable', 'N/A')
         },
         settingsOAuthEnabled: {
             sources: [{ path: 'oauth_enabled', api: 'oauthStatus' }],
-            formatter: (value) => (value === true) ? '✓ Enabled' : (value === false) ? 'Disabled' : 'N/A'
+            formatter: (value, app) => (value === true) ? app.t('modal.settings.system.enabled', '✓ Enabled')
+                : (value === false) ? app.t('modal.settings.system.disabled', 'Disabled')
+                : app.t('modal.settings.system.notAvailable', 'N/A')
         }
     };
 
@@ -73,6 +75,7 @@ class MemoryDashboard {
         this.apiBase = 'api';
         this.eventSource = null;
         this.memories = [];
+        this.tagManagementMinCount = 2;
         this.currentView = 'dashboard';
         // 国际化状态
         this.currentLang = 'en';
@@ -99,10 +102,14 @@ class MemoryDashboard {
         this._sseReconnectAttempts = 0;
         this._syncMonitorInterval = null;
         this._lastAuthFailureToast = null;
+        this._dashboardRefreshTimer = null;
+        this._dashboardRefreshInterval = null;
+        this._dashboardRefreshInFlight = false;
+        this._syncCountdownInterval = null;
 
         // Settings with defaults
         this.settings = {
-            theme: 'light',
+            theme: 'system',
             viewDensity: 'comfortable',
             previewLines: 3
         };
@@ -111,6 +118,14 @@ class MemoryDashboard {
         this.selectedFiles = [];
         this.documentsListenersSetup = false;
         this.processingMode = 'batch'; // 'batch' or 'individual'
+
+        // Knowledge graph view state
+        this.graphLayout = 'force';
+        this.graphRingCenterId = null;
+        this._graphFocusedNode = null;
+        this._graphFocusNeighbors = new Set();
+        this._graphClickTimer = null;
+        this._graph2dClickTimer = null;
 
         // Bind methods
         this.handleSearch = this.handleSearch.bind(this);
@@ -129,13 +144,15 @@ class MemoryDashboard {
         await this.initI18n();
         this.loadSettings();
         this.applyTheme();
+        this.watchSystemColorScheme();
         this.setupEventListeners();
+        this.setupStatusIsland();
         this.setupAuthListeners();
 
         // Check for secure context
         if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
             console.warn('⚠️ Insecure connection detected. Credentials should be transmitted over HTTPS.');
-            this.showToast('Warning: Connection not secure. Please use HTTPS in production.', 'warning');
+            this.showToast(this.t('toast.connectionInsecure', 'Warning: Connection not secure. Please use HTTPS in production.'), 'warning');
         }
 
         // Detect authentication requirement before loading data or starting
@@ -155,7 +172,6 @@ class MemoryDashboard {
         await this.loadVersion();
         await this.loadMemoryTypes();
         await this.loadDashboardData();
-        this.updateConnectionStatus('connected');
 
         // Initialize sync status monitoring for hybrid mode
         await this.checkSyncStatus();
@@ -385,15 +401,85 @@ class MemoryDashboard {
     }
 
     /**
+     * Set an element's text from the catalog. Text without values keeps its
+     * key in data-i18n, so applyTranslations() translates it again after a
+     * language switch. Text with values drops the key, so a switch cannot put
+     * back the element's earlier text.
+     */
+    setTranslatedText(el, key, fallback, vars) {
+        if (!el) return;
+        el.textContent = this.t(key, fallback, vars);
+        if (vars) {
+            delete el.dataset.i18n;
+        } else {
+            el.dataset.i18n = key;
+        }
+    }
+
+    /**
+     * Set text that is not a single catalog string (a date, a size, a value
+     * from the server) and drop any data-i18n key, so a language switch
+     * leaves it alone.
+     */
+    setValueText(el, text) {
+        if (!el) return;
+        el.textContent = text;
+        delete el.dataset.i18n;
+    }
+
+    /**
+     * Markup for an element whose whole text is one catalog string. It carries
+     * the key, so a language switch translates it again without a re-render.
+     */
+    staticTextHtml(tag, className, key, fallback, style = '') {
+        const classAttr = className ? ` class="${className}"` : '';
+        const styleAttr = style ? ` style="${style}"` : '';
+        return `<${tag}${classAttr}${styleAttr} data-i18n="${key}">${this.escapeHtml(this.t(key, fallback))}</${tag}>`;
+    }
+
+    /**
+     * Set a {count} string and keep the key. data-count (and data-extra) let
+     * the next applyTranslations() fill the same numbers in the new language
+     * instead of leaving the {count} placeholder.
+     */
+    setCountedText(el, key, fallback, count, extra) {
+        if (!el) return;
+        const vars = { count };
+        el.dataset.i18n = key;
+        el.dataset.count = String(count);
+        if (extra === undefined) {
+            delete el.dataset.extra;
+        } else {
+            vars.extra = extra;
+            el.dataset.extra = extra;
+        }
+        el.textContent = this.t(key, fallback, vars);
+    }
+
+    /**
      * 应用翻译到 DOM
      */
     async applyTranslations() {
         // 统一遍历带 i18n 属性的元素，减少多次 DOM 遍历
-        document.querySelectorAll('[data-i18n], [data-i18n-html], [data-i18n-placeholder], [data-i18n-aria]').forEach(el => {
-            const { i18n, i18nHtml, i18nPlaceholder, i18nAria } = el.dataset;
+        document.querySelectorAll('[data-i18n], [data-i18n-html], [data-i18n-placeholder], [data-i18n-aria], [data-i18n-title]').forEach(el => {
+            const { i18n, i18nHtml, i18nPlaceholder, i18nAria, i18nTitle } = el.dataset;
 
             if (i18n) {
-                const text = this.t(i18n, el.textContent?.trim() || '');
+                const fallback = el.textContent?.trim() || '';
+                // A {count} string keeps its number in data-count. Without that,
+                // this pass would write the placeholder, and on a parent it
+                // would erase a child that held the number.
+                const template = this.translations?.[i18n]
+                    || this.fallbackTranslations?.[i18n]
+                    || fallback;
+                const vars = {};
+                if (template.includes('{count}') && el.hasAttribute('data-count')) {
+                    vars.count = el.getAttribute('data-count');
+                }
+                if (template.includes('{extra}') && el.hasAttribute('data-extra')) {
+                    vars.extra = el.getAttribute('data-extra');
+                }
+                const text = this.t(i18n, fallback, vars);
                 if (text) el.textContent = text;
             }
 
@@ -411,6 +497,11 @@ class MemoryDashboard {
                 const text = this.t(i18nAria, el.getAttribute('aria-label') || '');
                 el.setAttribute('aria-label', text);
             }
+
+            if (i18nTitle) {
+                const text = this.t(i18nTitle, el.getAttribute('title') || '');
+                el.setAttribute('title', text);
+            }
         });
 
         // 文档标题
@@ -424,6 +515,21 @@ class MemoryDashboard {
                 : this.t('search.modeManual', modeText.textContent);
         }
 
+        // Compact sync control: the widget's data-i18n key is the initial
+        // "Checking..." default. Re-render the live status word from the
+        // control's state class, so switching languages does not reset a
+        // running sync to "Checking..." until the next poll.
+        const syncStatusText = document.getElementById('syncStatusText');
+        if (syncStatusText) {
+            const syncState = syncStatusText.closest('.sync-control-compact')
+                ?.className.match(/\b(paused|syncing|pending|error|synced)\b/)?.[1];
+            if (syncState) {
+                syncStatusText.textContent = this.t(`sync.status.${syncState}`, syncStatusText.textContent);
+            }
+        }
+
+        this.statusIsland?.refresh();
+
         // 更新语言按钮状态
         this.updateLanguageSwitcher();
     }
@@ -435,7 +541,53 @@ class MemoryDashboard {
         if (!this.supportedLanguages.includes(lang) || lang === this.currentLang) return;
         await this.loadTranslations(lang);
         await this.applyTranslations();
+        await this.rerenderActiveView();
         this.showToast(this.t('toast.languageSwitched', 'Language switched'), 'success', 2000);
+    }
+
+    /**
+     * Re-render the JavaScript-built text of the active view after a language
+     * switch (#1807). applyTranslations() only reaches data-i18n elements.
+     * Cached views re-render without a request; the others re-run the loader
+     * they use on open. The knowledge graph is left alone to keep its camera.
+     * Browse is skipped: its tag cloud has no translated text, and re-rendering
+     * it would hide the memories of a selected tag. No scroll restore: every
+     * renderer swaps its content in one step, so the page height holds.
+     */
+    async rerenderActiveView() {
+        try {
+            // The active-filter chips sit in the search view but keep their
+            // text while another view is open, so rebuild them on every switch.
+            this.updateActiveFilters();
+            switch (this.currentView) {
+                case 'dashboard':
+                    this.renderRecentMemories(this.memories);
+                    break;
+                case 'search':
+                    if (this.searchResults.length) this.renderSearchResults(this.searchResults);
+                    break;
+                case 'analytics':
+                    await Promise.all([
+                        this.loadAnalyticsOverview(),
+                        this.loadMemoryGrowthChart(),
+                        this.loadTagUsageChart(),
+                        this.loadMemoryTypesChart(),
+                        this.loadActivityHeatmapChart(),
+                        this.loadTopTagsReport(),
+                        this.loadRecentActivityReport(),
+                        this.loadStorageReport(),
+                        this.loadRelationshipTypesChart()
+                    ]);
+                    break;
+                case 'documents':
+                case 'manage':
+                case 'qualityAnalytics':
+                    await this.loadViewData(this.currentView);
+                    break;
+            }
+        } catch (error) {
+            console.warn('Re-render after language switch failed:', error);
+        }
     }
 
     /**
@@ -473,15 +625,43 @@ class MemoryDashboard {
                 if (textDiv && textDiv.classList.contains('detail-content-text')) {
                     textDiv.classList.toggle('detail-content-collapsed');
                     e.target.textContent = textDiv.classList.contains('detail-content-collapsed')
-                        ? '▼ Show full content'
-                        : '▲ Collapse';
+                        ? `▼ ${this.t('modal.memoryDetails.showFullContent', 'Show full content')}`
+                        : `▲ ${this.t('modal.memoryDetails.collapse', 'Collapse')}`;
                 }
+            }
+        });
+
+        // The memory detail content is rendered dynamically, so delegate metadata toggles.
+        document.getElementById('modalContent')?.addEventListener('click', (e) => {
+            const toggle = e.target.closest('.metadata-toggle');
+            if (toggle) {
+                toggle.parentElement.classList.toggle('expanded');
+            }
+        });
+
+        // The recent-memory empty state is rendered dynamically after startup.
+        document.getElementById('recentMemoriesList')?.addEventListener('click', (e) => {
+            const addMemoryLink = e.target.closest('[data-action="add-memory"]');
+            if (addMemoryLink) {
+                e.preventDefault();
+                this.handleAddMemory();
             }
         });
 
         // Navigation
         document.querySelectorAll('.nav-item').forEach(item => {
             item.addEventListener('click', this.handleNavigation);
+        });
+
+        // Escape key clears knowledge graph focus mode if active (#1855)
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && this._graphFocusedNode) {
+                const fsModal = document.getElementById('graphFullscreenModal');
+                const isFs = (fsModal && (fsModal.style.display !== 'none' || fsModal.classList.contains('active'))) || this._graphFullscreenOpen;
+                if (!isFs) {
+                    this.clearGraphFocus(false);
+                }
+            }
         });
 
         // Language dropdown
@@ -626,6 +806,18 @@ class MemoryDashboard {
             this.closeModal(document.getElementById('settingsModal'));
         });
 
+        document.getElementById('backupNowButton')?.addEventListener('click', () => {
+            this.createBackup();
+        });
+
+        document.getElementById('viewBackupsButton')?.addEventListener('click', () => {
+            this.openViewBackupsModal();
+        });
+
+        document.getElementById('viewBackupsCloseButton')?.addEventListener('click', () => {
+            this.closeModal(document.getElementById('viewBackupsModal'));
+        });
+
         // Initialize settings tabs
         this.initializeSettingsTabs();
         this.initCredentialsTab();
@@ -646,8 +838,9 @@ class MemoryDashboard {
         document.getElementById('cleanupDuplicatesBtn')?.addEventListener('click', this.handleCleanupDuplicates.bind(this));
         document.getElementById('deleteByDateBtn')?.addEventListener('click', this.handleBulkDeleteByDate.bind(this));
         document.getElementById('deleteUntaggedBtn')?.addEventListener('click', this.handleDeleteUntagged.bind(this));
-        document.getElementById('optimizeDbBtn')?.addEventListener('click', this.handleOptimizeDatabase.bind(this));
-        document.getElementById('rebuildIndexBtn')?.addEventListener('click', this.handleRebuildIndex.bind(this));
+        document.getElementById('ontologyAddTypeBtn')?.addEventListener('click', this.handleAddMemoryType.bind(this));
+        document.getElementById('ontologySetRetentionBtn')?.addEventListener('click', this.handleSetRetention.bind(this));
+        this.initializeManageTabs();
 
         // Analytics tab event listeners
         document.getElementById('growthPeriodSelect')?.addEventListener('change', this.handleGrowthPeriodChange.bind(this));
@@ -659,7 +852,11 @@ class MemoryDashboard {
         document.getElementById('refreshGraphBtn')?.addEventListener('click', this.handleGraphRefresh.bind(this));
         document.getElementById('graphLimitSelect')?.addEventListener('change', this.handleGraphRefresh.bind(this));
         document.getElementById('graphMinConnectionsSelect')?.addEventListener('change', this.handleGraphRefresh.bind(this));
+        document.getElementById('graphDegreeSlider')?.addEventListener('input', this.handleGraphDegreeChange.bind(this));
         document.getElementById('graphDimensionBtn')?.addEventListener('click', this.toggleGraphDimension.bind(this));
+        document.querySelectorAll('[data-graph-layout]').forEach(button => {
+            button.addEventListener('click', () => this.setGraphLayout(button.dataset.graphLayout));
+        });
         document.getElementById('graphRotateBtn')?.addEventListener('click', this.toggleGraphRotation.bind(this));
         document.getElementById('graphFullscreenRotateBtn')?.addEventListener('click', this.toggleGraphRotation.bind(this));
         document.getElementById('graphFullscreenLegendBtn')?.addEventListener('click', this.toggleGraphLegend.bind(this));
@@ -684,6 +881,9 @@ class MemoryDashboard {
      * Set up Server-Sent Events for real-time updates
      */
     setupSSE() {
+        // Bump first: any in-flight ticket exchange from a previous call is now
+        // stale and will refuse to open a stream (see _openSSEWithTicket).
+        this._sseSetupGeneration = (this._sseSetupGeneration || 0) + 1;
         // Close any existing connection to prevent connection multiplication.
         // Without this, each failed reconnect spawns a new EventSource while
         // the old one may still be retrying, leading to exponential 401 spam.
@@ -699,75 +899,174 @@ class MemoryDashboard {
         }
 
         try {
-            // Build SSE URL with query parameter auth (EventSource API doesn't support custom headers)
+            // EventSource cannot set an Authorization header. It used to carry
+            // `?api_key=<long-lived key>`, which uvicorn wrote verbatim into the
+            // access log on every reconnect (issue #1117) — TLS protects the wire,
+            // not the log. Now we ask for a single-use ticket over POST: the real
+            // credential travels in a body no access-log line contains, and the
+            // ticket is dead within a minute and cannot be replayed.
             const sseUrl = new URL(`${this.apiBase}/events`, document.baseURI);
+            this.updateConnectionStatus('connecting');
             if (this.authState.apiKey) {
-                sseUrl.searchParams.set('api_key', this.authState.apiKey);
-            } else if (this.authState.oauthToken) {
+                this._openSSEWithTicket(sseUrl);
+                return;
+            }
+            if (this.authState.oauthToken) {
+                // OAuth tokens are short-lived and revocable, so a URL carries far
+                // less risk here. Unchanged by this fix.
                 sseUrl.searchParams.set('token', this.authState.oauthToken);
             }
-            this.eventSource = new EventSource(sseUrl.toString());
-
-            this.eventSource.onopen = () => {
-                // Reset backoff on successful connection
-                this._sseReconnectAttempts = 0;
-                this.updateConnectionStatus('connected');
-            };
-
-            this.eventSource.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    this.handleRealtimeUpdate(data);
-                } catch (error) {
-                    console.error('Error parsing SSE data:', error);
-                }
-            };
-
-            // Add specific event listeners for sync progress
-            this.eventSource.addEventListener('sync_progress', (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    this.handleSyncProgress(data);
-                } catch (error) {
-                    console.error('Error parsing sync_progress event:', error);
-                }
-            });
-
-            this.eventSource.addEventListener('sync_completed', (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    this.handleSyncCompleted(data);
-                } catch (error) {
-                    console.error('Error parsing sync_completed event:', error);
-                }
-            });
-
-            this.eventSource.onerror = (error) => {
-                console.error('SSE connection error:', error);
-                this.updateConnectionStatus('disconnected');
-
-                // Don't reconnect if we're not authenticated — avoids infinite
-                // 401 loop when EventSource can't send auth headers and the
-                // query-param fallback isn't accepted.
-                if (!this.authState.isAuthenticated) {
-                    return;
-                }
-
-                // Exponential backoff: 5s → 10s → 20s → 40s → 60s max
-                const attempts = this._sseReconnectAttempts || 0;
-                const delay = Math.min(5000 * Math.pow(2, attempts), 60000);
-                this._sseReconnectAttempts = attempts + 1;
-
-                setTimeout(() => {
-                    if (this.eventSource && this.eventSource.readyState === EventSource.CLOSED) {
-                        this.setupSSE();
-                    }
-                }, delay);
-            };
-
+            this._connectSSE(sseUrl);
         } catch (error) {
             console.error('Failed to establish SSE connection:', error);
             this.updateConnectionStatus('disconnected');
+        }
+    }
+
+    /**
+     * Open the EventSource and bind handlers. One connection path so a retry
+     * cannot leave a second socket behind (see the close() at the top of setupSSE).
+     */
+    _connectSSE(sseUrl) {
+        this.eventSource = new EventSource(sseUrl.toString());
+
+        this.eventSource.onopen = () => {
+            // Reset backoff on successful connection
+            this._sseReconnectAttempts = 0;
+            this.updateConnectionStatus('connected');
+            this._scheduleDashboardRefresh();
+        };
+
+        this.eventSource.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                this.handleRealtimeUpdate(data);
+            } catch (error) {
+                console.error('Error parsing SSE data:', error);
+            }
+        };
+
+        // Add specific event listeners for sync progress
+        this.eventSource.addEventListener('sync_progress', (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                this.handleSyncProgress(data);
+            } catch (error) {
+                console.error('Error parsing sync_progress event:', error);
+            }
+        });
+
+        this.eventSource.addEventListener('sync_completed', (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                this.handleSyncCompleted(data);
+            } catch (error) {
+                console.error('Error parsing sync_completed event:', error);
+            }
+        });
+
+        // Issue #1557: the scheduled delta-sync cycle emits a per-peer
+        // completion event; refresh the dashboard and sync panel on receipt.
+        this.eventSource.addEventListener('sync_delta_completed', (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                this.handleSyncDeltaCompleted(data);
+            } catch (error) {
+                console.error('Error parsing sync_delta_completed event:', error);
+            }
+        });
+
+        // Issue #1557: memories stored/deleted by any client (GUI, MCP tools,
+        // remote storage) previously left dashboard widgets stale until a
+        // manual reload. The backend already broadcasts these events; now the
+        // dashboard listens and refreshes itself (debounced).
+        this.eventSource.addEventListener('memory_stored', () => {
+            this._scheduleDashboardRefresh();
+        });
+
+        this.eventSource.addEventListener('memory_deleted', () => {
+            this._scheduleDashboardRefresh();
+        });
+
+        this.eventSource.addEventListener('consolidation_completed', () => {
+            this._scheduleDashboardRefresh();
+        });
+
+        this.eventSource.onerror = (error) => {
+            console.error('SSE connection error:', error);
+            this.updateConnectionStatus('disconnected');
+
+            // Don't reconnect if we're not authenticated — avoids infinite
+            // 401 loop when EventSource can't send auth headers and the
+            // query-param fallback isn't accepted.
+            if (!this.authState.isAuthenticated) {
+                return;
+            }
+
+            // Exponential backoff: 5s → 10s → 20s → 40s → 60s max
+            const attempts = this._sseReconnectAttempts || 0;
+            const delay = Math.min(5000 * Math.pow(2, attempts), 60000);
+            this._sseReconnectAttempts = attempts + 1;
+
+            setTimeout(() => {
+                if (this.eventSource && this.eventSource.readyState === EventSource.CLOSED) {
+                    this.setupSSE();
+                }
+            }, delay);
+        };
+
+    }
+
+    /**
+     * Exchange the long-lived API key for a single-use SSE ticket, then connect.
+     * The key travels in a POST body; only the ticket goes on the URL.
+     */
+    async _openSSEWithTicket(sseUrl) {
+        // Greptile: a failed exchange used to leave the page disconnected with
+        // no EventSource and therefore no onerror retry — a transient 429 or
+        // blip killed live updates until a reload. Retry with backoff, and bail
+        // out if the user signed out meanwhile.
+        // The generation counter also stops a slow response from an earlier
+        // setupSSE opening a second stream after a newer one is already live.
+        const attempt = ++this._sseSetupGeneration;
+        const maxAttempts = 4;
+        for (let i = 0; i < maxAttempts; i++) {
+            if (attempt !== this._sseSetupGeneration) return; // superseded
+            if (this.authState.requiresAuth && !this.authState.isAuthenticated) return;
+            try {
+                const headers = { 'Content-Type': 'application/json' };
+                if (this.authState.apiKey) headers['X-API-Key'] = this.authState.apiKey;
+                const resp = await fetch(`${this.apiBase}/events/ticket`, {
+                    method: 'POST',
+                    headers,
+                    body: '{}',
+                    credentials: 'same-origin',
+                });
+                // 401 is not transient: the credential is wrong. Retry only
+                // what a retry can fix.
+                if (resp.status === 401 || resp.status === 403) {
+                    console.error(`SSE ticket refused (${resp.status}); not retrying`);
+                    this.updateConnectionStatus('unauthorized');
+                    return;
+                }
+                if (!resp.ok) throw new Error(`ticket request failed: ${resp.status}`);
+                const data = await resp.json();
+                if (attempt !== this._sseSetupGeneration) return;
+                sseUrl.searchParams.set(data.param_name || 'ticket', data.ticket);
+                this._connectSSE(sseUrl);
+                return;
+            } catch (err) {
+                if (attempt !== this._sseSetupGeneration) return;
+                if (i === maxAttempts - 1) {
+                    console.error('SSE ticket exchange failed:', err);
+                    // Network or server trouble, not a refusal: the reader can try again.
+                    this.updateConnectionStatus('disconnected');
+                    return;
+                }
+                // 250ms, 500ms, 1000ms — short, because the user is waiting
+                // for live updates, not for a background sync.
+                await new Promise((r) => setTimeout(r, 250 * Math.pow(2, i)));
+            }
         }
     }
 
@@ -815,7 +1114,7 @@ class MemoryDashboard {
             const memoryCountElement = document.getElementById('totalMemories');
             if (memoryCountElement && data.synced_count) {
                 // Refresh the detailed health to get accurate count
-                this.loadDashboardData().catch(err => console.error('Error refreshing dashboard:', err));
+                this._scheduleDashboardRefresh();
             }
         }
 
@@ -840,13 +1139,13 @@ class MemoryDashboard {
         // Update sync status display
         const syncStatus = document.getElementById('syncStatus');
         if (syncStatus) {
-            syncStatus.textContent = 'Synced';
+            syncStatus.textContent = this.t('sync.status.synced', 'Synced');
             syncStatus.className = 'sync-status synced';
         }
 
         // Refresh dashboard data to show updated counts
         if (this.currentView === 'dashboard') {
-            this.loadDashboardData().catch(err => console.error('Error refreshing dashboard:', err));
+            this._scheduleDashboardRefresh();
         }
 
         // Also refresh sync status for hybrid mode
@@ -855,6 +1154,57 @@ class MemoryDashboard {
         // Show completion notification
         const message = data.message || `Sync completed: ${data.synced_count} memories synced`;
         this.showToast(message, 'success');
+    }
+
+    /** Refresh dashboard and peer status once for a burst of cycle events. */
+    handleSyncDeltaCompleted(data) {
+        console.log('Delta-sync completed:', data);
+        this._scheduleDashboardRefresh();
+    }
+
+    /**
+     * Refresh dashboard widgets after accumulating real-time events (issue #1557).
+     *
+     * Multiple SSE events arriving in quick succession (e.g. one delta-sync
+     * cycle touching several peers, or a store/delete burst) collapse into a
+     * single refresh within ~1s of the first event, instead of one refetch each.
+     */
+    _scheduleDashboardRefresh(delayMs = 1000) {
+        if (this._dashboardRefreshTimer) {
+            return; // a refresh is already pending; it will pick up this event too
+        }
+        this._dashboardRefreshTimer = setTimeout(async () => {
+            this._dashboardRefreshTimer = null;
+            if (document.hidden) return;
+            if (this._dashboardRefreshInFlight) {
+                this._scheduleDashboardRefresh(delayMs);
+                return;
+            }
+            this._dashboardRefreshInFlight = true;
+            try {
+                await Promise.all([
+                    this.checkSyncStatus(),
+                    this.currentView === 'dashboard' ? this.loadDashboardData({ silent: true }) : Promise.resolve()
+                ]);
+            } catch (error) {
+                console.error('Error refreshing live data:', error);
+            } finally {
+                this._dashboardRefreshInFlight = false;
+            }
+        }, delayMs);
+    }
+
+    /**
+     * Stop any pending dashboard refresh / countdown tickers (called on destroy).
+     */
+    stopLiveRefresh() {
+        if (this._dashboardRefreshTimer) {
+            clearTimeout(this._dashboardRefreshTimer);
+            this._dashboardRefreshTimer = null;
+        }
+        clearInterval(this._dashboardRefreshInterval);
+        this._dashboardRefreshInterval = null;
+        this._stopSyncCountdown();
     }
 
     /**
@@ -889,9 +1239,11 @@ class MemoryDashboard {
             // Populate typeFilter (search filter) - keep "All types" option
             const typeFilter = document.getElementById('typeFilter');
             if (typeFilter) {
+                const selected = typeFilter.value;
                 const allOpt = document.createElement('option');
                 allOpt.value = '';
-                allOpt.textContent = this.t('search.filters.type.all') || 'All types';
+                allOpt.dataset.i18n = 'search.filters.type.all';
+                allOpt.textContent = this.t('search.filters.type.all', 'All types');
                 const typeOpts = types.map(t => {
                     const opt = document.createElement('option');
                     opt.value = t;
@@ -899,6 +1251,13 @@ class MemoryDashboard {
                     return opt;
                 });
                 typeFilter.replaceChildren(allOpt, ...typeOpts);
+                // Keep the user's type filter. If that type was just removed, the filter
+                // falls back to "All types" and the search reruns so results and badge match.
+                if (types.includes(selected)) {
+                    typeFilter.value = selected;
+                } else if (selected) {
+                    typeFilter.dispatchEvent(new Event('change'));
+                }
             }
 
             // Populate all memoryType selects (document upload + add memory modal)
@@ -921,8 +1280,8 @@ class MemoryDashboard {
     /**
      * Load initial dashboard data
      */
-    async loadDashboardData() {
-        this.setLoading(true);
+    async loadDashboardData({ silent = false } = {}) {
+        if (!silent) this.setLoading(true);
 
         try {
             // Load recent memories for dashboard display
@@ -941,9 +1300,9 @@ class MemoryDashboard {
 
         } catch (error) {
             console.error('Error loading dashboard data:', error);
-            this.showToast(this.t('toast.loadDashboardFail', 'Failed to load dashboard data'), 'error');
+            if (!silent) this.showToast(this.t('toast.loadDashboardFail', 'Failed to load dashboard data'), 'error');
         } finally {
-            this.setLoading(false);
+            if (!silent) this.setLoading(false);
         }
     }
 
@@ -1004,7 +1363,7 @@ class MemoryDashboard {
             // Show a message in the history container instead of just logging
             const historyContainer = document.getElementById('uploadHistory');
             if (historyContainer) {
-                historyContainer.innerHTML = '<p style="text-align: center; color: var(--error);">Failed to load upload history. Please check the console for details.</p>';
+                historyContainer.innerHTML = `<p style="text-align: center; color: var(--error);">${this.escapeHtml(this.t('documents.uploadHistoryError', 'Failed to load upload history. Please check the console for details.'))}</p>`;
             }
         }
     }
@@ -1017,7 +1376,7 @@ class MemoryDashboard {
         if (!historyContainer) return;
 
         if (uploads.length === 0) {
-            historyContainer.innerHTML = '<p style="text-align: center; color: var(--neutral-500);">No uploads yet. Start by uploading some documents!</p>';
+            historyContainer.innerHTML = `<p style="text-align: center; color: var(--neutral-500);" data-i18n="documents.noUploads">${this.escapeHtml(this.t('documents.noUploads', 'No uploads yet'))}</p>`;
             return;
         }
 
@@ -1046,24 +1405,26 @@ class MemoryDashboard {
                         <div class="upload-status ${statusClass}">
                             <span>${statusText}</span>
                             ${upload.errors && upload.errors.length > 0 ? `
-                                <span title="${this.escapeHtml(upload.errors.join('; '))}">⚠️</span>
+                                <span class="upload-error-count" title="${this.escapeHtml(upload.errors.join('; '))}">${this.escapeHtml(this.t('documents.uploadErrorCount', 'Errors: {count}', { count: upload.errors.length }))}</span>
                             ` : ''}
                         </div>
                         ${upload.status === 'completed' && hasMemories ? `
                             <div class="upload-actions">
                                 <button class="btn-icon btn-view-memory"
-                                title="View memory chunks">
+                                title="${this.escapeHtml(this.t('documents.viewChunksTip', 'View memory chunks'))}"
+                                data-i18n-title="documents.viewChunksTip">
                                     <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
                                     </svg>
-                                    <span>View</span>
+                                    <span data-i18n="documents.view">${this.escapeHtml(this.t('documents.view', 'View'))}</span>
                                 </button>
                                 <button class="btn-icon btn-remove"
-                                title="Remove document and memories">
+                                title="${this.escapeHtml(this.t('documents.removeWithMemoriesTip', 'Remove document and memories'))}"
+                                data-i18n-title="documents.removeWithMemoriesTip">
                                     <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
                                     </svg>
-                                    <span>Remove</span>
+                                    <span data-i18n="documents.remove">${this.escapeHtml(this.t('documents.remove', 'Remove'))}</span>
                                 </button>
                             </div>
                         ` : ''}
@@ -1135,7 +1496,7 @@ class MemoryDashboard {
         }
 
         // Chunking help info icon
-        const infoIcon = document.querySelector('.info-icon');
+        const infoIcon = document.querySelector('.info-icon-chunk');
         if (infoIcon) {
             infoIcon.addEventListener('click', () => {
                 this.toggleChunkingHelp();
@@ -1202,9 +1563,6 @@ class MemoryDashboard {
 
         // Sync buttons event listeners are attached in checkSyncStatus()
         // after buttons are confirmed to be accessible in the DOM
-
-        // Backup buttons use inline onclick handlers in HTML
-        // (setupEventListeners runs before settings modal DOM is interactive)
 
         // Document search button
         const docSearchBtn = document.getElementById('docSearchBtn');
@@ -1329,8 +1687,8 @@ class MemoryDashboard {
         }
         if (this.modeDescription) {
             this.modeDescription.innerHTML = mode === 'batch'
-                ? '<small>All selected files will be processed together with the same tags.</small>'
-                : '<small>Each file will be processed individually with the same tags.</small>';
+                ? `<small data-i18n="documents.modeDescription">${this.escapeHtml(this.t('documents.modeDescription', 'All selected files will be processed together with the same tags.'))}</small>`
+                : `<small data-i18n="documents.modeDescriptionIndividual">${this.escapeHtml(this.t('documents.modeDescriptionIndividual', 'Each file will be processed individually with the same tags.'))}</small>`;
         }
 
         console.log(`Processing mode set to: ${mode}`);
@@ -1405,9 +1763,9 @@ class MemoryDashboard {
                         <svg width="48" height="48" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
                         </svg>
-                        <h3>Drag & drop files here</h3>
-                        <p>or <button id="fileSelectBtn" class="link-button">browse to select files</button></p>
-                        <p class="supported-formats">Supported formats: PDF, DOCX, PPTX, TXT, MD, JSON</p>
+                        <h3 data-i18n="documents.dropTitle">${this.escapeHtml(this.t('documents.dropTitle', 'Drag & drop files here'))}</h3>
+                        <p data-i18n-html="documents.dropSubtitle">${this.t('documents.dropSubtitle', 'or <button id="fileSelectBtn" class="link-button">browse to select files</button>')}</p>
+                        <p class="supported-formats" data-i18n="documents.supported">${this.escapeHtml(this.t('documents.supported', 'Supported formats: PDF, DOCX, PPTX, TXT, MD, JSON'))}</p>
                         <input type="file" id="fileInput" multiple accept=".pdf,.docx,.pptx,.txt,.md,.json" style="display: none;">
                     `;
                 }
@@ -1451,7 +1809,7 @@ class MemoryDashboard {
         console.log(`Upload response status: ${response.status}`);
 
         if (!response.ok) {
-            let errorMessage = `Upload failed with status ${response.status}`;
+            let errorMessage = this.t('documents.uploadStatusError', 'Upload failed with status {status}', { status: response.status });
             try {
                 const error = await response.json();
                 console.error('Upload error details:', error);
@@ -1509,7 +1867,7 @@ class MemoryDashboard {
 
         if (!response.ok) {
             const error = await response.json();
-            throw new Error(error.detail || 'Batch upload failed');
+            throw new Error(error.detail || this.t('documents.batchUploadFailed', 'Batch upload failed'));
         }
 
         const result = await response.json();
@@ -1581,6 +1939,7 @@ class MemoryDashboard {
 
         try {
             const syncStatus = await this.apiCall('/sync/status');
+            this.updateDeltaSyncStatus(syncStatus.delta_sync);
 
             // Get compact sync control element
             const syncControl = document.getElementById('syncControl');
@@ -1636,35 +1995,41 @@ class MemoryDashboard {
 
             // Determine status and update UI (dot color is handled by CSS classes)
             if (isPaused) {
-                statusText.textContent = 'Paused';
+                statusText.textContent = this.t('sync.status.paused', 'Paused');
                 syncProgress.textContent = '';
                 syncControl.className = 'sync-control-compact paused';
                 if (syncButton) syncButton.disabled = true;
             } else if (syncStatus.status === 'syncing') {
-                statusText.textContent = 'Syncing';
-                syncProgress.textContent = syncStatus.operations_pending > 0 ? `${syncStatus.operations_pending} pending` : '';
+                statusText.textContent = this.t('sync.status.syncing', 'Syncing');
+                syncProgress.textContent = syncStatus.operations_pending > 0 ? this.t('sync.pendingOps', '{count} pending', { count: syncStatus.operations_pending }) : '';
                 syncControl.className = 'sync-control-compact syncing';
                 if (syncButton) syncButton.disabled = true;
             } else if (syncStatus.status === 'pending') {
-                statusText.textContent = 'Pending';
-                syncProgress.textContent = `${syncStatus.operations_pending} ops`;
+                statusText.textContent = this.t('sync.status.pending', 'Pending');
+                syncProgress.textContent = this.t('sync.opsCount', '{count} ops', { count: syncStatus.operations_pending });
                 syncControl.className = 'sync-control-compact pending';
                 if (syncButton) syncButton.disabled = false;
             } else if (syncStatus.status === 'error') {
-                statusText.textContent = 'Error';
-                syncProgress.textContent = `${syncStatus.operations_failed} failed`;
+                statusText.textContent = this.t('sync.status.error', 'Error');
+                syncProgress.textContent = this.t('sync.failedCount', '{count} failed', { count: syncStatus.operations_failed });
                 syncControl.className = 'sync-control-compact error';
                 if (syncButton) syncButton.disabled = false;
             } else {
                 // synced status
-                statusText.textContent = 'Synced';
+                statusText.textContent = this.t('sync.status.synced', 'Synced');
                 syncProgress.textContent = '';
                 syncControl.className = 'sync-control-compact synced';
                 if (syncButton) syncButton.disabled = false;
             }
 
         } catch (error) {
+            this._stopSyncCountdown();
             console.error('Error checking sync status:', error);
+            const deltaControl = document.getElementById('deltaSyncControl');
+            if (deltaControl && deltaControl.style.display !== 'none') {
+                deltaControl.className = 'sync-control-compact delta-sync-control error';
+                document.getElementById('deltaSyncStatus').textContent = this.t('sync.statusUnavailable', 'Status unavailable');
+            }
             // Hide sync control on error (likely not hybrid mode)
             const syncControl = document.getElementById('syncControl');
             if (syncControl) syncControl.style.display = 'none';
@@ -1674,11 +2039,166 @@ class MemoryDashboard {
     /**
      * Format time delta in human readable format
      */
+    updateDeltaSyncStatus(delta) {
+        this._stopSyncCountdown();
+        const panel = document.getElementById('deltaSyncControl');
+        if (!panel) return;
+        panel.style.display = delta?.configured ? 'block' : 'none';
+        if (!delta?.configured) return;
+        const state = delta.status || 'disabled';
+        panel.className = `sync-control-compact delta-sync-control ${state === 'disabled' ? 'paused' : state}`;
+        document.getElementById('deltaSyncStatus').textContent = this.t(`sync.status.${state}`, state.charAt(0).toUpperCase() + state.slice(1));
+        const next = delta.next_run_at ? new Date(delta.next_run_at) : null;
+        const cadence = this.formatDuration(delta.interval_seconds);
+        document.getElementById('deltaSyncSchedule').textContent = delta.enabled
+            ? this.t('sync.scheduleEveryNext', 'Every {interval} · Next: {time}', { interval: cadence, time: next ? next.toLocaleTimeString() : this.t('sync.notScheduled', 'not scheduled') })
+            : this.t('sync.automaticDisabled', 'Automatic sync disabled · Schedule: {schedule}', { schedule: delta.schedule });
+        if (delta.enabled && delta.next_run_at) {
+            this._startSyncCountdown(delta.next_run_at, this.t('sync.every', 'Every {interval} · ', { interval: cadence }));
+        }
+        const container = document.getElementById('deltaSyncPeers');
+        // Keep the disclosure open across live refreshes, including keyboard focus.
+        const openPeers = new Set([...container.querySelectorAll('details[open]')]
+            .map(details => details.dataset.peerId));
+        const focusedPeer = document.activeElement?.closest('details')?.dataset.peerId;
+        container.replaceChildren();
+        const text = (parent, tag, value, className, i18nKey) => {
+            const el = document.createElement(tag);
+            if (className) el.className = className;
+            // Static labels carry their key so applyTranslations() re-translates
+            // them after a language switch (#1806); dynamic values do not.
+            if (i18nKey) el.dataset.i18n = i18nKey;
+            el.textContent = value;
+            parent.appendChild(el);
+            return el;
+        };
+        const peers = delta.peers || [];
+        if (!peers.length) text(container, 'p', this.t('sync.noPeers', 'No peers configured'), 'delta-sync-meta', 'sync.noPeers');
+        for (const peer of peers) {
+            const row = document.createElement('div');
+            row.className = 'delta-sync-peer';
+            const heading = document.createElement('div');
+            heading.className = 'delta-sync-peer-heading';
+            row.appendChild(heading);
+            text(heading, 'span', peer.peer_id, 'delta-sync-destination');
+            if (peers.length > 1) {
+                text(heading, 'span', peer.health || peer.status, 'delta-sync-meta');
+            }
+            text(row, 'p', peer.url || this.t('sync.urlNotConfigured', 'URL not configured'), 'delta-sync-url');
+
+            const metrics = document.createElement('dl');
+            metrics.className = 'delta-sync-metrics';
+            row.appendChild(metrics);
+            const metric = (label, value, note, labelKey) => {
+                const group = document.createElement('div');
+                text(group, 'dt', label, undefined, labelKey);
+                const result = text(group, 'dd', value);
+                text(result, 'span', note, 'delta-sync-meta');
+                metrics.appendChild(group);
+            };
+            metric(this.t('sync.pull', 'Pull'), peer.pull ? String(peer.pull.received ?? this.t('sync.unknown', 'Unknown')) : '—',
+                peer.pull ? this.t('sync.pullReceived', 'received · {count} applied', { count: peer.pull.applied }) : this.t('sync.noCycleYet', 'No cycle yet'), 'sync.pull');
+            metric(this.t('sync.push', 'Push'), peer.push ? String(peer.push.pushed) : '—',
+                peer.push ? this.t('sync.pushSent', 'sent to peer') : this.t('sync.noCycleYet', 'No cycle yet'), 'sync.push');
+
+            const completed = peer.last_cycle_at ? new Date(peer.last_cycle_at) : null;
+            const lastCycle = text(row, 'p', completed
+                ? this.t('sync.lastCycle', 'Last cycle {time}', { time: this.formatTimeDelta(Math.max(0, Math.floor((Date.now() - completed.getTime()) / 1000))) })
+                : peer.cycle_status === 'syncing' ? this.t('sync.status.syncing', 'Syncing…') : this.t('sync.waitingFirstCycle', 'Waiting for first cycle'), 'delta-sync-meta');
+            if (completed) lastCycle.title = completed.toLocaleString();
+            if (peer.last_error || ['error', 'incompatible', 'unavailable'].includes(peer.status)) {
+                text(row, 'p', peer.last_error || peer.message, 'delta-sync-error');
+            }
+
+            const details = document.createElement('details');
+            details.className = 'delta-sync-details';
+            details.dataset.peerId = peer.peer_id;
+            details.open = openPeers.has(peer.peer_id);
+            const summary = text(details, 'summary', this.t('sync.details', 'Sync details'), undefined, 'sync.details');
+            const diagnostics = document.createElement('dl');
+            for (const [labelKey, label, value] of [
+                ['sync.pullCursor', this.t('sync.pullCursor', 'Pull cursor'), peer.pull?.cursor ?? this.t('sync.notAvailable', 'Not available')],
+                ['sync.pushCursor', this.t('sync.pushCursor', 'Push cursor'), peer.push?.cursor ?? this.t('sync.notAvailable', 'Not available')],
+                ['sync.backlog', this.t('sync.backlog', 'Backlog'), peer.backlog ?? this.t('sync.unknown', 'Unknown')]
+            ]) {
+                const group = document.createElement('div');
+                text(group, 'dt', label, undefined, labelKey);
+                text(group, 'dd', String(value));
+                diagnostics.appendChild(group);
+            }
+            details.appendChild(diagnostics);
+            row.appendChild(details);
+            container.appendChild(row);
+            if (focusedPeer === peer.peer_id) summary.focus({ preventScroll: true });
+        }
+    }
+
+    /**
+     * A duration in its largest whole unit: "45s", "5m", "3h", "2d". The sync
+     * cadence shows it on its own; formatTimeDelta() wraps it in "{time} ago".
+     */
+    formatDuration(seconds) {
+        if (seconds < 60) return this.t('time.seconds', '{count}s', { count: seconds });
+        if (seconds < 3600) return this.t('time.minutes', '{count}m', { count: Math.floor(seconds / 60) });
+        if (seconds < 86400) return this.t('time.hours', '{count}h', { count: Math.floor(seconds / 3600) });
+        return this.t('time.days', '{count}d', { count: Math.floor(seconds / 86400) });
+    }
+
     formatTimeDelta(seconds) {
-        if (seconds < 60) return `${seconds}s ago`;
-        if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-        if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-        return `${Math.floor(seconds / 86400)}d ago`;
+        return this.t('time.ago', '{time} ago', { time: this.formatDuration(seconds) });
+    }
+
+    /**
+     * Format a time remaining as "Next sync in Xh XXm / Xm XXs / Xs" (issue #1557).
+     */
+    _formatSyncIn(remainingMs) {
+        const total = Math.max(0, Math.round(remainingMs / 1000));
+        const h = Math.floor(total / 3600);
+        const m = Math.floor((total % 3600) / 60);
+        const s = total % 60;
+        if (h > 0) return this.t('sync.nextSyncInHm', 'Next sync in {hours}h {minutes}m', { hours: h, minutes: String(m).padStart(2, '0') });
+        if (m > 0) return this.t('sync.nextSyncInMs', 'Next sync in {minutes}m {seconds}s', { minutes: m, seconds: String(s).padStart(2, '0') });
+        return this.t('sync.nextSyncInS', 'Next sync in {seconds}s', { seconds: s });
+    }
+
+    /**
+     * Show a live "next sync" countdown anchored to the server-provided
+     * next_run_at of the scheduled delta-sync job (issue #1557).
+     *
+     * Anchoring on an absolute timestamp keeps the countdown accurate across
+     * throttled intervals/interrupted tabs; the 10s checkSyncStatus poll
+     * re-arms it with any schedule change (misfires, manual cycles).
+     */
+    _startSyncCountdown(nextRunAt, prefix = '') {
+        const nextAt = new Date(nextRunAt).getTime();
+        const progressEl = document.getElementById('deltaSyncSchedule');
+        this._stopSyncCountdown();
+        if (!progressEl) return;
+        if (!nextRunAt || Number.isNaN(nextAt)) {
+            progressEl.textContent = this.t('sync.schedulePaused', 'Schedule paused');
+            return;
+        }
+
+        const render = () => {
+            const remainingMs = nextAt - Date.now();
+            if (remainingMs <= 0) {
+                // A due timestamp does not prove that a cycle is running.
+                // The next status response supplies the next scheduled run.
+                progressEl.textContent = prefix + this.t('sync.scheduledDue', 'Scheduled sync due');
+                this._stopSyncCountdown();
+                return;
+            }
+            progressEl.textContent = prefix + this._formatSyncIn(remainingMs);
+        };
+        this._syncCountdownInterval = setInterval(render, 1000);
+        render();
+    }
+
+    _stopSyncCountdown() {
+        if (this._syncCountdownInterval) {
+            clearInterval(this._syncCountdownInterval);
+            this._syncCountdownInterval = null;
+        }
     }
 
     /**
@@ -1698,7 +2218,7 @@ class MemoryDashboard {
 
                 if (pauseButton) pauseButton.style.display = 'none';
                 if (resumeButton) resumeButton.style.display = 'flex';
-                if (statusText) statusText.textContent = 'Paused';
+                if (statusText) statusText.textContent = this.t('sync.status.paused', 'Paused');
                 if (syncControl) syncControl.className = 'sync-control-compact paused';
 
                 // Small delay to allow backend state to propagate before checking status
@@ -1733,7 +2253,7 @@ class MemoryDashboard {
 
                 if (pauseButton) pauseButton.style.display = 'flex';
                 if (resumeButton) resumeButton.style.display = 'none';
-                if (statusText) statusText.textContent = 'Synced';
+                if (statusText) statusText.textContent = this.t('sync.status.synced', 'Synced');
                 if (syncControl) syncControl.className = 'sync-control-compact synced';
 
                 // Small delay to allow backend state to propagate before checking status
@@ -1764,18 +2284,18 @@ class MemoryDashboard {
             const nextBackup = document.getElementById('settingsNextBackup');
 
             if (!backupStatus.enabled) {
-                if (lastBackup) lastBackup.textContent = 'Backups disabled';
+                this.setTranslatedText(lastBackup, 'modal.settings.backup.disabled', 'Backups disabled');
                 if (backupCount) backupCount.textContent = '-';
-                if (nextBackup) nextBackup.textContent = '-';
+                this.setValueText(nextBackup, '-');
                 return;
             }
 
-            // Update last backup time
+            // Update last backup time. formatTimeDelta() already says "ago".
             if (lastBackup) {
                 if (backupStatus.time_since_last_seconds) {
-                    lastBackup.textContent = this.formatTimeDelta(Math.floor(backupStatus.time_since_last_seconds)) + ' ago';
+                    this.setValueText(lastBackup, this.formatTimeDelta(Math.floor(backupStatus.time_since_last_seconds)));
                 } else {
-                    lastBackup.textContent = 'Never';
+                    this.setTranslatedText(lastBackup, 'modal.settings.never', 'Never');
                 }
             }
 
@@ -1788,9 +2308,11 @@ class MemoryDashboard {
             // Update next scheduled backup
             if (nextBackup && backupStatus.next_backup_at) {
                 const nextDate = new Date(backupStatus.next_backup_at);
-                nextBackup.textContent = nextDate.toLocaleString();
-            } else if (nextBackup) {
-                nextBackup.textContent = backupStatus.scheduler_running ? 'Scheduled' : 'Not scheduled';
+                this.setValueText(nextBackup, nextDate.toLocaleString());
+            } else if (backupStatus.scheduler_running) {
+                this.setTranslatedText(nextBackup, 'modal.settings.backup.scheduled', 'Scheduled');
+            } else {
+                this.setTranslatedText(nextBackup, 'modal.settings.backup.notScheduled', 'Not scheduled');
             }
 
         } catch (error) {
@@ -1845,7 +2367,7 @@ class MemoryDashboard {
         // Show loading state
         const listEl = document.getElementById('backupsList');
         const summaryEl = document.getElementById('backupsSummary');
-        if (listEl) listEl.innerHTML = '<p class="loading-text">Loading backups...</p>';
+        if (listEl) listEl.innerHTML = this.staticTextHtml('p', 'loading-text', 'modal.backups.loading', 'Loading backups...');
         if (summaryEl) summaryEl.innerHTML = '';
 
         this.openModal(modal);
@@ -1871,9 +2393,16 @@ class MemoryDashboard {
             const totalSizeMB = (totalSizeBytes / 1024 / 1024).toFixed(2);
             const backupDir = status?.backup_directory || '';
 
-            // Render summary
+            // Render summary. The values are inserted as HTML after the
+            // translated sentence is escaped, so they keep their <strong>.
             if (summaryEl) {
-                let html = `<strong>${totalCount}</strong> backup${totalCount !== 1 ? 's' : ''} &middot; <strong>${totalSizeMB} MB</strong> total`;
+                const sentence = totalCount === 1
+                    ? this.t('modal.backups.summaryOne', '{count} backup · {size} total')
+                    : this.t('modal.backups.summaryMany', '{count} backups · {size} total');
+                let html = this.replacePlaceholders(this.escapeHtml(sentence), {
+                    count: `<strong>${this.escapeHtml(totalCount)}</strong>`,
+                    size: `<strong>${this.escapeHtml(totalSizeMB)} MB</strong>`
+                });
                 if (backupDir) {
                     html += `<br><span class="backup-directory-path">${this.escapeHtml(backupDir)}</span>`;
                 }
@@ -1882,15 +2411,22 @@ class MemoryDashboard {
 
             // Render backup list
             if (backups.length === 0) {
-                listEl.innerHTML = '<p class="loading-text">No backups found. Create one using "Create Backup Now".</p>';
+                const empty = this.t('modal.backups.empty', 'No backups found. Create one using "{button}".', {
+                    button: this.t('modal.settings.backupNow', 'Create Backup Now')
+                });
+                listEl.innerHTML = `<p class="loading-text">${this.escapeHtml(empty)}</p>`;
                 return;
             }
 
             listEl.innerHTML = backups.map(backup => {
                 const sizeMB = (backup.size_bytes / 1024 / 1024).toFixed(2);
-                const createdDate = backup.created_at ? new Date(backup.created_at).toLocaleString() : 'Unknown';
+                const createdDate = backup.created_at
+                    ? new Date(backup.created_at).toLocaleString()
+                    : this.t('modal.backups.unknownDate', 'Unknown');
                 const ageDays = backup.age_days != null ? backup.age_days : '?';
-                const ageLabel = ageDays === 1 ? '1 day ago' : `${ageDays} days ago`;
+                const ageLabel = ageDays === 1
+                    ? this.t('modal.backups.ageOne', '1 day ago')
+                    : this.t('modal.backups.ageDays', '{days} days ago', { days: ageDays });
 
                 return `
                     <div class="backup-item">
@@ -1898,7 +2434,7 @@ class MemoryDashboard {
                         <div class="backup-meta">
                             <span>${sizeMB} MB</span>
                             <span>${this.escapeHtml(createdDate)}</span>
-                            <span>${ageLabel}</span>
+                            <span>${this.escapeHtml(ageLabel)}</span>
                         </div>
                     </div>
                 `;
@@ -1906,7 +2442,7 @@ class MemoryDashboard {
 
         } catch (error) {
             console.error('Error loading backups list:', error);
-            listEl.innerHTML = '<p class="loading-text" style="color: var(--error);">Failed to load backups.</p>';
+            listEl.innerHTML = this.staticTextHtml('p', 'loading-text', 'modal.backups.loadFailed', 'Failed to load backups.', 'color: var(--error);');
         }
     }
 
@@ -1918,6 +2454,13 @@ class MemoryDashboard {
         if (this._syncMonitorInterval) {
             clearInterval(this._syncMonitorInterval);
         }
+        // Recover missed SSE events and writes from clients without notifications.
+        clearInterval(this._dashboardRefreshInterval);
+        this._dashboardRefreshInterval = setInterval(() => {
+            if (this.currentView === 'dashboard' && !document.hidden) {
+                this._scheduleDashboardRefresh(1000);
+            }
+        }, 30000);
         // Check sync status every 10 seconds
         this._syncMonitorInterval = setInterval(() => {
             this.checkSyncStatus();
@@ -1948,8 +2491,8 @@ class MemoryDashboard {
             const syncProgress = document.getElementById('syncProgress');
             const syncControl = document.getElementById('syncControl');
 
-            if (statusText) statusText.textContent = 'Syncing';
-            if (syncProgress) syncProgress.textContent = statusBefore.operations_pending > 0 ? `${statusBefore.operations_pending} pending` : '';
+            if (statusText) statusText.textContent = this.t('sync.status.syncing', 'Syncing');
+            if (syncProgress) syncProgress.textContent = statusBefore.operations_pending > 0 ? this.t('sync.pendingOps', '{count} pending', { count: statusBefore.operations_pending }) : '';
             if (syncControl) syncControl.className = 'sync-control-compact syncing';
 
             // Show toast when sync starts
@@ -2012,7 +2555,7 @@ class MemoryDashboard {
         taggedContainer.style.display = 'none';
 
         if (!this.tags || this.tags.length === 0) {
-            container.innerHTML = '<p class="text-neutral-600">No tags found. Start adding tags to your memories to see them here.</p>';
+            container.innerHTML = `<p class="text-neutral-600" data-i18n="browse.noTags">${this.escapeHtml(this.t('browse.noTags', 'No tags found. Start adding tags to your memories to see them here.'))}</p>`;
             return;
         }
 
@@ -2069,39 +2612,32 @@ class MemoryDashboard {
     }
 
     /**
-     * Escape HTML to prevent XSS
+     * Escape HTML to prevent XSS. Safe in element text and in quoted attribute
+     * values: quotes are encoded too, since callers interpolate the result into
+     * data-tag="..." and similar attributes (GHSA-j664-v823-6p9f).
      */
     escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
+        return String(text ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     /**
-     * Get time-of-day emoji icon based on timestamp
+     * Render a local time-of-day cue alongside the clock time for a timestamp
      * @param {number} timestamp - Unix timestamp in seconds
-     * @returns {string} HTML with emoji + tooltip
+     * @returns {string} HTML span with the time-of-day icon and clock time
      */
     renderTimeIcon(timestamp) {
         if (!timestamp) return '';
 
         const date = new Date(timestamp * 1000);
-        const hour = date.getHours(); // Local timezone
-        const segment = Math.floor(hour / 3); // 0-7
-
+        const segment = Math.floor(date.getHours() / 3);
         const icons = ['🌙', '🌅', '☕', '💻', '🍽️', '⛅', '🍷', '🛏️'];
-        const labels = [
-            'Late Night',    // 00-03
-            'Early Morning', // 03-06
-            'Morning',       // 06-09
-            'Late Morning',  // 09-12
-            'Afternoon',     // 12-15
-            'Late Afternoon',// 15-18
-            'Evening',       // 18-21
-            'Night'          // 21-24
-        ];
-
-        return `<span class="time-icon" title="${labels[segment]}">${icons[segment]}</span>`;
+        const time = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+        return `<span class="time-icon"><span aria-hidden="true">${icons[segment]}</span> ${time}</span>`;
     }
 
     /**
@@ -2177,7 +2713,7 @@ class MemoryDashboard {
      */
     renderMemoriesInContainer(memories, container) {
         if (!memories || memories.length === 0) {
-            container.innerHTML = '<p class="empty-state">No memories found with this tag.</p>';
+            container.innerHTML = `<p class="empty-state" data-i18n="browse.noTaggedMemories">${this.escapeHtml(this.t('browse.noTaggedMemories', 'No memories found with this tag.'))}</p>`;
             return;
         }
 
@@ -2220,6 +2756,11 @@ class MemoryDashboard {
         if (targetView) {
             targetView.classList.add('active');
             this.currentView = viewName;
+
+            // Opening the Manage tab always starts on its first sub-tab (#1973)
+            if (viewName === 'manage') {
+                this.switchManageTab('manageTabBulk');
+            }
 
             // Load view-specific data
             this.loadViewData(viewName);
@@ -2340,6 +2881,11 @@ class MemoryDashboard {
         const typeFilter = document.getElementById('typeFilter')?.value;
         const query = document.getElementById('quickSearch')?.value?.trim() || '';
 
+        // A newer filter search or Clear All makes this one outdated: it must
+        // stop paging and must not replace what the newer one shows.
+        const searchId = this.filterSearchId = (this.filterSearchId || 0) + 1;
+        const isCurrent = () => searchId === this.filterSearchId;
+
         // Add loading state
         const applyBtn = document.getElementById('applyFiltersBtn');
         if (applyBtn) {
@@ -2413,29 +2959,41 @@ class MemoryDashboard {
             }
             // Priority 4: Type-only filter
             else if (typeFilter && typeFilter.trim()) {
-                const allMemoriesResponse = await this.apiCall('/memories?page=1&page_size=1000');
-                if (allMemoriesResponse.memories) {
-                    results = allMemoriesResponse.memories
-                        .filter(memory => (memory.memory_type || 'note') === typeFilter)
-                        .map(memory => ({ memory, similarity: 1.0 }));
+                // Let the server filter by type and page through the result:
+                // GET /memories caps page_size at 100 (#1971).
+                const pageSize = 100;
+                const memoryType = encodeURIComponent(typeFilter);
+                let page = 1;
+                let hasMore = true;
+                while (hasMore) {
+                    if (!isCurrent()) return;
+                    const response = await this.apiCall(
+                        `/memories?page=${page}&page_size=${pageSize}&memory_type=${memoryType}`
+                    );
+                    const memories = response.memories || [];
+                    results.push(...memories.map(memory => ({ memory, similarity: 1.0 })));
+                    hasMore = Boolean(response.has_more) && memories.length > 0;
+                    page++;
                 }
             } else {
                 // No filters, clear results
                 results = [];
             }
 
+            if (!isCurrent()) return;
             this.searchResults = results;
             this.renderSearchResults(results);
             this.updateResultsCount(results.length);
             this.updateActiveFilters();
 
         } catch (error) {
+            if (!isCurrent()) return;
             console.error('Filter search error:', error);
             this.showToast(this.t('toast.filterSearchFailed', 'Filter search failed'), 'error');
         } finally {
-            // Remove loading state
+            // Remove loading state, unless a newer search owns it now
             const applyBtn = document.getElementById('applyFiltersBtn');
-            if (applyBtn) {
+            if (applyBtn && isCurrent()) {
                 applyBtn.classList.remove('loading');
                 applyBtn.disabled = false;
             }
@@ -2501,8 +3059,8 @@ class MemoryDashboard {
         const saveBtn = document.getElementById('saveMemoryBtn');
 
         // Reset modal title and button text
-        title.textContent = 'Add New Memory';
-        saveBtn.textContent = 'Save Memory';
+        this.setTranslatedText(title, 'modal.addMemory.title', 'Add New Memory');
+        this.setTranslatedText(saveBtn, 'modal.addMemory.save', 'Save Memory');
 
         // Clear form
         document.getElementById('addMemoryForm').reset();
@@ -2555,7 +3113,7 @@ class MemoryDashboard {
                     };
 
                     response = await this.apiCall(`/memories/${originalContentHash}`, 'PUT', updatePayload);
-                    successMessage = 'Memory updated successfully';
+                    successMessage = this.t('toast.memoryUpdatedSuccess', 'Memory updated successfully');
                 } else {
                     // Content changed - use create-delete approach (but with proper error handling)
 
@@ -2565,7 +3123,7 @@ class MemoryDashboard {
 
                         // CRITICAL: Only proceed with deletion if creation actually succeeded
                         if (response.success) {
-                            successMessage = 'Memory updated successfully';
+                            successMessage = this.t('toast.memoryUpdatedSuccess', 'Memory updated successfully');
 
                             try {
                                 // Step 2: Delete original memory (only after successful creation)
@@ -2591,7 +3149,7 @@ class MemoryDashboard {
             } else {
                 // Create new memory
                 response = await this.apiCall('/memories', 'POST', payload);
-                successMessage = 'Memory saved successfully';
+                successMessage = this.t('toast.memorySavedSuccess', 'Memory saved successfully');
             }
 
             this.closeModal(document.getElementById('addMemoryModal'));
@@ -2638,7 +3196,7 @@ class MemoryDashboard {
         const title = document.getElementById('modalTitle');
         const content = document.getElementById('modalContent');
 
-        title.textContent = 'Memory Details';
+        this.setTranslatedText(title, 'modal.memoryDetails.title', 'Memory Details');
         content.innerHTML = this.renderMemoryDetails(memory);
 
         // Set up action buttons
@@ -2659,21 +3217,21 @@ class MemoryDashboard {
         return `
             <div class="memory-detail">
                 <div class="memory-meta">
-                    <p><strong>Created:</strong> ${createdDate} ${this.renderTimeIcon(memory.created_at)}</p>
-                    ${updatedDate ? `<p><strong>Updated:</strong> ${updatedDate}</p>` : ''}
-                    <p><strong>Type:</strong> ${memory.memory_type || 'note'}</p>
-                    <p><strong>ID:</strong> ${memory.content_hash}</p>
+                    <p><strong data-i18n="modal.memoryDetails.created">${this.escapeHtml(this.t('modal.memoryDetails.created', 'Created:'))}</strong> ${createdDate}</p>
+                    ${updatedDate ? `<p><strong data-i18n="modal.memoryDetails.updated">${this.escapeHtml(this.t('modal.memoryDetails.updated', 'Updated:'))}</strong> ${updatedDate}</p>` : ''}
+                    <p><strong data-i18n="modal.memoryDetails.type">${this.escapeHtml(this.t('modal.memoryDetails.type', 'Type:'))}</strong> ${memory.memory_type || 'note'}</p>
+                    <p><strong data-i18n="modal.memoryDetails.id">${this.escapeHtml(this.t('modal.memoryDetails.id', 'ID:'))}</strong> ${memory.content_hash}</p>
                 </div>
 
                 <div class="memory-detail-section">
-                    <h4>Content</h4>
+                    <h4 data-i18n="modal.memoryDetails.content">${this.escapeHtml(this.t('modal.memoryDetails.content', 'Content'))}</h4>
                     <div class="content-text detail-content-text${memory.content && memory.content.length > 200 ? ' detail-content-collapsed' : ''}">${this.escapeHtml(memory.content)}</div>
-                    ${memory.content && memory.content.length > 200 ? '<button class="content-toggle-btn" data-action="toggle-content">▼ Show full content</button>' : ''}
+                    ${memory.content && memory.content.length > 200 ? '<button class="content-toggle-btn" data-action="toggle-content">▼ ' + this.escapeHtml(this.t('modal.memoryDetails.showFullContent', 'Show full content')) + '</button>' : ''}
                 </div>
 
                 ${memory.tags && memory.tags.length > 0 ? `
                     <div class="memory-tags-section">
-                        <h4>Tags</h4>
+                        <h4 data-i18n="modal.memoryDetails.tags">${this.escapeHtml(this.t('modal.memoryDetails.tags', 'Tags'))}</h4>
                         <div class="memory-tags">
                             ${memory.tags.map(tag => `<span class="tag">${this.escapeHtml(tag)}</span>`).join('')}
                         </div>
@@ -2682,8 +3240,8 @@ class MemoryDashboard {
 
                 ${memory.metadata ? `
                     <div class="memory-metadata">
-                        <h4 class="metadata-toggle" onclick="this.parentElement.classList.toggle('expanded')" style="cursor: pointer; user-select: none;">
-                            <span class="toggle-icon">▶</span> Metadata
+                        <h4 class="metadata-toggle" style="cursor: pointer; user-select: none;">
+                            <span class="toggle-icon">▶</span> <span data-i18n="modal.memoryDetails.metadata">${this.escapeHtml(this.t('modal.memoryDetails.metadata', 'Metadata'))}</span>
                         </h4>
                         <div class="metadata-content">
                             ${this.renderMetadata(memory.metadata)}
@@ -2699,7 +3257,7 @@ class MemoryDashboard {
      */
     renderMetadata(metadata) {
         if (!metadata || typeof metadata !== 'object') {
-            return '<p class="metadata-empty">No metadata available</p>';
+            return `<p class="metadata-empty" data-i18n="modal.memoryDetails.noMetadata">${this.escapeHtml(this.t('modal.memoryDetails.noMetadata', 'No metadata available'))}</p>`;
         }
 
         let html = '<div class="metadata-items">';
@@ -2737,7 +3295,7 @@ class MemoryDashboard {
      * Delete memory
      */
     async deleteMemory(memory) {
-        if (!confirm('Are you sure you want to delete this memory? This action cannot be undone.')) {
+        if (!confirm(this.t('modal.memoryDetails.confirmDelete', 'Are you sure you want to delete this memory? This action cannot be undone.'))) {
             return;
         }
 
@@ -2775,8 +3333,8 @@ class MemoryDashboard {
         const saveBtn = document.getElementById('saveMemoryBtn');
 
         // Update modal for editing
-        title.textContent = 'Edit Memory';
-        saveBtn.textContent = 'Update Memory';
+        this.setTranslatedText(title, 'modal.addMemory.editTitle', 'Edit Memory');
+        this.setTranslatedText(saveBtn, 'modal.addMemory.update', 'Update Memory');
 
         // Pre-fill the form with existing data
         document.getElementById('memoryContent').value = memory.content || '';
@@ -2815,7 +3373,7 @@ class MemoryDashboard {
         // Try to use Web Share API if available
         if (navigator.share) {
             navigator.share({
-                title: 'Memory from MCP Memory Service',
+                title: this.t('modal.memoryDetails.shareTitle', 'Memory from MCP Memory Service'),
                 text: memory.content,
                 url: window.location.href
             }).catch(err => {
@@ -2919,7 +3477,7 @@ class MemoryDashboard {
     }
 
     if (!memories || memories.length === 0) {
-    container.innerHTML = '<p class="empty-state">No memories found. <a href="#" onclick="app.handleAddMemory()">Add your first memory</a></p>';
+    container.innerHTML = `<p class="empty-state"><span data-i18n="sections.recentMemoriesEmpty">${this.escapeHtml(this.t('sections.recentMemoriesEmpty', 'No memories found.'))}</span> <a href="#" data-action="add-memory" data-i18n="sections.addFirstMemory">${this.escapeHtml(this.t('sections.addFirstMemory', 'Add your first memory'))}</a></p>`;
     return;
     }
 
@@ -2994,7 +3552,7 @@ class MemoryDashboard {
 
             if (isDocumentChunk && !processedHashes.has(memory.content_hash)) {
                 const uploadId = memory.metadata.upload_id;
-                const sourceFile = memory.metadata.source_file || 'Unknown file';
+                const sourceFile = memory.metadata.source_file || this.t('documents.unknownFile', 'Unknown file');
 
                 if (!documentGroups.has(uploadId)) {
                     documentGroups.set(uploadId, {
@@ -3060,7 +3618,7 @@ class MemoryDashboard {
         return `
             <div class="document-group" data-upload-id="${this.escapeHtml(group.upload_id)}">
                 <div class="document-header">
-                    <div class="document-icon">📄</div>
+                    <div class="document-icon"><svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg></div>
                     <div class="document-info">
                         <div class="document-title">${fileName}</div>
                         <div class="document-meta">
@@ -3069,7 +3627,7 @@ class MemoryDashboard {
                     </div>
                 </div>
                 <div class="document-preview">
-                    ${group.memories[0] ? this.escapeHtml(group.memories[0].content.substring(0, 150)) + (group.memories[0].content.length > 150 ? '...' : '') : 'No content preview available'}
+                    ${group.memories[0] ? this.escapeHtml(group.memories[0].content.substring(0, 150)) + (group.memories[0].content.length > 150 ? '...' : '') : this.escapeHtml(this.t('documents.noPreview', 'No content preview available'))}
                 </div>
                 ${uniqueTags.length > 0 ? `
                     <div class="document-tags">
@@ -3078,17 +3636,19 @@ class MemoryDashboard {
                     </div>
                 ` : ''}
                 <div class="document-actions">
-                    <button class="btn-icon btn-view-chunks" title="View all chunks">
+                    <button class="btn-icon btn-view-chunks" title="${this.escapeHtml(this.t('documents.viewAllChunksTip', 'View all chunks'))}"
+                            data-i18n-title="documents.viewAllChunksTip">
                         <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
                         </svg>
-                        <span>View Chunks</span>
+                        <span data-i18n="documents.viewChunks">${this.escapeHtml(this.t('documents.viewChunks', 'View Chunks'))}</span>
                     </button>
-                    <button class="btn-icon btn-remove" title="Remove document">
+                    <button class="btn-icon btn-remove" title="${this.escapeHtml(this.t('documents.removeTip', 'Remove document'))}"
+                            data-i18n-title="documents.removeTip">
                         <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
                         </svg>
-                        <span>Remove</span>
+                        <span data-i18n="documents.remove">${this.escapeHtml(this.t('documents.remove', 'Remove'))}</span>
                     </button>
                 </div>
             </div>
@@ -3104,7 +3664,7 @@ class MemoryDashboard {
         modal.innerHTML = `
             <div class="modal-content large-modal">
                 <div class="modal-header">
-                    <h3>📄 ${this.escapeHtml(group.source_file)}</h3>
+                    <h3>${this.escapeHtml(group.source_file)}</h3>
                     <button class="modal-close">&times;</button>
                 </div>
                 <div class="modal-body">
@@ -3161,7 +3721,7 @@ class MemoryDashboard {
         }
 
         if (!tags || tags.length === 0) {
-            container.innerHTML = '<div class="no-tags">No tags found.</div>';
+            container.innerHTML = `<div class="no-tags" data-i18n="browse.noTagsShort">${this.escapeHtml(this.t('browse.noTagsShort', 'No tags found.'))}</div>`;
             return;
         }
 
@@ -3192,7 +3752,7 @@ class MemoryDashboard {
         const container = document.getElementById('searchResultsList');
 
         if (!results || results.length === 0) {
-            container.innerHTML = '<p class="empty-state">No results found. Try a different search term.</p>';
+            container.innerHTML = `<p class="empty-state" data-i18n="search.results.none">${this.escapeHtml(this.t('search.results.none', 'No results found. Try a different search term.'))}</p>`;
             return;
         }
 
@@ -3227,9 +3787,9 @@ class MemoryDashboard {
         ${this.renderQualityBadge(memory)}
     <div class="memory-header">
         <div class="memory-meta">
-                        <span>${createdDate} ${this.renderTimeIcon(memory.created_at)}</span>
-            ${memory.memory_type ? `<span> • ${memory.memory_type}</span>` : ''}
-        ${relevanceScore ? `<span> • ${relevanceScore}% match</span>` : ''}
+            ${memory.memory_type ? `<span class="memory-type" data-type="${this.escapeHtml(memory.memory_type)}">${this.escapeHtml(memory.memory_type)}</span>` : ''}
+            <span>${createdDate} ${this.renderTimeIcon(memory.created_at)}</span>
+            ${relevanceScore ? `<span>${relevanceScore}% match</span>` : ''}
         </div>
                 </div>
 
@@ -3275,10 +3835,11 @@ class MemoryDashboard {
      * Update search results count
      */
     updateResultsCount(count) {
-        const element = document.getElementById('resultsCount');
-        if (element) {
-            element.textContent = `${count} result${count !== 1 ? 's' : ''}`;
-        }
+        // Same split as searchDocumentContent(): the stored key is what a
+        // later language switch fills, so 1 and every other count stay apart.
+        const key = count === 1 ? 'search.results.count.one' : 'search.results.count';
+        const fallback = count === 1 ? '{count} result' : '{count} results';
+        this.setCountedText(document.getElementById('resultsCount'), key, fallback, count);
     }
 
     /**
@@ -3302,36 +3863,38 @@ class MemoryDashboard {
                 filters.push({
                     type: 'tag',
                     value: tag,
-                    label: `Tag: ${tag}`
+                    label: this.t('search.filters.activeTag', 'Tag: {tag}', { tag })
                 });
             });
         }
 
         if (dateFilter) {
             const dateLabels = {
-                'today': 'Today',
-                'week': 'This week',
-                'month': 'This month',
-                'year': 'This year'
+                'today': this.t('search.filters.date.today', 'Today'),
+                'yesterday': this.t('search.filters.date.yesterday', 'Yesterday'),
+                'week': this.t('search.filters.date.week', 'This week'),
+                'month': this.t('search.filters.date.month', 'This month'),
+                'quarter': this.t('search.filters.date.quarter', 'This quarter'),
+                'year': this.t('search.filters.date.year', 'This year')
             };
             filters.push({
                 type: 'date',
                 value: dateFilter,
-                label: `Date: ${dateLabels[dateFilter] || dateFilter}`
+                label: this.t('search.filters.activeDate', 'Date: {date}', { date: dateLabels[dateFilter] || dateFilter })
             });
         }
 
         if (typeFilter) {
             const typeLabels = {
-                'note': 'Notes',
-                'code': 'Code',
-                'reference': 'References',
-                'idea': 'Ideas'
+                'note': this.t('search.filters.type.note', 'Notes'),
+                'code': this.t('search.filters.type.code', 'Code'),
+                'reference': this.t('search.filters.type.reference', 'References'),
+                'idea': this.t('search.filters.type.idea', 'Ideas')
             };
             filters.push({
                 type: 'type',
                 value: typeFilter,
-                label: `Type: ${typeLabels[typeFilter] || typeFilter}`
+                label: this.t('search.filters.activeType', 'Type: {type}', { type: typeLabels[typeFilter] || typeFilter })
             });
         }
 
@@ -3350,15 +3913,16 @@ class MemoryDashboard {
             </div>
         `).join('');
 
-        // Add event listeners for filter removal
-        filtersList.addEventListener('click', (e) => {
+        // Assigned, not added: this runs on every filter change and language
+        // switch, and each added listener would remove the filter once more.
+        filtersList.onclick = (e) => {
             const button = e.target.closest('.remove-filter');
             if (!button) return;
 
             const type = button.dataset.filterType;
             const value = button.dataset.filterValue;
             this.removeFilter(type, value);
-        });
+        };
     }
 
     /**
@@ -3400,6 +3964,14 @@ class MemoryDashboard {
         if (tagFilter) tagFilter.value = '';
         if (dateFilter) dateFilter.value = '';
         if (typeFilter) typeFilter.value = '';
+
+        // Cancel a filter search that is still running, and drop its loading state
+        this.filterSearchId = (this.filterSearchId || 0) + 1;
+        const applyBtn = document.getElementById('applyFiltersBtn');
+        if (applyBtn) {
+            applyBtn.classList.remove('loading');
+            applyBtn.disabled = false;
+        }
 
         this.searchResults = [];
         this.renderSearchResults([]);
@@ -3485,32 +4057,55 @@ class MemoryDashboard {
      * Update connection status indicator
      */
     updateConnectionStatus(status) {
-        const statusElement = document.getElementById('connectionStatus');
-        if (statusElement) {
-            const indicator = statusElement.querySelector('.status-indicator');
-            const text = statusElement.querySelector('.status-text');
-            if (!indicator || !text) return;
+        if (!this.statusIsland) return;
+        // The island keeps the key, not the text, so a language switch re-renders it.
+        const text = (key, fallback) => ({ key, fallback });
+        let entry;
+        switch (status) {
+            case 'connected':
+                entry = { state: 'ready', text: text('status.connected', 'Connected') };
+                break;
+            case 'connecting':
+                entry = { state: 'busy', progress: 'unknown', text: text('status.connecting', 'Connecting...') };
+                break;
+            case 'disconnected':
+                // The stream retries by itself with a growing delay; the action skips the wait.
+                // It is offered only where a new attempt can help, not while signed out.
+                entry = {
+                    state: 'error',
+                    text: text('status.disconnected', 'Disconnected'),
+                    actions: this.authState.requiresAuth && !this.authState.isAuthenticated ? [] : [{
+                        id: 'reconnect',
+                        label: text('island.reconnect', 'Reconnect'),
+                        run: () => this.setupSSE(),
+                    }],
+                };
+                break;
+            case 'unauthorized':
+                // The server refused the stream ticket (401/403): trying again cannot help.
+                entry = { state: 'error', text: text('error.authRequired', 'Authentication required') };
+                break;
+            default:
+                entry = { state: 'error', text: text('status.unknown', 'Unknown') };
+        }
+        entry.label = text('island.source.connection', 'Live updates');
+        // A connection failure is not dismissible: it ends with the next report of this source.
+        this.statusIsland.report('connection', entry);
+    }
 
-            // Reset indicator classes
-            indicator.className = 'status-indicator';
-
-            switch (status) {
-                case 'connected':
-                    text.textContent = 'Connected';
-                    // Connected uses default green color (no additional class needed)
-                    break;
-                case 'connecting':
-                    text.textContent = 'Connecting...';
-                    indicator.classList.add('connecting');
-                    break;
-                case 'disconnected':
-                    text.textContent = 'Disconnected';
-                    indicator.classList.add('disconnected');
-                    break;
-                default:
-                    text.textContent = 'Unknown';
-                    indicator.classList.add('disconnected');
+    /**
+     * Create the header's status island. It is an addition: if the script is missing
+     * or the island throws, the dashboard works without it.
+     */
+    setupStatusIsland() {
+        this.statusIsland = null;
+        try {
+            const root = document.getElementById('statusIsland');
+            if (root && typeof StatusIsland === 'function') {
+                this.statusIsland = new StatusIsland({ root, t: (key, fallback, vars) => this.t(key, fallback, vars) });
             }
+        } catch (error) {
+            console.warn('Status island unavailable:', error);
         }
     }
 
@@ -3541,7 +4136,7 @@ class MemoryDashboard {
         // Handle 401 responses
         if (response.status === 401) {
             this.handleAuthFailure();
-            throw new Error('Authentication required');
+            throw new Error(this.t('error.authRequired', 'Authentication required'));
         }
 
         if (!response.ok) {
@@ -3550,7 +4145,15 @@ class MemoryDashboard {
             // callers can branch on machine-readable values instead of
             // substring-matching the human-readable message (which breaks on
             // wording / translation changes — see PR #807 review).
-            const err = new Error(errorData.detail || `HTTP ${response.status}`);
+            // `detail` is not always a string: the OAuth scope checks send
+            // {error, error_description} and request validation sends a list.
+            // Error() stringified those to "[object Object]" in every toast
+            // (#1743), so only non-empty strings become the message.
+            const detail = errorData.detail;
+            const text = (value) => (typeof value === 'string' && value) || null;
+            const message = text(detail) || text(detail?.error_description)
+                || text(detail?.error) || `HTTP ${response.status}`;
+            const err = new Error(message);
             err.status = response.status;
             err.detail = errorData.detail;
             err.body = errorData;
@@ -3583,7 +4186,7 @@ class MemoryDashboard {
             if (!this._lastAuthFailureToast || (now - this._lastAuthFailureToast) > 30000) {
                 this._lastAuthFailureToast = now;
                 console.warn('Got 401 despite being authenticated — credentials may have been invalidated');
-                this.showToast('Session expired or credentials changed. Please refresh the page.', 'warning');
+                this.showToast(this.t('toast.authSessionExpired', 'Session expired or credentials changed. Please refresh the page.'), 'warning');
             }
             // Mark as unauthenticated so the next 401 triggers the full
             // re-auth flow (clear credentials + show modal) instead of
@@ -3650,12 +4253,12 @@ class MemoryDashboard {
             await this.loadDashboardData();
             this.checkSyncStatus();
             this.startSyncStatusMonitoring();
-            this.showToast('Authentication successful', 'success');
+            this.showToast(this.t('toast.authSuccess', 'Authentication successful'), 'success');
 
             return true;
         } catch (error) {
             // Key is invalid — clean up
-            this.showToast('Authentication failed. Please check your API key.', 'error');
+            this.showToast(this.t('toast.authFailed', 'Authentication failed. Please check your API key.'), 'error');
             this._clearCredentials();
             return false;
         }
@@ -3743,7 +4346,7 @@ class MemoryDashboard {
         const actionText = document.getElementById('serverActionText');
 
         if (actionStatus) { actionStatus.style.display = 'flex'; }
-        if (actionText) { actionText.textContent = 'Checking for updates...'; }
+        this.setTranslatedText(actionText, 'modal.settings.server.checking', 'Checking for updates...');
 
         try {
             const data = await this.apiCall('/server/version/check');
@@ -3751,24 +4354,24 @@ class MemoryDashboard {
 
             if (data.update_available) {
                 if (statusEl) {
-                    statusEl.textContent = `Yes - ${data.commits_behind} commit(s) available`;
+                    this.setTranslatedText(statusEl, 'modal.settings.server.commitsAvailable', 'Yes - {count} commit(s) available', { count: data.commits_behind });
                     statusEl.style.color = 'var(--success, #10b981)';
                     statusEl.style.fontWeight = '600';
                 }
                 if (updateBtn) { updateBtn.style.display = 'inline-flex'; }
-                this.showToast(`${data.commits_behind} update(s) available!`, 'info');
+                this.showToast(this.t('modal.settings.server.updatesAvailable', '{count} update(s) available', { count: data.commits_behind }), 'info');
             } else {
                 if (statusEl) {
-                    statusEl.textContent = 'Up to date';
+                    this.setTranslatedText(statusEl, 'modal.settings.server.upToDate', 'Up to date');
                     statusEl.style.color = 'var(--text-secondary)';
                 }
                 if (updateBtn) { updateBtn.style.display = 'none'; }
-                this.showToast('Already up to date.', 'success');
+                this.showToast(this.t('modal.settings.server.alreadyUpToDate', 'Already up to date.'), 'success');
             }
         } catch (error) {
             if (actionStatus) { actionStatus.style.display = 'none'; }
-            if (statusEl) { statusEl.textContent = 'Check failed'; }
-            this.showToast('Failed to check for updates: ' + error.message, 'error');
+            this.setTranslatedText(statusEl, 'modal.settings.server.checkFailed', 'Check failed');
+            this.showToast(this.t('modal.settings.server.checkFailedWithError', 'Failed to check for updates: {error}', { error: error.message }), 'error');
         }
     }
 
@@ -3781,7 +4384,7 @@ class MemoryDashboard {
      * the process actually rolled over instead of trusting /api/health.
      */
     async updateAndRestart(force = false) {
-        if (!force && !confirm('This will pull the latest code, install dependencies, and restart the server. Continue?')) {
+        if (!force && !confirm(this.t('modal.settings.server.confirmUpdate', 'This will pull the latest code, install dependencies, and restart the server. Continue?'))) {
             return;
         }
 
@@ -3789,12 +4392,12 @@ class MemoryDashboard {
         const actionText = document.getElementById('serverActionText');
 
         if (actionStatus) { actionStatus.style.display = 'flex'; }
-        if (actionText) { actionText.textContent = 'Pulling updates and installing...'; }
+        this.setTranslatedText(actionText, 'modal.settings.server.pulling', 'Pulling updates and installing...');
 
         try {
             const data = await this.apiCall('/server/update', 'POST', { confirm: true, force });
 
-            if (actionText) { actionText.textContent = 'Update complete. Server restarting...'; }
+            this.setTranslatedText(actionText, 'modal.settings.server.updateComplete', 'Update complete. Server restarting...');
             // Show captured git/pip output in console for diagnostics
             if (data.git_output) { console.info('git pull:\n' + data.git_output); }
             if (data.pip_output) { console.info('pip install:\n' + data.pip_output); }
@@ -3808,14 +4411,14 @@ class MemoryDashboard {
             // substring-matching the message — error wording can change
             // between releases and gets translated, status codes don't.
             if (error.status === 409) {
-                this.showToast('Update blocked: ' + msg, 'error');
-                if (confirm('The server has uncommitted local changes that will block the pull.\n\n' + msg + '\n\nForce-pull anyway? (Local changes may be overwritten.)')) {
+                this.showToast(this.t('modal.settings.server.updateBlocked', 'Update blocked: {error}', { error: msg }), 'error');
+                if (confirm(this.t('modal.settings.server.confirmForcePull', 'The server has uncommitted local changes that will block the pull.\n\n{error}\n\nForce-pull anyway? (Local changes may be overwritten.)', { error: msg }))) {
                     return this.updateAndRestart(true);
                 }
                 return;
             }
 
-            this.showToast('Update failed: ' + msg, 'error');
+            this.showToast(this.t('modal.settings.server.updateFailed', 'Update failed: {error}', { error: msg }), 'error');
         }
     }
 
@@ -3824,7 +4427,7 @@ class MemoryDashboard {
      * so pollServerHealth can verify the process actually rolled over.
      */
     async restartServer() {
-        if (!confirm('Are you sure you want to restart the server? This will temporarily disconnect all clients.')) {
+        if (!confirm(this.t('modal.settings.server.confirmRestart', 'Are you sure you want to restart the server? This will temporarily disconnect all clients.'))) {
             return;
         }
 
@@ -3836,7 +4439,7 @@ class MemoryDashboard {
             if (error.message && error.message.includes('fetch')) {
                 this.showRestartOverlay(null, null);
             } else {
-                this.showToast('Restart failed: ' + error.message, 'error');
+                this.showToast(this.t('modal.settings.server.restartFailed', 'Restart failed: {error}', { error: error.message }), 'error');
             }
         }
     }
@@ -3855,6 +4458,13 @@ class MemoryDashboard {
         const statusEl = document.getElementById('restartStatus');
 
         if (overlay) { overlay.style.display = 'flex'; }
+        // "Reconnecting in {seconds}s": the countdown span moves to wherever
+        // the language puts {seconds}, and the interval below keeps updating it.
+        const countdownLine = countdownEl ? countdownEl.parentElement : null;
+        if (countdownLine) {
+            const [before, after = ''] = this.t('modal.settings.server.reconnectingIn', 'Reconnecting in {seconds}s').split('{seconds}');
+            countdownLine.replaceChildren(before, countdownEl, after);
+        }
 
         let countdown = 5;
         let attempts = 0;
@@ -3877,14 +4487,14 @@ class MemoryDashboard {
      */
     async pollServerHealth(statusEl, overlay, attempts, maxAttempts, preRestartPid, preRestartVersion) {
         if (attempts >= maxAttempts) {
-            if (statusEl) { statusEl.textContent = 'Server did not come back online. Please check manually.'; }
+            this.setTranslatedText(statusEl, 'modal.settings.server.notBackOnline', 'Server did not come back online. Please check manually.');
             setTimeout(() => {
                 if (overlay) { overlay.style.display = 'none'; }
             }, 5000);
             return;
         }
 
-        if (statusEl) { statusEl.textContent = `Attempt ${attempts + 1}/${maxAttempts} - Waiting for server...`; }
+        this.setTranslatedText(statusEl, 'modal.settings.server.attempt', 'Attempt {attempt}/{max} - Waiting for server...', { attempt: attempts + 1, max: maxAttempts });
 
         try {
             // Probe /server/status (auth-protected); fall back to /api/health
@@ -3903,7 +4513,7 @@ class MemoryDashboard {
                 }
 
                 if (restarted) {
-                    if (statusEl) { statusEl.textContent = `Server is back online (v${status.version}, pid ${status.pid})! Reloading...`; }
+                    this.setTranslatedText(statusEl, 'modal.settings.server.backOnline', 'Server is back online (v{version}, pid {pid})! Reloading...', { version: status.version, pid: status.pid });
                     setTimeout(() => {
                         window.location.reload();
                     }, 1500);
@@ -3912,9 +4522,7 @@ class MemoryDashboard {
                 // Status responded but pid+version unchanged — process didn't actually restart.
                 // Keep polling; on the final attempt we surface a warning below.
                 if (attempts === maxAttempts - 1) {
-                    if (statusEl) {
-                        statusEl.textContent = `Process did not restart (still pid ${status.pid}, v${status.version}). The update may have failed silently — check server logs.`;
-                    }
+                    this.setTranslatedText(statusEl, 'modal.settings.server.didNotRestart', 'Process did not restart (still pid {pid}, v{version}). The update may have failed silently — check server logs.', { pid: status.pid, version: status.version });
                     setTimeout(() => {
                         if (overlay) { overlay.style.display = 'none'; }
                     }, 8000);
@@ -3924,7 +4532,7 @@ class MemoryDashboard {
                 // /server/status unavailable (server still down or auth-gated) — try /api/health as a liveness probe
                 const response = await fetch('api/health');
                 if (response.ok && preRestartPid == null && preRestartVersion == null) {
-                    if (statusEl) { statusEl.textContent = 'Server is back online! Reloading...'; }
+                    this.setTranslatedText(statusEl, 'modal.settings.server.backOnlineReloading', 'Server is back online, reloading');
                     setTimeout(() => { window.location.reload(); }, 1500);
                     return;
                 }
@@ -3988,8 +4596,13 @@ class MemoryDashboard {
                 const stats = document.getElementById('memoryViewerStats');
                 const chunksList = document.getElementById('memoryChunksList');
 
-                filename.textContent = response.filename || 'Document';
-                stats.textContent = `${response.total_found} chunk${response.total_found !== 1 ? 's' : ''} found`;
+                filename.textContent = response.filename || this.t('documents.untitled', 'Document');
+                const found = response.total_found;
+                const key = found === 1
+                    ? 'modal.memoryViewer.chunksFound.one'
+                    : 'modal.memoryViewer.chunksFound';
+                const fallback = found === 1 ? '{count} chunk found' : '{count} chunks found';
+                this.setCountedText(stats, key, fallback, found);
 
                 // Render chunks
                 if (response.memories && response.memories.length > 0) {
@@ -4016,7 +4629,7 @@ class MemoryDashboard {
 
                     chunksList.innerHTML = chunksHtml;
                 } else {
-                    chunksList.innerHTML = '<p class="text-muted">No memory chunks found for this document.</p>';
+                    chunksList.innerHTML = `<p class="text-muted" data-i18n="documents.noChunks">${this.escapeHtml(this.t('documents.noChunks', 'No memory chunks found for this document.'))}</p>`;
                 }
 
                 modal.style.display = 'flex';
@@ -4056,7 +4669,7 @@ class MemoryDashboard {
     async removeDocument(uploadId, filename) {
         console.log('removeDocument called with:', { uploadId, filename, currentView: this.currentView });
 
-        if (!confirm(`Remove "${filename}" and all its memory chunks?\n\nThis action cannot be undone.`)) {
+        if (!confirm(this.t('documents.removeConfirm', 'Remove "{filename}" and all its memory chunks?\n\nThis action cannot be undone.', { filename }))) {
             console.log('User cancelled removal');
             return;
         }
@@ -4127,14 +4740,14 @@ class MemoryDashboard {
                 const extra = count > 20 ? ' (showing top 20)' : '';
                 const key = count === 1 ? 'documents.search.count.one' : 'documents.search.count.other';
                 const fallback = count === 1 ? '{count} result{extra}' : '{count} results{extra}';
-                const baseCount = this.t(key, fallback, { count, extra });
-                resultsCount.textContent = baseCount;
+                // Replaces the idle search.results.count label. One element, one count.
+                this.setCountedText(resultsCount, key, fallback, count, extra);
 
                 if (displayResults.length > 0) {
                     const resultsHtml = displayResults.map(result => {
                         const mem = result.memory;
                         const uploadIdTag = mem.tags?.find(tag => tag.startsWith('upload_id:'));
-                        const sourceFile = mem.metadata?.source_file || 'Unknown file';
+                        const sourceFile = mem.metadata?.source_file || this.t('documents.unknownFile', 'Unknown file');
                         const contentPreview = mem.content.length > 200
                             ? mem.content.substring(0, 200) + '...'
                             : mem.content;
@@ -4237,10 +4850,46 @@ class MemoryDashboard {
     }
 
     /**
+     * The OS dark-mode media query, or null where matchMedia is unavailable.
+     */
+    systemColorSchemeQuery() {
+        if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+            return null;
+        }
+        return window.matchMedia('(prefers-color-scheme: dark)');
+    }
+
+    /**
+     * Resolve a theme setting ('light', 'dark' or 'system') to 'light' or 'dark'.
+     */
+    resolveTheme(theme = this.settings.theme) {
+        if (theme === 'dark' || theme === 'light') {
+            return theme;
+        }
+        const query = this.systemColorSchemeQuery();
+        return query && query.matches ? 'dark' : 'light';
+    }
+
+    /**
+     * Re-apply the theme when the OS scheme changes, as long as the user follows it.
+     */
+    watchSystemColorScheme() {
+        const query = this.systemColorSchemeQuery();
+        if (!query || typeof query.addEventListener !== 'function') {
+            return;
+        }
+        query.addEventListener('change', () => {
+            if (this.settings.theme === 'system') {
+                this.applyTheme();
+            }
+        });
+    }
+
+    /**
      * Apply theme to the page
      */
     applyTheme(theme = this.settings.theme) {
-        const isDark = theme === 'dark';
+        const isDark = this.resolveTheme(theme) === 'dark';
         document.body.classList.toggle('dark-mode', isDark);
 
         // Configure Chart.js colors for dark mode
@@ -4290,10 +4939,12 @@ class MemoryDashboard {
     }
 
     /**
-     * Toggle between light and dark theme
+     * Toggle between light and dark theme. The result is saved as an explicit
+     * choice, so the dashboard stops following the system until 'system' is
+     * picked again in settings.
      */
     toggleTheme() {
-        const newTheme = this.settings.theme === 'dark' ? 'light' : 'dark';
+        const newTheme = this.resolveTheme() === 'dark' ? 'light' : 'dark';
         this.settings.theme = newTheme;
         this.applyTheme(newTheme);
         this.saveSettingsToStorage();
@@ -4327,13 +4978,15 @@ class MemoryDashboard {
     }
 
     /**
-     * Reset system info fields to loading state
+     * Reset system info fields to loading state. data-loading marks a field
+     * that has no value yet; the text cannot, since it is translated.
      */
     resetSystemInfoLoadingState() {
         Object.keys(MemoryDashboard.SYSTEM_INFO_CONFIG).forEach(id => {
             const element = document.getElementById(id);
             if (element) {
-                element.textContent = 'Loading...';
+                this.setTranslatedText(element, 'status.loading', 'Loading...');
+                element.dataset.loading = 'true';
             }
         });
     }
@@ -4370,7 +5023,8 @@ class MemoryDashboard {
                     }
                 }
 
-                element.textContent = config.formatter(value);
+                this.setValueText(element, config.formatter(value, this));
+                delete element.dataset.loading;
             });
 
             // Populate OAuth detail fields (conditionally shown when enabled)
@@ -4380,10 +5034,11 @@ class MemoryDashboard {
                 showRow('oauthBackendRow');
                 showRow('oauthClientsRow');
                 showRow('oauthTokensRow');
+                const notAvailable = this.t('modal.settings.system.notAvailable', 'N/A');
                 const setVal = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
-                setVal('settingsOAuthBackend', oauthData.storage_backend || 'N/A');
-                setVal('settingsOAuthClients', oauthData.registered_clients_count ?? 'N/A');
-                setVal('settingsOAuthTokens', oauthData.active_tokens_count ?? 'N/A');
+                setVal('settingsOAuthBackend', oauthData.storage_backend || notAvailable);
+                setVal('settingsOAuthClients', oauthData.registered_clients_count ?? notAvailable);
+                setVal('settingsOAuthTokens', oauthData.active_tokens_count ?? notAvailable);
             }
 
             // Log warnings for failed API calls
@@ -4401,8 +5056,9 @@ class MemoryDashboard {
             // Set all system info fields that are still in loading state to error
             Object.keys(MemoryDashboard.SYSTEM_INFO_CONFIG).forEach(id => {
                 const element = document.getElementById(id);
-                if (element && element.textContent === 'Loading...') {
-                    element.textContent = 'Error';
+                if (element && element.dataset.loading === 'true') {
+                    this.setTranslatedText(element, 'modal.settings.system.error', 'Error');
+                    delete element.dataset.loading;
                 }
             });
         }
@@ -4423,17 +5079,17 @@ class MemoryDashboard {
      * @param {number} seconds - Uptime in seconds
      * @returns {string} Formatted uptime string
      */
-    static formatUptime(seconds) {
+    formatUptime(seconds) {
         const days = Math.floor(seconds / 86400);
         const hours = Math.floor((seconds % 86400) / 3600);
         const minutes = Math.floor((seconds % 3600) / 60);
 
         const parts = [];
-        if (days > 0) parts.push(`${days}d`);
-        if (hours > 0) parts.push(`${hours}h`);
-        if (minutes > 0) parts.push(`${minutes}m`);
+        if (days > 0) parts.push(this.t('time.days', '{count}d', { count: days }));
+        if (hours > 0) parts.push(this.t('time.hours', '{count}h', { count: hours }));
+        if (minutes > 0) parts.push(this.t('time.minutes', '{count}m', { count: minutes }));
 
-        return parts.length > 0 ? parts.join(' ') : '< 1m';
+        return parts.length > 0 ? parts.join(' ') : this.t('time.underAMinute', '< 1m');
     }
 
     /**
@@ -4478,6 +5134,43 @@ class MemoryDashboard {
     }
 
     /**
+     * Initialize the Manage tab's sub-tabs (#1973): a click or the arrow,
+     * Home and End keys select a sub-tab.
+     */
+    initializeManageTabs() {
+        const tabs = Array.from(document.querySelectorAll('#manageView [role="tab"]'));
+        tabs.forEach((tab, index) => {
+            tab.addEventListener('click', () => this.switchManageTab(tab.id));
+            tab.addEventListener('keydown', (e) => {
+                let next = null;
+                if (e.key === 'ArrowRight') next = tabs[(index + 1) % tabs.length];
+                else if (e.key === 'ArrowLeft') next = tabs[(index - 1 + tabs.length) % tabs.length];
+                else if (e.key === 'Home') next = tabs[0];
+                else if (e.key === 'End') next = tabs[tabs.length - 1];
+                if (!next) return;
+                e.preventDefault();
+                this.switchManageTab(next.id);
+                next.focus();
+            });
+        });
+    }
+
+    /**
+     * Show one Manage section and hide the others.
+     * @param {string} tabId - id of the sub-tab button to select
+     */
+    switchManageTab(tabId) {
+        document.querySelectorAll('#manageView [role="tab"]').forEach(tab => {
+            const selected = tab.id === tabId;
+            tab.classList.toggle('active', selected);
+            tab.setAttribute('aria-selected', String(selected));
+            tab.tabIndex = selected ? 0 : -1;
+            const panel = document.getElementById(tab.getAttribute('aria-controls'));
+            if (panel) panel.hidden = !selected;
+        });
+    }
+
+    /**
      * Switch settings tab
      * @param {string} tabName - Tab name (preferences, environment, system, backup)
      */
@@ -4512,6 +5205,11 @@ class MemoryDashboard {
         // Load credentials when switching to credentials tab
         if (tabName === 'credentials') {
             this.loadCredentials();
+        }
+
+        // Load the configured quality settings when switching to quality tab
+        if (tabName === 'quality') {
+            this.loadQualitySettings();
         }
 
         // Load server status + auto-check for updates when switching to server tab
@@ -4587,10 +5285,12 @@ class MemoryDashboard {
                         // account_id is not masked but keep consistent UX
                     }
                     input.type = 'text';
-                    btn.textContent = '🙈';
+                    btn.dataset.i18n = 'common.hide'; // keeps the label right across language switches
+                    btn.textContent = this.t('common.hide', 'Hide');
                 } else {
                     input.type = 'password';
-                    btn.textContent = '👁';
+                    btn.dataset.i18n = 'common.show';
+                    btn.textContent = this.t('common.show', 'Show');
                 }
             });
         });
@@ -4618,6 +5318,11 @@ class MemoryDashboard {
         if (saveBtn) {
             saveBtn.addEventListener('click', () => this.saveCloudflareCredentials());
         }
+
+        // Quality tab Save & Restart button
+        document.getElementById('qualitySaveBtn')?.addEventListener('click', () => {
+            this.saveQualitySettings();
+        });
     }
 
     /**
@@ -4630,36 +5335,41 @@ class MemoryDashboard {
         const testBtn = document.getElementById('credTestBtn');
 
         if (!tokenVal || !accountVal) {
-            this._showCredResult('error', '⚠️ API Token and Account ID are required.');
+            this._showCredResult('error', this.t('settings.credentials.required', 'API Token and Account ID are required.'));
             return;
         }
 
         testBtn.disabled = true;
-        testBtn.textContent = 'Testing…';
+        testBtn.textContent = this.t('settings.credentials.testing', 'Testing…');
         if (resultEl) { resultEl.style.display = 'none'; }
 
         try {
-            const data = await this.apiCall('/config/credentials/test', {
-                method: 'POST',
-                body: JSON.stringify({ api_token: tokenVal, account_id: accountVal })
+            // apiCall(endpoint, method, data) — not a fetch-style options object (#1839).
+            const data = await this.apiCall('/config/credentials/test', 'POST', {
+                api_token: tokenVal,
+                account_id: accountVal,
             });
 
             if (data.valid) {
-                const expires = data.expires_on
-                    ? ` · Expires ${new Date(data.expires_on).toLocaleDateString()}`
-                    : '';
-                this._showCredResult('success', `✓ Token active${expires}`);
+                const message = data.expires_on
+                    ? this.t(
+                        'settings.credentials.tokenActiveExpires',
+                        '✓ Token active · Expires {date}',
+                        { date: new Date(data.expires_on).toLocaleDateString() }
+                    )
+                    : this.t('settings.credentials.tokenActive', '✓ Token active');
+                this._showCredResult('success', message);
                 this._credTestedToken = tokenVal;
             } else {
-                this._showCredResult('error', `✗ ${data.error || 'Invalid token'}`);
+                this._showCredResult('error', `✗ ${data.error || this.t('settings.credentials.invalidToken', 'Invalid token')}`);
                 this._credTestedToken = null;
             }
         } catch (e) {
-            this._showCredResult('error', `✗ Request failed: ${e.message}`);
+            this._showCredResult('error', this.t('settings.credentials.requestFailed', '✗ Request failed: {error}', { error: e.message }));
             this._credTestedToken = null;
         } finally {
             testBtn.disabled = false;
-            testBtn.textContent = 'Test Connection';
+            testBtn.textContent = this.t('settings.credentials.testButton', 'Test Connection');
             this._updateCredSaveBtn();
         }
     }
@@ -4675,38 +5385,126 @@ class MemoryDashboard {
         const saveBtn = document.getElementById('credSaveBtn');
 
         if (!this._credTestedToken || this._credTestedToken !== tokenVal) {
-            this._showCredResult('error', '⚠️ Run "Test Connection" first.');
+            this._showCredResult('error', this.t('settings.credentials.testFirst', 'Run "Test Connection" first.'));
             return;
         }
 
         saveBtn.disabled = true;
-        saveBtn.textContent = 'Saving…';
+        saveBtn.textContent = this.t('settings.quality.saving', 'Saving…');
 
         try {
             const syncOwnerVal = (document.getElementById('cred-sync-owner')?.value || 'http');
-            await this.apiCall('/config/credentials', {
-                method: 'POST',
-                body: JSON.stringify({
-                    api_token: tokenVal,
-                    account_id: accountVal,
-                    d1_database_id: d1Val,
-                    vectorize_index: vectorizeVal,
-                    sync_owner: syncOwnerVal,
-                    tested_token: this._credTestedToken,
-                })
+            await this.apiCall('/config/credentials', 'POST', {
+                api_token: tokenVal,
+                account_id: accountVal,
+                d1_database_id: d1Val,
+                vectorize_index: vectorizeVal,
+                sync_owner: syncOwnerVal,
+                tested_token: this._credTestedToken,
             });
-            this._showCredResult('success', '✓ Credentials saved. Server restarting…');
+            this._showCredResult('success', this.t('settings.credentials.saved', '✓ Credentials saved. Server restarting…'));
             this.closeModal(document.getElementById('settingsModal'));
             this.showRestartOverlay();
         } catch (e) {
-            this._showCredResult('error', `✗ Save failed: ${e.message}`);
+            this._showCredResult('error', this.t('settings.quality.saveFailed', '✗ Save failed: {error}', { error: e.message }));
             saveBtn.disabled = false;
-            saveBtn.textContent = 'Save & Restart';
+            saveBtn.textContent = this.t('settings.quality.save', 'Save & Restart');
         }
     }
 
     _showCredResult(type, message) {
         const el = document.getElementById('credTestResult');
+        if (!el) return;
+        el.className = `cred-test-result cred-test-${type}`;
+        el.textContent = message;
+        el.style.display = 'block';
+    }
+
+    /**
+     * Load the configured quality provider and boost flag into the Quality tab.
+     * Values come from GET /api/config/env, so the tab shows what the server runs with.
+     */
+    async loadQualitySettings() {
+        const resultEl = document.getElementById('qualitySaveResult');
+        if (resultEl) resultEl.style.display = 'none';
+
+        // Nothing can be edited or saved until the configured values are in,
+        // otherwise Save would write the HTML defaults over them
+        const providerSelect = document.getElementById('quality-provider');
+        const boostCheckbox = document.getElementById('quality-boost-enabled');
+        const saveBtn = document.getElementById('qualitySaveBtn');
+        [providerSelect, boostCheckbox, saveBtn].forEach(el => { if (el) el.disabled = true; });
+
+        try {
+            const config = await this.apiCall('/config/env');
+            const params = Object.fromEntries(
+                config.categories.flatMap(category => category.parameters).map(param => [param.key, param])
+            );
+            const provider = params.MCP_QUALITY_AI_PROVIDER;
+            const boost = params.MCP_QUALITY_BOOST_ENABLED;
+
+            const providerValue = (provider?.value || 'local').toLowerCase();
+            const option = Array.from(providerSelect?.options || []).find(opt => opt.value === providerValue);
+            if (providerSelect) {
+                // A provider the dropdown does not offer (e.g. openai-compatible) is left as it is on save
+                providerSelect.disabled = !option;
+                providerSelect.value = providerValue;
+            }
+
+            // Same spellings as safe_get_bool_env(); unset means off, the server default
+            if (boostCheckbox) {
+                boostCheckbox.checked = ['true', '1', 'yes', 'on', 'enabled']
+                    .includes((boost?.value || '').toLowerCase().trim());
+                boostCheckbox.disabled = false;
+            }
+            if (saveBtn) saveBtn.disabled = false;
+
+            const info = document.getElementById('current-provider-info');
+            if (info) info.textContent = option ? option.textContent : providerValue;
+        } catch (e) {
+            console.warn('Failed to load quality settings:', e);
+            this._showQualityResult('error', this.t(
+                'settings.quality.loadFailed',
+                '✗ Could not load the current settings: {error}. Reopen this tab to retry.',
+                { error: e.message }
+            ));
+        }
+    }
+
+    /**
+     * POST /api/config/quality — persist the Quality tab and restart.
+     */
+    async saveQualitySettings() {
+        const saveBtn = document.getElementById('qualitySaveBtn');
+        const providerSelect = document.getElementById('quality-provider');
+        const settings = {
+            MCP_QUALITY_BOOST_ENABLED: document.getElementById('quality-boost-enabled')?.checked ? 'true' : 'false',
+        };
+        if (providerSelect && !providerSelect.disabled) {
+            settings.MCP_QUALITY_AI_PROVIDER = providerSelect.value || 'local';
+        }
+
+        saveBtn.disabled = true;
+        saveBtn.textContent = this.t('settings.quality.saving', 'Saving…');
+
+        try {
+            await this.apiCall('/config/quality', 'POST', { settings });
+            this.closeModal(document.getElementById('settingsModal'));
+            this.showRestartOverlay();
+        } catch (e) {
+            this._showQualityResult('error', this.t(
+                'settings.quality.saveFailed',
+                '✗ Save failed: {error}',
+                { error: e.message }
+            ));
+        } finally {
+            saveBtn.disabled = false;
+            saveBtn.textContent = this.t('settings.quality.save', 'Save & Restart');
+        }
+    }
+
+    _showQualityResult(type, message) {
+        const el = document.getElementById('qualitySaveResult');
         if (!el) return;
         el.className = `cred-test-result cred-test-${type}`;
         el.textContent = message;
@@ -4739,7 +5537,7 @@ class MemoryDashboard {
                             <div class="env-param-row">
                                 <div class="env-param-key">
                                     <strong>${this.escapeHtml(param.key)}</strong>
-                                    ${param.sensitive ? '<span class="sensitive-badge">🔒 Sensitive</span>' : ''}
+                                    ${param.sensitive ? this.staticTextHtml('span', 'sensitive-badge', 'modal.settings.env.sensitive', 'Sensitive') : ''}
                                 </div>
                                 <div class="env-param-value ${param.sensitive ? 'masked' : ''}">
                                     ${this.renderParamValue(param)}
@@ -4760,7 +5558,7 @@ class MemoryDashboard {
 
         } catch (error) {
             console.error('Failed to load environment config:', error);
-            container.innerHTML = '<p class="error">Failed to load configuration</p>';
+            container.innerHTML = this.staticTextHtml('p', 'error', 'modal.settings.env.loadFailed', 'Failed to load configuration');
         }
     }
 
@@ -4771,7 +5569,7 @@ class MemoryDashboard {
      */
     renderParamValue(param) {
         if (!param.value) {
-            return '<span class="env-value-empty">(not set)</span>';
+            return this.staticTextHtml('span', 'env-value-empty', 'modal.settings.env.notSet', '(not set)');
         }
 
         if (param.sensitive) {
@@ -4780,11 +5578,14 @@ class MemoryDashboard {
 
         if (param.type === 'boolean') {
             const isTrue = param.value === 'true' || param.value === true;
-            return `<span class="env-value-boolean ${isTrue ? 'true' : 'false'}">${isTrue ? '✓ Enabled' : '✗ Disabled'}</span>`;
+            return isTrue
+                ? this.staticTextHtml('span', 'env-value-boolean true', 'modal.settings.env.enabled', '✓ Enabled')
+                : this.staticTextHtml('span', 'env-value-boolean false', 'modal.settings.env.disabled', '✗ Disabled');
         }
 
         if (param.choices && param.choices.length > 0) {
-            return `<code class="env-value">${this.escapeHtml(param.value)}</code> <span class="env-choices">(options: ${param.choices.map(c => this.escapeHtml(c)).join(', ')})</span>`;
+            const options = this.t('modal.settings.env.options', '(options: {options})', { options: param.choices.join(', ') });
+            return `<code class="env-value">${this.escapeHtml(param.value)}</code> <span class="env-choices">${this.escapeHtml(options)}</span>`;
         }
 
         return `<code class="env-value">${this.escapeHtml(param.value)}</code>`;
@@ -4795,7 +5596,7 @@ class MemoryDashboard {
      */
     async copyEnvironmentConfig() {
         if (!this.currentEnvConfig) {
-            this.showToast('No configuration loaded', 'error');
+            this.showToast(this.t('modal.settings.env.noConfig', 'No configuration loaded'), 'error');
             return;
         }
 
@@ -4826,10 +5627,10 @@ class MemoryDashboard {
 
         try {
             await navigator.clipboard.writeText(configText);
-            this.showToast('Configuration copied to clipboard', 'success');
+            this.showToast(this.t('modal.settings.env.copied', 'Configuration copied to clipboard'), 'success');
         } catch (error) {
             console.error('Failed to copy:', error);
-            this.showToast('Failed to copy to clipboard', 'error');
+            this.showToast(this.t('toast.copyFailed', 'Failed to copy to clipboard'), 'error');
         }
     }
 
@@ -4844,10 +5645,135 @@ class MemoryDashboard {
             await this.loadTagSelectOptions();
             await this.loadTagManagementStats();
             await this.loadUntaggedCount();
+            await this.loadOntology();
         } catch (error) {
             console.error('Failed to load manage data:', error);
             this.showToast(this.t('toast.loadManageFail', 'Failed to load management data'), 'error');
         }
+    }
+
+    /**
+     * Load the ontology overlay (#1897): the type selects and the stored-entries table.
+     */
+    async loadOntology() {
+        const container = document.getElementById('ontologyStoredContainer');
+        if (!container) return;
+        try {
+            const data = await this.apiCall('/ontology');
+            document.getElementById('ontologyForms').style.display = data.writable ? '' : 'none';
+            document.getElementById('ontologyReadOnly').style.display = data.writable ? 'none' : '';
+            const types = data.memory_types.map(t => t.name);
+            this.fillOntologySelect('ontologyTypeParent', data.memory_types.filter(t => !t.parent).map(t => t.name));
+            this.fillOntologySelect('ontologyRetentionType', types);
+            this.renderOntologyStored(data.stored, data.writable);
+        } catch (error) {
+            console.error('Failed to load ontology:', error);
+            container.innerHTML = `<p class="error" data-i18n="manage.ontology.loadFailed">${this.escapeHtml(this.t('manage.ontology.loadFailed', 'Failed to load the ontology'))}</p>`;
+        }
+    }
+
+    /**
+     * Replace a select's options after its first (placeholder) option.
+     */
+    fillOntologySelect(id, names) {
+        const select = document.getElementById(id);
+        if (!select) return;
+        // Keep the user's choice across reloads (a language switch re-renders the section).
+        const selected = select.value;
+        while (select.options.length > 1) select.remove(1);
+        names.forEach(name => select.add(new Option(name, name)));
+        if (names.includes(selected)) select.value = selected;
+    }
+
+    /**
+     * One line of detail for a stored overlay row.
+     */
+    ontologyDetail(row) {
+        const p = row.payload || {};
+        if (row.kind === 'memory_type') return row.parent || '';
+        if (row.kind === 'retention') return this.t('manage.ontology.days', '{days} days', { days: p.days });
+        if (row.kind === 'relationship') return Array.isArray(p.valid_patterns) ? p.valid_patterns.join(', ') : '';
+        return `${p.relationship} (${p.confidence})`;
+    }
+
+    renderOntologyStored(rows, writable) {
+        const container = document.getElementById('ontologyStoredContainer');
+        if (!rows.length) {
+            container.innerHTML = `<p class="text-neutral-600" data-i18n="manage.ontology.empty">${this.escapeHtml(this.t('manage.ontology.empty', 'Nothing stored yet. Built-in types and types from MCP_CUSTOM_MEMORY_TYPES are not listed here.'))}</p>`;
+            return;
+        }
+        const th = (key, fallback) => `<th data-i18n="${key}">${this.escapeHtml(this.t(key, fallback))}</th>`;
+        let html = '<table class="tag-stats-table"><thead><tr>';
+        html += th('manage.ontology.column.kind', 'Kind') + th('manage.ontology.column.name', 'Name')
+            + th('manage.ontology.column.detail', 'Details');
+        if (writable) html += th('manage.tags.column.actions', 'Actions');
+        html += '</tr></thead><tbody>';
+        rows.forEach(row => {
+            html += `<tr><td>${this.escapeHtml(row.kind)}</td><td class="tag-name">${this.escapeHtml(row.key)}</td>`;
+            html += `<td>${this.escapeHtml(this.ontologyDetail(row))}</td>`;
+            if (writable) {
+                html += `<td class="tag-actions"><button class="tag-action-btn danger" data-kind="${this.escapeHtml(row.kind)}" data-key="${this.escapeHtml(row.key)}" data-i18n="manage.ontology.remove">${this.escapeHtml(this.t('manage.ontology.remove', 'Remove'))}</button></td>`;
+            }
+            html += '</tr>';
+        });
+        container.innerHTML = html + '</tbody></table>';
+        // Assigned, not added: the table re-renders on every visit and language switch.
+        container.onclick = (e) => {
+            const button = e.target.closest('[data-kind]');
+            if (button) this.handleRemoveOntologyEntry(button.dataset.kind, button.dataset.key);
+        };
+    }
+
+    async ontologyWrite(endpoint, method, body) {
+        this.setLoading(true);
+        try {
+            await this.apiCall(endpoint, method, body);
+            this.showToast(this.t('toast.ontologyUpdated', 'Ontology updated'), 'success');
+            await this.loadOntology();
+            // The search filter and memory forms list the types too (loaded at startup).
+            await this.loadMemoryTypes();
+            return true;
+        } catch (error) {
+            console.error('Ontology write failed:', error);
+            this.showToast(error.message || this.t('toast.operationFailed', 'Operation failed'), 'error');
+            return false;
+        } finally {
+            this.setLoading(false);
+        }
+    }
+
+    async handleAddMemoryType() {
+        const name = document.getElementById('ontologyTypeName');
+        const parent = document.getElementById('ontologyTypeParent').value || null;
+        if (!name.value.trim()) return;
+        if (await this.ontologyWrite('/ontology/memory-types', 'POST', { name: name.value.trim(), parent })) {
+            name.value = '';
+        }
+    }
+
+    async handleSetRetention() {
+        const type = document.getElementById('ontologyRetentionType').value;
+        const raw = document.getElementById('ontologyRetentionDays').value.trim();
+        const days = Number(raw);
+        if (!type || !raw) return;
+        // Number(), not parseInt(): "30.5" and "1e2" must not turn into 30 and 1.
+        if (!Number.isInteger(days) || days < 1 || days > 3650) {
+            this.showToast(this.t('manage.ontology.retention.invalid', 'Enter a whole number of days from 1 to 3650.'), 'error');
+            return;
+        }
+        await this.ontologyWrite(`/ontology/retention/${encodeURIComponent(type)}`, 'PUT', { days });
+    }
+
+    async handleRemoveOntologyEntry(kind, key) {
+        const paths = {
+            memory_type: () => `/ontology/memory-types/${encodeURIComponent(key)}`,
+            retention: () => `/ontology/retention/${encodeURIComponent(key)}`,
+            relationship: () => `/ontology/relationships/${encodeURIComponent(key)}`,
+            type_pattern: () => '/ontology/type-patterns/' + key.split(' → ').map(encodeURIComponent).join('/'),
+        };
+        if (!paths[kind]) return;
+        if (!confirm(this.t('manage.ontology.removeConfirm', 'Remove {name}? Stored memories and edges keep it.', { name: key }))) return;
+        await this.ontologyWrite(paths[kind](), 'DELETE');
     }
 
     /**
@@ -4857,12 +5783,13 @@ class MemoryDashboard {
         try {
             const data = await this.apiCall('/manage/untagged/count');
             const count = data.count || 0;
-            const countSpan = document.getElementById('untaggedCount');
             const card = document.getElementById('deleteUntaggedCard');
-
-            if (countSpan) {
-                countSpan.textContent = count;
-            }
+            this.setCountedText(
+                document.getElementById('untaggedCount'),
+                'manage.bulk.deleteUntagged.desc',
+                'Remove memories without any tags ({count} found)',
+                count
+            );
             if (card) {
                 card.style.display = count > 0 ? '' : 'none';
             }
@@ -4879,6 +5806,7 @@ class MemoryDashboard {
             const data = await this.apiCall('/manage/tags/stats');
             const select = document.getElementById('deleteTagSelect');
             if (!select) return;
+            const selected = select.value;
 
             // Clear existing options except the first
             while (select.children.length > 1) {
@@ -4893,6 +5821,7 @@ class MemoryDashboard {
                 option.dataset.count = tagStat.count;  // Store count in data attribute
                 select.appendChild(option);
             });
+            if (data.tags.some(tagStat => tagStat.tag === selected)) select.value = selected;
         } catch (error) {
             console.error('Failed to load tag options:', error);
         }
@@ -4910,7 +5839,7 @@ class MemoryDashboard {
             this.renderTagManagementTable(data);
         } catch (error) {
             console.error('Failed to load tag management stats:', error);
-            container.innerHTML = '<p class="error">Failed to load tag statistics</p>';
+            container.innerHTML = `<p class="error" data-i18n="manage.tags.loadFailed">${this.escapeHtml(this.t('manage.tags.loadFailed', 'Failed to load tag statistics'))}</p>`;
         }
     }
 
@@ -4921,28 +5850,52 @@ class MemoryDashboard {
         const container = document.getElementById('tagManagementContainer');
         if (!container) return;
 
-        let html = '<table class="tag-stats-table">';
+        const minimum = this.tagManagementMinCount ?? 2;
+        let html = '<div class="tag-management-filter">';
+        html += `<label for="tagManagementMinCount" data-i18n="manage.tags.minimumCount">${this.escapeHtml(this.t('manage.tags.minimumCount', 'Show tags used at least N times'))}</label> `;
+        html += `<input id="tagManagementMinCount" class="form-control" style="max-width: 6rem; display: inline-block;" type="number" min="1" step="1" value="${minimum}">`;
+        html += '<p class="tag-management-count" aria-live="polite"></p></div>';
+        html += '<table class="tag-stats-table">';
         html += '<thead><tr>';
-        html += '<th>Tag</th>';
-        html += '<th>Count</th>';
-        html += '<th>Actions</th>';
-        html += '</tr></thead><tbody>';
-
-        data.tags.forEach(tagStat => {
-        html += '<tr>';
-        html += `<td class="tag-name">${tagStat.tag}</td>`;
-        html += `<td class="tag-count">${tagStat.count}</td>`;
-        html += '<td class="tag-actions">';
-        html += `<button class="tag-action-btn" data-action="rename-tag" data-tag="${this.escapeHtml(tagStat.tag)}">Rename</button>`;
-        html += `<button class="tag-action-btn danger" data-action="delete-tag" data-tag="${this.escapeHtml(tagStat.tag)}" data-count="${tagStat.count}">Delete</button>`;
-        html += '</td></tr>';
-        });
-
-        html += '</tbody></table>';
+        html += `<th data-i18n="manage.tags.column.tag">${this.escapeHtml(this.t('manage.tags.column.tag', 'Tag'))}</th>`;
+        html += `<th data-i18n="manage.tags.column.count">${this.escapeHtml(this.t('manage.tags.column.count', 'Count'))}</th>`;
+        html += `<th data-i18n="manage.tags.column.actions">${this.escapeHtml(this.t('manage.tags.column.actions', 'Actions'))}</th>`;
+        html += '</tr></thead><tbody></tbody></table>';
         container.innerHTML = html;
 
-        // Add event listeners for tag actions
-        container.addEventListener('click', (e) => {
+        const input = container.querySelector('#tagManagementMinCount');
+        const body = container.querySelector('tbody');
+        const summary = container.querySelector('.tag-management-count');
+        const renderRows = () => {
+            const tags = data.tags.filter(tagStat => tagStat.count >= (this.tagManagementMinCount ?? 2));
+            body.innerHTML = tags.map(tagStat => {
+                let row = '<tr>';
+                row += `<td class="tag-name">${this.escapeHtml(tagStat.tag)}</td>`;
+                row += `<td class="tag-count">${tagStat.count}</td>`;
+                row += '<td class="tag-actions">';
+                row += `<button class="tag-action-btn" data-action="rename-tag" data-tag="${this.escapeHtml(tagStat.tag)}" data-i18n="manage.tags.rename">${this.escapeHtml(this.t('manage.tags.rename', 'Rename'))}</button>`;
+                row += `<button class="tag-action-btn danger" data-action="delete-tag" data-tag="${this.escapeHtml(tagStat.tag)}" data-count="${tagStat.count}" data-i18n="manage.tags.delete">${this.escapeHtml(this.t('manage.tags.delete', 'Delete'))}</button>`;
+                return row + '</td></tr>';
+            }).join('');
+            summary.textContent = this.t('manage.tags.showingCount', 'Showing {shown} of {total} tags', { shown: tags.length, total: data.tags.length });
+        };
+        // Update just the rows while typing, so the input keeps its focus.
+        input.oninput = () => {
+            const value = Number(input.value);
+            if (!Number.isInteger(value) || value < 1) return;
+            this.tagManagementMinCount = value;
+            renderRows();
+        };
+        input.onchange = () => {
+            const value = Number(input.value);
+            this.tagManagementMinCount = Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
+            input.value = String(this.tagManagementMinCount);
+            renderRows();
+        };
+        renderRows();
+
+        // Assigned, not added: the table re-renders on every visit and language switch.
+        container.onclick = (e) => {
             const button = e.target.closest('[data-action]');
             if (!button) return;
 
@@ -4955,7 +5908,7 @@ class MemoryDashboard {
                 const count = parseInt(button.dataset.count, 10);
                 this.deleteTag(tag, count);
             }
-        });
+        };
     }
 
     /**
@@ -5069,15 +6022,15 @@ class MemoryDashboard {
      */
     async handleDeleteUntagged() {
         // Get current count
-        const countSpan = document.getElementById('untaggedCount');
-        const count = parseInt(countSpan?.textContent || '0', 10);
+        const countEl = document.getElementById('untaggedCount');
+        const count = parseInt(countEl?.dataset.count || '0', 10);
 
         if (count === 0) {
-            this.showToast('No untagged memories to delete', 'info');
+            this.showToast(this.t('toast.noUntaggedMemories', 'No untagged memories to delete'), 'info');
             return;
         }
 
-        if (!await this.confirmBulkOperation(`Delete ${count} memories without tags?`)) {
+        if (!await this.confirmBulkOperation(this.t('manage.bulk.deleteUntagged.confirm', 'Delete {count} memories without tags?', { count }))) {
             return;
         }
 
@@ -5090,28 +6043,14 @@ class MemoryDashboard {
                 await this.loadManageData();
                 await this.loadDashboardData();
             } else {
-                this.showToast(result.message || 'Operation failed', 'error');
+                this.showToast(result.message || this.t('toast.operationFailed', 'Operation failed'), 'error');
             }
         } catch (error) {
             console.error('Delete untagged failed:', error);
-            this.showToast('Delete untagged operation failed', 'error');
+            this.showToast(this.t('toast.deleteUntaggedFailed', 'Delete untagged operation failed'), 'error');
         } finally {
             this.setLoading(false);
         }
-    }
-
-    /**
-     * Handle database optimization
-     */
-    async handleOptimizeDatabase() {
-        this.showToast(this.t('toast.dbOptimizeTodo', 'Database optimization not yet implemented'), 'warning');
-    }
-
-    /**
-     * Handle index rebuild
-     */
-    async handleRebuildIndex() {
-        this.showToast(this.t('toast.indexRebuildTodo', 'Index rebuild not yet implemented'), 'warning');
     }
 
     /**
@@ -5171,7 +6110,9 @@ class MemoryDashboard {
             this.updateElementText('analyticsTotalMemories', data.total_memories || 0);
             this.updateElementText('analyticsThisWeek', data.memories_this_week || 0);
             this.updateElementText('analyticsUniqueTags', data.unique_tags || 0);
-            this.updateElementText('analyticsDbSize', data.database_size_mb ?
+            // 0.0 is a real size for a near-empty database and rounds down to 0;
+            // only null/undefined mean the backend did not report a size.
+            this.updateElementText('analyticsDbSize', data.database_size_mb != null ?
                 `${data.database_size_mb.toFixed(1)} MB` : 'N/A');
         } catch (error) {
             console.error('Failed to load analytics overview:', error);
@@ -5192,7 +6133,7 @@ class MemoryDashboard {
             this.renderMemoryGrowthChart(container, data);
         } catch (error) {
             console.error('Failed to load memory growth:', error);
-            container.innerHTML = '<p class="error">Failed to load growth chart</p>';
+            container.innerHTML = `<p class="error" data-i18n="analytics.growthLoadFailed">${this.t('analytics.growthLoadFailed', 'Failed to load growth chart')}</p>`;
         }
     }
 
@@ -5201,33 +6142,46 @@ class MemoryDashboard {
      */
     renderMemoryGrowthChart(container, data) {
         if (!data.data_points || data.data_points.length === 0) {
-            container.innerHTML = '<p>No growth data available</p>';
+            container.innerHTML = `<p data-i18n="analytics.noGrowthData">${this.t('analytics.noGrowthData', 'No growth data available')}</p>`;
             return;
         }
 
-        // Find max count for scaling
-        const recentPoints = data.data_points.slice(-10);
-        const maxCount = Math.max(...recentPoints.map(p => p.count), 1);
+        // One line: the running total per period, the latest point carries the accent.
+        const points = data.data_points.slice(-12);
+        const totals = points.map(p => Number(p.cumulative) || 0);
+        const max = Math.max(...totals, 1);
+        // Draw at the container's content width (no padding, no floor) so the SVG is not
+        // scaled and the 11px axis labels stay 11px on phones too. 600 only if hidden.
+        const cs = getComputedStyle(container);
+        const contentWidth = container.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+        const W = contentWidth > 0 ? Math.round(contentWidth) : 600, H = 220, L = 8, R = 48, T = 16, B = 28;
+        // Below ~360px the two period labels would overlap; keep only the current one.
+        const showFirstLabel = W >= 360 && points.length > 1;
+        const x = i => L + (points.length === 1 ? (W - L - R) : i * (W - L - R) / (points.length - 1));
+        const y = v => T + (H - T - B) * (1 - v / max);
+        const label = p => this.escapeHtml(p.label || p.date || '');
 
-        let html = '<div class="simple-chart">';
+        const path = totals.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+        const grid = [0, 0.5, 1].map(f => {
+            const gy = y(max * f).toFixed(1);
+            return `<line class="growth-grid" x1="${L}" x2="${W - R}" y1="${gy}" y2="${gy}"/>`
+                + `<text class="growth-axis" x="${W - R + 8}" y="${(+gy + 4).toFixed(1)}">${Math.round(max * f)}</text>`;
+        }).join('');
+        const last = points.length - 1;
+        const current = points[last];
 
-        recentPoints.forEach(point => {
-            // Normalize bar width relative to max, then convert to pixels (200px scale)
-            const barWidthPx = (point.count / maxCount) * 200;
-            const displayCount = point.count || 0;
-            const displayCumulative = point.cumulative || 0;
-            // Use label if available, otherwise fall back to date for backward compatibility
-            const displayLabel = point.label || point.date;
-
-            html += `<div class="chart-row">
-                <div class="chart-bar" style="width: ${barWidthPx}px"></div>
-                <span class="chart-value">+${displayCount} <small>(${displayCumulative} total)</small></span>
-                <span class="chart-label">${displayLabel}</span>
-            </div>`;
-        });
-
-        html += '</div>';
-        container.innerHTML = html;
+        container.innerHTML = `
+            <div class="growth-summary">
+                <span class="growth-figure">${totals[last]}</span>
+                <span class="growth-delta">+${Number(current.count) || 0} · ${label(current)}</span>
+            </div>
+            <svg class="growth-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${label(points[0])} – ${label(current)}">
+                ${grid}
+                <path class="growth-line" d="${path}"/>
+                <circle class="growth-dot" cx="${x(last).toFixed(1)}" cy="${y(totals[last]).toFixed(1)}" r="4"/>
+                ${showFirstLabel ? `<text class="growth-axis" x="${L}" y="${H - 6}">${label(points[0])}</text>` : ''}
+                <text class="growth-axis" x="${W - R}" y="${H - 6}" text-anchor="end">${label(current)}</text>
+            </svg>`;
     }
 
     /**
@@ -5242,7 +6196,7 @@ class MemoryDashboard {
             this.renderTagUsageChart(container, data);
         } catch (error) {
             console.error('Failed to load tag usage:', error);
-            container.innerHTML = '<p class="error">Failed to load tag usage chart</p>';
+            container.innerHTML = `<p class="error" data-i18n="analytics.tagUsageLoadFailed">${this.t('analytics.tagUsageLoadFailed', 'Failed to load tag usage chart')}</p>`;
         }
     }
 
@@ -5251,7 +6205,7 @@ class MemoryDashboard {
      */
     renderTagUsageChart(container, data) {
         if (!data.tags || data.tags.length === 0) {
-            container.innerHTML = '<p>No tags found</p>';
+            container.innerHTML = `<p data-i18n="analytics.noTagUsage">${this.t('analytics.noTagUsage', 'No tags found')}</p>`;
             return;
         }
 
@@ -5263,23 +6217,29 @@ class MemoryDashboard {
 
         // Render significant tags
         significantTags.forEach(tag => {
-            const barWidthPx = (tag.percentage / 100) * 200; // Convert percentage to pixels (200px scale)
+            const barWidthPx = (Math.min(tag.percentage, 100) / 100) * 200; // percentage to px, clamped to the 200px scale
             html += `<div class="chart-row">
                 <div class="chart-bar" style="width: ${barWidthPx}px"></div>
                 <span class="chart-value">${tag.count} (${tag.percentage}%)</span>
-                <span class="chart-label">${tag.tag}</span>
+                <span class="chart-label">${this.escapeHtml(tag.tag)}</span>
             </div>`;
         });
 
-        // Add "diverse" category if there are minor tags
+        // Add an aggregate row for the minor tags.
+        //
+        // These counts are tag assignments, not memories: one memory can carry
+        // several tags, so summing the per-tag percentages goes past 100% as soon
+        // as anything is multiply tagged, and the bar (percentage / 100 * 200) runs
+        // past the 200px scale. Report how many tags were folded in and leave the
+        // percentage out; there is no honest percentage for a set of overlapping tags.
         if (minorTags.length > 0) {
-            const diverseCount = minorTags.reduce((sum, t) => sum + t.count, 0);
-            const diversePercentage = minorTags.reduce((sum, t) => sum + t.percentage, 0);
-            const barWidthPx = (diversePercentage / 100) * 200;
+            const assignmentCount = minorTags.reduce((sum, t) => sum + t.count, 0);
+            const minorTagsTip = this.t('analytics.minorTagsTip',
+                '{assignments} tag assignments across {count} tags with 10 or fewer memories each',
+                { assignments: assignmentCount, count: minorTags.length });
             html += `<div class="chart-row">
-                <div class="chart-bar" style="width: ${barWidthPx}px"></div>
-                <span class="chart-value">${diverseCount} (${diversePercentage.toFixed(1)}%)</span>
-                <span class="chart-label" title="${minorTags.length} tags with ≤10 memories each">diverse (${minorTags.length} tags)</span>
+                <span class="chart-value">${this.escapeHtml(this.t('analytics.minorTagsCount', '{count} tags', { count: minorTags.length }))}</span>
+                <span class="chart-label" title="${this.escapeHtml(minorTagsTip)}" data-i18n="analytics.minorTagsLabel">${this.escapeHtml(this.t('analytics.minorTagsLabel', 'more tags (≤10 memories each)'))}</span>
             </div>`;
         }
 
@@ -5299,7 +6259,7 @@ class MemoryDashboard {
             this.renderMemoryTypesChart(container, data);
         } catch (error) {
             console.error('Failed to load memory types:', error);
-            container.innerHTML = '<p class="error">Failed to load memory types chart</p>';
+            container.innerHTML = `<p class="error" data-i18n="analytics.memoryTypesLoadFailed">${this.t('analytics.memoryTypesLoadFailed', 'Failed to load memory types chart')}</p>`;
         }
     }
 
@@ -5308,7 +6268,7 @@ class MemoryDashboard {
      */
     renderMemoryTypesChart(container, data) {
         if (!data.types || data.types.length === 0) {
-            container.innerHTML = '<p>No memory types found</p>';
+            container.innerHTML = `<p data-i18n="analytics.noMemoryTypes">${this.t('analytics.noMemoryTypes', 'No memory types found')}</p>`;
             return;
         }
 
@@ -5321,7 +6281,7 @@ class MemoryDashboard {
         // Render significant types
         significantTypes.forEach(type => {
             const barWidthPx = (type.percentage / 100) * 200; // Convert percentage to pixels (200px scale)
-            const typeName = type.memory_type || 'untyped';
+            const typeName = this.escapeHtml(type.memory_type || 'untyped');
             html += `<div class="chart-row">
                 <div class="chart-bar" style="width: ${barWidthPx}px"></div>
                 <span class="chart-value">${type.count} (${type.percentage.toFixed(1)}%)</span>
@@ -5337,7 +6297,7 @@ class MemoryDashboard {
             html += `<div class="chart-row">
                 <div class="chart-bar" style="width: ${barWidthPx}px"></div>
                 <span class="chart-value">${diverseCount} (${diversePercentage.toFixed(1)}%)</span>
-                <span class="chart-label" title="${minorTypes.length} types with ≤10 memories each">diverse (${minorTypes.length} types)</span>
+                <span class="chart-label" title="${this.escapeHtml(this.t('analytics.minorTypesTip', '{count} types with ≤10 memories each', { count: minorTypes.length }))}">${this.escapeHtml(this.t('analytics.minorTypesLabel', 'diverse ({count} types)', { count: minorTypes.length }))}</span>
             </div>`;
         }
 
@@ -5358,7 +6318,7 @@ class MemoryDashboard {
         this.renderTopTagsReport(container, data);
     } catch (error) {
     console.error('Failed to load top tags:', error);
-        container.innerHTML = '<p class="error">Failed to load top tags</p>';
+        container.innerHTML = this.staticTextHtml('p', 'error', 'analytics.topTagsLoadFailed', 'Failed to load top tags');
         }
     }
 
@@ -5367,24 +6327,25 @@ class MemoryDashboard {
     */
     renderTopTagsReport(container, data) {
     if (!data.tags || data.tags.length === 0) {
-    container.innerHTML = '<p>No tags found</p>';
+    container.innerHTML = this.staticTextHtml('p', '', 'analytics.topTagsEmpty', 'No tags found');
     return;
     }
 
     let html = '<div class="enhanced-tags-report">';
-    html += `<div class="report-period">Period: ${data.period}</div>`;
+    const periodLabel = this.t(`analytics.period.${data.period}`, data.period);
+    html += `<div class="report-period">${this.escapeHtml(this.t('analytics.reportPeriod', 'Period: {period}', { period: periodLabel }))}</div>`;
     html += '<ul class="tags-list">';
     data.tags.slice(0, 10).forEach(tag => {
-        const trendIcon = tag.trending ? '📈' : '';
+        const trendIcon = tag.trending ? ` <span class="tag-trending">${this.escapeHtml(this.t('analytics.trending', 'trending'))}</span>` : '';
             const growthText = tag.growth_rate !== null ? ` (${tag.growth_rate > 0 ? '+' : ''}${tag.growth_rate}%)` : '';
         html += `<li>
                 <div class="tag-header">
-                    <strong>${tag.tag}</strong>${trendIcon}
-                    <span class="tag-count">${tag.count} memories (${tag.percentage}%)${growthText}</span>
+                    <strong>${this.escapeHtml(tag.tag)}</strong>${trendIcon}
+                    <span class="tag-count">${this.escapeHtml(this.t('analytics.memoriesPercent', '{count} memories ({percent}%)', { count: tag.count, percent: tag.percentage }))}${growthText}</span>
                 </div>`;
             if (tag.co_occurring_tags && tag.co_occurring_tags.length > 0) {
-                html += '<div class="tag-cooccurrence">Often with: ';
-                html += tag.co_occurring_tags.slice(0, 3).map(co => `${co.tag} (${co.strength.toFixed(2)})`).join(', ');
+                html += `<div class="tag-cooccurrence">${this.escapeHtml(this.t('analytics.oftenWith', 'Often with:'))} `;
+                html += tag.co_occurring_tags.slice(0, 3).map(co => `${this.escapeHtml(co.tag)} (${co.strength.toFixed(2)})`).join(', ');
                 html += '</div>';
             }
             html += '</li>';
@@ -5407,8 +6368,29 @@ class MemoryDashboard {
     this.renderRecentActivityReport(container, data);
     } catch (error) {
     console.error('Failed to load recent activity:', error);
-    container.innerHTML = '<p class="error">Failed to load recent activity</p>';
+    container.innerHTML = this.staticTextHtml('p', 'error', 'analytics.recentActivityLoadFailed', 'Failed to load recent activity');
     }
+    }
+
+    /**
+    * Render an activity period in the dashboard language. The API sends English
+    * labels plus the hour, weekday or ISO week; older servers send labels only.
+    */
+    formatActivityPeriod(item) {
+        const lang = this.currentLang || undefined;
+        if (item.hour != null) {
+            return new Intl.DateTimeFormat(lang, { hour: 'numeric', timeZone: 'UTC' })
+                .format(Date.UTC(2024, 0, 1, item.hour));
+        }
+        if (item.weekday != null) {
+            // 2024-01-01 is a Monday, matching the API's 0 = Monday.
+            return new Intl.DateTimeFormat(lang, { weekday: 'long', timeZone: 'UTC' })
+                .format(Date.UTC(2024, 0, 1 + item.weekday));
+        }
+        if (item.iso_week != null) {
+            return this.t('analytics.weekLabel', 'Week {week} ({year})', { week: item.iso_week, year: item.iso_year });
+        }
+        return item.label;
     }
 
     /**
@@ -5419,15 +6401,15 @@ class MemoryDashboard {
 
     // Summary stats
     html += '<div class="activity-summary">';
-        html += `<div class="activity-stat"><strong>Active Days:</strong> ${data.active_days}/${data.total_days}</div>`;
-    html += `<div class="activity-stat"><strong>Current Streak:</strong> ${data.current_streak} days</div>`;
-    html += `<div class="activity-stat"><strong>Longest Streak:</strong> ${data.longest_streak} days</div>`;
+        html += `<div class="activity-stat">${this.staticTextHtml('strong', '', 'analytics.activeDays', 'Active Days:')} ${data.active_days}/${data.total_days}</div>`;
+    html += `<div class="activity-stat">${this.staticTextHtml('strong', '', 'analytics.currentStreak', 'Current Streak:')} ${this.escapeHtml(this.t('analytics.streakDays', '{count} days', { count: data.current_streak }))}</div>`;
+    html += `<div class="activity-stat">${this.staticTextHtml('strong', '', 'analytics.longestStreak', 'Longest Streak:')} ${this.escapeHtml(this.t('analytics.streakDays', '{count} days', { count: data.longest_streak }))}</div>`;
     html += '</div>';
 
     if (data.peak_times && data.peak_times.length > 0) {
     html += '<div class="peak-times">';
-        html += '<strong>Peak Times:</strong> ';
-        html += data.peak_times.join(', ');
+        html += `${this.staticTextHtml('strong', '', 'analytics.peakTimes', 'Peak Times:')} `;
+        html += (data.peak_periods?.length ? data.peak_periods.map(p => this.formatActivityPeriod(p)) : data.peak_times).join(', ');
             html += '</div>';
     }
 
@@ -5446,8 +6428,8 @@ class MemoryDashboard {
                 const barWidth = totalCount > 0 ? (item.count / maxCount * 100) : 0;
 
                 html += `<div class="activity-bar-row">
-                    <span class="activity-label">${item.label}</span>
-                    <div class="activity-bar" style="width: ${barWidth}%" title="${item.count} memories (${percentage.toFixed(1)}%)"></div>
+                    <span class="activity-label">${this.formatActivityPeriod(item)}</span>
+                    <div class="activity-bar" style="width: ${barWidth}%" title="${this.escapeHtml(this.t('analytics.memoriesPercent', '{count} memories ({percent}%)', { count: item.count, percent: percentage.toFixed(1) }))}"></div>
                     <span class="activity-count">${item.count} (${percentage.toFixed(1)}%)</span>
                 </div>`;
             });
@@ -5473,7 +6455,7 @@ class MemoryDashboard {
             this.renderActivityHeatmapChart(container, data);
         } catch (error) {
             console.error('Failed to load activity heatmap:', error);
-            container.innerHTML = '<p class="error">Failed to load activity heatmap</p>';
+            container.innerHTML = this.staticTextHtml('p', 'error', 'analytics.heatmapLoadFailed', 'Failed to load activity heatmap');
         }
     }
 
@@ -5482,15 +6464,15 @@ class MemoryDashboard {
      */
     renderActivityHeatmapChart(container, data) {
         if (!data.data || data.data.length === 0) {
-            container.innerHTML = '<p>No activity data available</p>';
+            container.innerHTML = this.staticTextHtml('p', '', 'analytics.heatmapEmpty', 'No activity data available');
             return;
         }
 
         // Create calendar grid
         let html = '<div class="activity-heatmap">';
         html += '<div class="heatmap-stats">';
-        html += `<span>${data.total_days} active days</span>`;
-        html += `<span>Max: ${data.max_count} memories/day</span>`;
+        html += `<span>${this.escapeHtml(this.t('analytics.heatmapActiveDays', '{count} active days', { count: data.total_days }))}</span>`;
+        html += `<span>${this.escapeHtml(this.t('analytics.heatmapMaxPerDay', 'Max: {count} memories/day', { count: data.max_count }))}</span>`;
         html += '</div>';
 
         // Group by months
@@ -5507,7 +6489,7 @@ class MemoryDashboard {
         // Render each month
         Object.keys(months).sort().reverse().forEach(monthKey => {
             const [year, month] = monthKey.split('-');
-            const monthName = new Date(year, month - 1).toLocaleString('default', { month: 'short' });
+            const monthName = new Date(year, month - 1).toLocaleString(this.currentLang || undefined, { month: 'short' });
 
             html += `<div class="heatmap-month">`;
             html += `<div class="month-label">${monthName} ${year}</div>`;
@@ -5527,7 +6509,7 @@ class MemoryDashboard {
             // Add cells for each day
             monthData.forEach(day => {
                 const level = day.level;
-                const tooltip = `${day.date}: ${day.count} memories`;
+                const tooltip = this.escapeHtml(this.t('analytics.heatmapDayTip', '{date}: {count} memories', { date: day.date, count: day.count }));
                 html += `<div class="heatmap-cell level-${level}" title="${tooltip}"></div>`;
             });
 
@@ -5536,11 +6518,11 @@ class MemoryDashboard {
 
         // Legend
         html += '<div class="heatmap-legend">';
-        html += '<span>Less</span>';
+        html += this.staticTextHtml('span', '', 'analytics.heatmapLess', 'Less');
         for (let i = 0; i <= 4; i++) {
             html += `<div class="legend-cell level-${i}"></div>`;
         }
-        html += '<span>More</span>';
+        html += this.staticTextHtml('span', '', 'analytics.heatmapMore', 'More');
         html += '</div>';
 
         html += '</div>';
@@ -5580,7 +6562,7 @@ class MemoryDashboard {
             this.renderStorageReport(container, data);
         } catch (error) {
             console.error('Failed to load storage report:', error);
-            container.innerHTML = '<p class="error">Failed to load storage report</p>';
+            container.innerHTML = `<p class="error" data-i18n="analytics.storageLoadFailed">${this.t('analytics.storageLoadFailed', 'Failed to load storage report')}</p>`;
         }
     }
 
@@ -5592,24 +6574,27 @@ class MemoryDashboard {
 
         // Summary stats
         html += '<div class="storage-summary">';
-        html += `<div class="storage-stat"><strong>Total Size:</strong> ${data.total_size_mb} MB</div>`;
-        html += `<div class="storage-stat"><strong>Average Memory:</strong> ${data.average_memory_size} chars</div>`;
-        html += `<div class="storage-stat"><strong>Efficiency:</strong> ${data.storage_efficiency}%</div>`;
+        html += `<div class="storage-stat"><strong data-i18n="analytics.storageTotalSize">${this.t('analytics.storageTotalSize', 'Total Size:')}</strong> ${this.t('analytics.storageSizeMb', '{size} MB', { size: data.total_size_mb })}</div>`;
+        html += `<div class="storage-stat"><strong data-i18n="analytics.storageAverageMemory">${this.t('analytics.storageAverageMemory', 'Average Memory:')}</strong> ${this.t('analytics.storageAverageChars', '{count} chars', { count: data.average_memory_size })}</div>`;
+        html += `<div class="storage-stat"><strong data-i18n="analytics.storageEfficiency">${this.t('analytics.storageEfficiency', 'Efficiency:')}</strong> ${data.storage_efficiency}%</div>`;
         html += '</div>';
 
         // Largest memories
         if (data.largest_memories && data.largest_memories.length > 0) {
-            html += '<h4>Largest Memories</h4>';
+            html += `<h4 data-i18n="analytics.largestMemories">${this.t('analytics.largestMemories', 'Largest Memories')}</h4>`;
             html += '<ul class="largest-memories">';
             data.largest_memories.slice(0, 5).forEach(memory => {
                 // Backend provides created_at as ISO string, not timestamp
-                const date = memory.created_at ? new Date(memory.created_at).toLocaleDateString() : 'Unknown';
+                const date = memory.created_at ? new Date(memory.created_at).toLocaleDateString() : this.t('analytics.storageUnknownDate', 'Unknown');
                 // Backend provides size_kb and preview (not size and content_preview)
-                const sizeDisplay = memory.size_kb ? `${memory.size_kb} KB` : `${memory.size_bytes || 0} bytes`;
+                const sizeDisplay = memory.size_kb
+                    ? this.t('analytics.storageSizeKb', '{size} KB', { size: memory.size_kb })
+                    : this.t('analytics.storageSizeBytes', '{size} bytes', { size: memory.size_bytes || 0 });
+                const tagList = memory.tags.join(', ') || this.t('analytics.storageNoTags', 'none');
                 html += `<li>
                     <div class="memory-size">${sizeDisplay}</div>
                     <div class="memory-preview">${this.escapeHtml(memory.preview || '')}</div>
-                    <div class="memory-meta">${date} • Tags: ${memory.tags.join(', ') || 'none'}</div>
+                    <div class="memory-meta">${date} • ${this.escapeHtml(this.t('analytics.storageTags', 'Tags: {tags}', { tags: tagList }))}</div>
                 </li>`;
             });
             html += '</ul>';
@@ -5640,7 +6625,7 @@ class MemoryDashboard {
             this.renderRelationshipTypesChart(container, data);
         } catch (error) {
             console.error('Failed to load relationship types:', error);
-            container.innerHTML = '<p class="error">Failed to load relationship types chart</p>';
+            container.innerHTML = `<p class="error" data-i18n="analytics.relationshipTypesLoadFailed">${this.t('analytics.relationshipTypesLoadFailed', 'Failed to load relationship types chart')}</p>`;
         }
     }
 
@@ -5649,7 +6634,7 @@ class MemoryDashboard {
      */
     renderRelationshipTypesChart(container, data) {
         if (!data || Object.keys(data).length === 0) {
-            container.innerHTML = '<p>No relationships found</p>';
+            container.innerHTML = `<p data-i18n="analytics.noRelationshipTypes">${this.t('analytics.noRelationshipTypes', 'No relationships found')}</p>`;
             return;
         }
 
@@ -5696,6 +6681,11 @@ class MemoryDashboard {
         const container = document.getElementById('graphVisualizationContainer');
         if (!container) return;
 
+        // Loads can overlap (Refresh clicked twice, or a select changed mid-load).
+        // Only the most recent one may touch the graph; a slower, older response
+        // must not render over it or clear its state.
+        const requestId = (this._graphLoadId = (this._graphLoadId || 0) + 1);
+
         try {
             const limit = document.getElementById('graphLimitSelect')?.value || 100;
             const minConnections = document.getElementById('graphMinConnectionsSelect')?.value || 1;
@@ -5707,14 +6697,20 @@ class MemoryDashboard {
             }
 
             const data = await this.apiCall(`/analytics/graph-visualization?limit=${limit}&min_connections=${minConnections}`);
+            if (requestId !== this._graphLoadId) return;
 
             if (!data || !data.nodes || data.nodes.length === 0) {
-                container.innerHTML = '<p>No connected memories found. Try lowering the minimum connections filter.</p>';
+                this._clearGraphData();
+                container.innerHTML = `<p data-i18n="analytics.noConnectedMemories">${this.t('analytics.noConnectedMemories', 'No connected memories found. Try lowering the minimum connections filter.')}</p>`;
                 return;
             }
 
             // Store data for fullscreen use
             this.currentGraphData = data;
+            this.graphRingCenterId = null;
+
+            // A reload brings a new node set, so the degree filter starts over.
+            this.minGraphDegree = 1;
 
             // Build the type->color map from the actual data and (re)render the
             // filter pills so every present type is filterable (no orphan "other").
@@ -5724,7 +6720,9 @@ class MemoryDashboard {
             this.renderGraphVisualization(container, data);
         } catch (error) {
             console.error('Failed to load graph visualization:', error);
-            container.innerHTML = '<p class="error">Failed to load graph visualization</p>';
+            if (requestId !== this._graphLoadId) return;
+            this._clearGraphData();
+            container.innerHTML = `<p class="error" data-i18n="analytics.graphLoadFailed">${this.t('analytics.graphLoadFailed', 'Failed to load graph visualization')}</p>`;
         }
     }
 
@@ -5733,7 +6731,7 @@ class MemoryDashboard {
      */
     renderGraphVisualization(container, data) {
         if (!data.nodes || data.nodes.length === 0) {
-            container.innerHTML = '<p>No connected memories found. Try lowering the minimum connections filter.</p>';
+            container.innerHTML = `<p data-i18n="analytics.noConnectedMemories">${this.t('analytics.noConnectedMemories', 'No connected memories found. Try lowering the minimum connections filter.')}</p>`;
             return;
         }
 
@@ -5751,9 +6749,17 @@ class MemoryDashboard {
      * Render graph in a specific container with custom dimensions
      */
     renderGraphVisualizationInContainer(container, data, width, height, isFullscreen) {
+        this._disposeConcentricRingView(isFullscreen);
 
         // PoC (Orrery-style): tear down any prior 3D instance bound to this slot
         this._disposeGraph3D(isFullscreen);
+
+        // Likewise stop the previous 2D simulation for this slot: every re-render
+        // (type pill, degree slider) builds a new one, and the old one would keep
+        // ticking against detached nodes until it cooled on its own.
+        const previousSimulation = isFullscreen ? this.fullscreenSimulation : this.graphSimulation;
+        if (previousSimulation) previousSimulation.stop();
+        container.innerHTML = '';
 
         // Default to 3D once the (ESM, deferred) 3d-force-graph module has set
         // window.ForceGraph3D. Don't cache `false` — the module may still be
@@ -5762,22 +6768,31 @@ class MemoryDashboard {
         if (this.use3DGraph === undefined && typeof window.ForceGraph3D !== 'undefined') {
             this.use3DGraph = true;
         }
-        if (this.use3DGraph && typeof window.ForceGraph3D !== 'undefined') {
+        if (this.graphLayout !== 'rings' && this.use3DGraph && typeof window.ForceGraph3D !== 'undefined') {
             this.render3DGraph(container, data, width, height, isFullscreen);
             return;
         }
 
-        // ----- Legacy 2D D3.js force-directed fallback -----
         // Apply the same type filter + edge-dedup on fresh copies (D3 mutates
         // node/link objects, so never run it on the shared currentGraphData).
         data = this._filterGraphData(data);
+        if (this.graphLayout === 'rings') {
+            this.renderConcentricRingGraph(container, data, width, height, isFullscreen);
+            return;
+        }
 
+        // ----- Legacy 2D D3.js force-directed fallback -----
         // Create SVG
         const svg = d3.select(container)
             .append('svg')
             .attr('width', width)
             .attr('height', height)
-            .attr('viewBox', [0, 0, width, height]);
+            .attr('viewBox', [0, 0, width, height])
+            .on('click', (event) => {
+                if (event.target === svg.node()) {
+                    this.clearGraphFocus(isFullscreen);
+                }
+            });
 
         // Add zoom behavior
         const g = svg.append('g');
@@ -5830,7 +6845,24 @@ class MemoryDashboard {
             .attr('r', d => Math.min(20, 8 + Math.sqrt(d.connections) * 2))
             .attr('fill', d => nodeColors[d.type] || nodeColors['untyped'])
             .style('cursor', 'pointer')
-            .on('click', (event, d) => this.handleGraphNodeClick(event, d))
+            .on('click', (event, d) => {
+                if (event.defaultPrevented) return;
+                event.stopPropagation();
+                if (this._graph2dClickTimer) clearTimeout(this._graph2dClickTimer);
+                this._graph2dClickTimer = setTimeout(() => {
+                    this._graph2dClickTimer = null;
+                    this.setGraphFocus(d, isFullscreen);
+                }, 250);
+            })
+            .on('dblclick', (event, d) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (this._graph2dClickTimer) {
+                    clearTimeout(this._graph2dClickTimer);
+                    this._graph2dClickTimer = null;
+                }
+                this.handleGraphNodeClick(event, d);
+            })
             .call(this.dragBehavior(simulation));
 
         // Adjust text size for large graphs
@@ -5863,7 +6895,7 @@ class MemoryDashboard {
                 .duration(200)
                 .style('opacity', 1);
 
-            tooltip.html(this.formatGraphTooltip(d))
+            tooltip.html(this.formatGraphTooltip(d, this.t('analytics.graphFocusHint', 'Click node to focus; double-click for details')))
                 .style('left', (event.pageX + 10) + 'px')
                 .style('top', (event.pageY - 28) + 'px');
         })
@@ -5897,6 +6929,363 @@ class MemoryDashboard {
             this.graphSimulation = simulation;
             this.graphSvg = svg;
         }
+    }
+
+    /**
+     * Render the filtered graph in BFS-distance rings around the selected node.
+     */
+    _concentricRingNodeRadius(item) {
+        return Math.min(20, 8 + Math.sqrt(item.connections || 1) * 2);
+    }
+
+    renderConcentricRingGraph(container, data, width, height, isFullscreen) {
+        const slot = isFullscreen ? '_fs' : '_main';
+        const svg = d3.select(container)
+            .append('svg')
+            .attr('width', width)
+            .attr('height', height)
+            .attr('viewBox', [0, 0, width, height])
+            .attr('class', 'graph-ring-canvas');
+
+        const g = svg.append('g');
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 4])
+            .on('zoom', event => g.attr('transform', event.transform));
+        svg.call(zoom);
+
+        const nodes = data.nodes.map(node => ({ ...node }));
+        const nodeById = new Map(nodes.map(node => [node.id, node]));
+        const idOf = value => (value && typeof value === 'object') ? value.id : value;
+        const edges = data.edges
+            .map(edge => ({ ...edge, source: idOf(edge.source), target: idOf(edge.target) }))
+            .filter(edge => nodeById.has(edge.source) && nodeById.has(edge.target));
+        const layout = this._calculateConcentricRingLayout(
+            nodes,
+            edges,
+            this.graphRingCenterId,
+            width,
+            height
+        );
+        this.graphRingCenterId = layout.centerId;
+
+        const ringLayer = g.append('g').attr('class', 'graph-ring-guides');
+        const link = g.append('g')
+            .selectAll('line')
+            .data(edges)
+            .join('line')
+            .attr('class', edge => `graph-link link-${edge.relationship_type || 'related'}`)
+            .attr('stroke-width', 1.5);
+        const nodeColors = this.graphTypeColors || { 'untyped': '#9B59B6' };
+        const node = g.append('g')
+            .selectAll('circle')
+            .data(nodes)
+            .join('circle')
+            .attr('class', 'graph-node')
+            .attr('r', item => this._concentricRingNodeRadius(item))
+            .attr('fill', item => nodeColors[item.type] || nodeColors.untyped)
+            .style('cursor', 'pointer');
+        const fontSize = nodes.length > 750 ? '8px' : nodes.length > 500 ? '10px' : '12px';
+        const label = g.append('g')
+            .selectAll('text')
+            .data(nodes)
+            .join('text')
+            .attr('class', 'graph-label')
+            .attr('font-size', fontSize)
+            .attr('fill', isFullscreen ? '#ffffff' : 'currentColor')
+            .attr('dy', -15)
+            .text(item => {
+                const content = item.content || '';
+                return content.length > 20 ? content.substring(0, 20) + '...' : content;
+            });
+        const tooltip = d3.select(container)
+            .append('div')
+            .attr('class', 'graph-tooltip')
+            .style('position', 'absolute')
+            .style('opacity', 0);
+
+        const view = {
+            clickTimer: null,
+            edges,
+            height,
+            isFullscreen,
+            label,
+            link,
+            node,
+            nodeById,
+            nodes,
+            ringLayer,
+            svg,
+            width,
+            zoom
+        };
+        this['ringGraph' + slot] = view;
+        this._applyConcentricRingLayout(view, layout, false);
+
+        node
+            .on('click', (event, item) => {
+                if (event.defaultPrevented) return;
+                event.stopPropagation();
+                if (view.clickTimer) window.clearTimeout(view.clickTimer);
+                view.clickTimer = window.setTimeout(() => {
+                    view.clickTimer = null;
+                    this.recenterConcentricRingGraph(item.id);
+                }, 250);
+            })
+            .on('dblclick', (event, item) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (view.clickTimer) {
+                    window.clearTimeout(view.clickTimer);
+                    view.clickTimer = null;
+                }
+                this.handleGraphNodeClick(event, item);
+            })
+            .on('mouseover', (event, item) => {
+                tooltip.transition().duration(200).style('opacity', 1);
+                tooltip
+                    .html(this.formatGraphTooltip(item, this.t('analytics.graphRingHint', 'Click to center; double-click for details')))
+                    .style('left', (event.pageX + 10) + 'px')
+                    .style('top', (event.pageY - 28) + 'px');
+            })
+            .on('mouseout', () => tooltip.transition().duration(500).style('opacity', 0))
+            .call(this.concentricRingDragBehavior(view));
+    }
+
+    /**
+     * Calculate stable node coordinates by shortest-path distance from a center node.
+     */
+    _calculateConcentricRingLayout(nodes, edges, requestedCenterId, width, height) {
+        const adjacency = new Map(nodes.map(node => [node.id, new Set()]));
+        const nodeById = new Map(nodes.map(node => [node.id, node]));
+        edges.forEach(edge => {
+            adjacency.get(edge.source)?.add(edge.target);
+            adjacency.get(edge.target)?.add(edge.source);
+        });
+        const degree = node => adjacency.get(node.id)?.size || 0;
+        const byDegree = [...nodes].sort((a, b) => degree(b) - degree(a) || String(a.id).localeCompare(String(b.id)));
+        const center = nodes.find(node => node.id === requestedCenterId) || byDegree[0];
+        if (!center) return { centerId: null, outerRadius: 0, positions: new Map(), radii: [] };
+
+        const depths = new Map([[center.id, 0]]);
+        const queue = [center.id];
+        for (let cursor = 0; cursor < queue.length; cursor += 1) {
+            const current = queue[cursor];
+            const nextDepth = depths.get(current) + 1;
+            const neighbors = [...(adjacency.get(current) || [])]
+                .map(id => nodeById.get(id))
+                .filter(Boolean)
+                .sort((a, b) => degree(b) - degree(a) || String(a.id).localeCompare(String(b.id)));
+            neighbors.forEach(neighbor => {
+                if (depths.has(neighbor.id)) return;
+                depths.set(neighbor.id, nextDepth);
+                queue.push(neighbor.id);
+            });
+        }
+
+        let maxDepth = Math.max(0, ...depths.values());
+        const disconnected = byDegree.filter(node => !depths.has(node.id));
+        if (disconnected.length) {
+            maxDepth += 1;
+            disconnected.forEach(node => depths.set(node.id, maxDepth));
+        }
+
+        const rings = new Map();
+        nodes.forEach(node => {
+            const depth = depths.get(node.id);
+            if (!rings.has(depth)) rings.set(depth, []);
+            rings.get(depth).push(node);
+        });
+        rings.forEach(ring => ring.sort(
+            (a, b) => degree(b) - degree(a) || String(a.id).localeCompare(String(b.id))
+        ));
+
+        const cx = width / 2;
+        const cy = height / 2;
+        const nominalRadius = Math.max(0, Math.min(width, height) / 2 - 48);
+        const nominalStep = Math.max(72, nominalRadius / Math.max(1, maxDepth + 0.35));
+        const nodeRadius = node => this._concentricRingNodeRadius(node);
+        const positions = new Map([[center.id, { x: cx, y: cy, depth: 0 }]]);
+        const radii = [];
+        let outerRadius = nodeRadius(center);
+        let previousNodeRadius = nodeRadius(center);
+        let previousRadius = 0;
+        for (let depth = 1; depth <= maxDepth; depth += 1) {
+            const ring = rings.get(depth) || [];
+            const ringNodeRadius = Math.max(10, ...ring.map(nodeRadius));
+            const circumferenceRadius = ring.reduce(
+                (length, node) => length + nodeRadius(node) * 2 + 12,
+                0
+            ) / (2 * Math.PI);
+            const radialRadius = previousRadius + Math.max(
+                nominalStep,
+                previousNodeRadius + ringNodeRadius + 24
+            );
+            const radius = Math.max(circumferenceRadius, radialRadius);
+            radii.push(radius);
+            ring.forEach((node, index) => {
+                const angle = -Math.PI / 2 + (2 * Math.PI * index / Math.max(1, ring.length));
+                positions.set(node.id, {
+                    x: cx + radius * Math.cos(angle),
+                    y: cy + radius * Math.sin(angle),
+                    depth
+                });
+            });
+            previousNodeRadius = ringNodeRadius;
+            previousRadius = radius;
+            outerRadius = Math.max(outerRadius, radius + ringNodeRadius + 28);
+        }
+        return { centerId: center.id, outerRadius, positions, radii };
+    }
+
+    /**
+     * Move both rendered ring views to a new center without another API request.
+     */
+    recenterConcentricRingGraph(centerId) {
+        this.graphRingCenterId = centerId;
+        ['_main', '_fs'].forEach(slot => {
+            const view = this['ringGraph' + slot];
+            if (!view) return;
+            const layout = this._calculateConcentricRingLayout(
+                view.nodes,
+                view.edges,
+                centerId,
+                view.width,
+                view.height
+            );
+            this._applyConcentricRingLayout(view, layout, true);
+        });
+    }
+
+    _applyConcentricRingLayout(view, layout, animate) {
+        view.nodes.forEach(node => {
+            const position = layout.positions.get(node.id);
+            if (position) {
+                node.x = position.x;
+                node.y = position.y;
+                node.ringDepth = position.depth;
+            }
+        });
+        const transition = animate ? d3.transition().duration(650).ease(d3.easeCubicInOut) : null;
+        const move = selection => transition ? selection.transition(transition) : selection;
+
+        const guides = view.ringLayer
+            .selectAll('circle')
+            .data(layout.radii);
+        guides.exit().remove();
+        const mergedGuides = guides.enter()
+            .append('circle')
+            .attr('class', 'graph-ring-guide')
+            .attr('cx', view.width / 2)
+            .attr('cy', view.height / 2)
+            .attr('r', 0)
+            .merge(guides);
+        move(mergedGuides)
+            .attr('cx', view.width / 2)
+            .attr('cy', view.height / 2)
+            .attr('r', radius => radius);
+
+        view.node.classed('ring-center', node => node.id === layout.centerId);
+        move(view.node)
+            .attr('cx', node => node.x)
+            .attr('cy', node => node.y);
+        move(view.label)
+            .attr('x', node => node.x)
+            .attr('y', node => node.y);
+        move(view.link)
+            .attr('x1', edge => view.nodeById.get(edge.source).x)
+            .attr('y1', edge => view.nodeById.get(edge.source).y)
+            .attr('x2', edge => view.nodeById.get(edge.target).x)
+            .attr('y2', edge => view.nodeById.get(edge.target).y);
+
+        const availableDiameter = Math.max(1, Math.min(view.width, view.height) - 64);
+        const contentDiameter = Math.max(1, layout.outerRadius * 2);
+        const scale = Math.min(1, availableDiameter / contentDiameter);
+        view.zoom.scaleExtent([Math.min(0.1, scale), 4]);
+        const fitTransform = d3.zoomIdentity
+            .translate(view.width / 2, view.height / 2)
+            .scale(scale)
+            .translate(-view.width / 2, -view.height / 2);
+        const zoomTarget = transition ? view.svg.transition(transition) : view.svg;
+        zoomTarget.call(view.zoom.transform, fitTransform);
+    }
+
+    _disposeConcentricRingView(isFullscreen) {
+        const slot = isFullscreen ? '_fs' : '_main';
+        const view = this['ringGraph' + slot];
+        if (!view) return;
+        if (view.clickTimer) window.clearTimeout(view.clickTimer);
+        this._interruptConcentricRingTransitions(view);
+        this['ringGraph' + slot] = null;
+    }
+
+    _interruptConcentricRingTransitions(view) {
+        view.svg.interrupt();
+        view.ringLayer.selectAll('circle').interrupt();
+        view.node.interrupt().each(function (node) {
+            const circle = d3.select(this);
+            const x = Number(circle.attr('cx'));
+            const y = Number(circle.attr('cy'));
+            if (Number.isFinite(x)) node.x = x;
+            if (Number.isFinite(y)) node.y = y;
+        });
+        view.label.interrupt()
+            .attr('x', node => node.x)
+            .attr('y', node => node.y);
+        view.link.interrupt()
+            .attr('x1', edge => view.nodeById.get(edge.source).x)
+            .attr('y1', edge => view.nodeById.get(edge.source).y)
+            .attr('x2', edge => view.nodeById.get(edge.target).x)
+            .attr('y2', edge => view.nodeById.get(edge.target).y);
+    }
+
+    _resizeConcentricRingView(view, width, height) {
+        width = Math.max(1, Math.round(width));
+        height = Math.max(1, Math.round(height));
+        if (view.width === width && view.height === height) return;
+        this._interruptConcentricRingTransitions(view);
+        view.width = width;
+        view.height = height;
+        view.svg
+            .attr('width', width)
+            .attr('height', height)
+            .attr('viewBox', [0, 0, width, height]);
+        const layout = this._calculateConcentricRingLayout(
+            view.nodes,
+            view.edges,
+            this.graphRingCenterId,
+            width,
+            height
+        );
+        this._applyConcentricRingLayout(view, layout, false);
+    }
+
+    /**
+     * Keep node dragging available in ring mode. Re-centering restores the calculated positions.
+     */
+    concentricRingDragBehavior(view) {
+        const dashboard = this;
+        const update = () => {
+            view.node.attr('cx', node => node.x).attr('cy', node => node.y);
+            view.label.attr('x', node => node.x).attr('y', node => node.y);
+            view.link
+                .attr('x1', edge => view.nodeById.get(edge.source).x)
+                .attr('y1', edge => view.nodeById.get(edge.source).y)
+                .attr('x2', edge => view.nodeById.get(edge.target).x)
+                .attr('y2', edge => view.nodeById.get(edge.target).y);
+        };
+        return d3.drag()
+            .on('start', function () {
+                dashboard._interruptConcentricRingTransitions(view);
+                d3.select(this).classed('dragging', true);
+            })
+            .on('drag', (event, node) => {
+                node.x = event.x;
+                node.y = event.y;
+                update();
+            })
+            .on('end', function () {
+                d3.select(this).classed('dragging', false);
+            });
     }
 
     /**
@@ -5979,7 +7368,7 @@ class MemoryDashboard {
             .backgroundColor('#01010a')
             .showNavInfo(false)
             .graphData({ nodes, links })
-            .nodeLabel(d => this.formatGraphTooltip(d))
+            .nodeLabel(d => this.formatGraphTooltip(d, this.t('analytics.graphFocusHint', 'Click node to focus; double-click for details')))
             // Soft glowing sprites (not hard spheres) for smooth Orrery-style
             // halos; bloom amplifies the additive falloff.
             .nodeThreeObjectExtend(false)
@@ -6003,22 +7392,52 @@ class MemoryDashboard {
                 return sprite;
             })
             .linkColor(d => edgeColors[d.relationship_type] || edgeColors['related'])
-            .linkOpacity(0.32)
+            .linkOpacity(d => {
+                if (this._graphFocusedNode) {
+                    const s = linkEndId(d.source);
+                    const t = linkEndId(d.target);
+                    const fId = this._graphFocusedNode.id;
+                    if (s === fId || t === fId) return 0.55;
+                    if (this._graphFocusNeighbors.has(s) && this._graphFocusNeighbors.has(t)) return 0.16;
+                    return 0.025;
+                }
+                return 0.32;
+            })
             .linkCurvature(0.25)
             .linkWidth(d => {
-                if (!highlightNode) return 0.4;
-                const hit = linkEndId(d.source) === highlightNode || linkEndId(d.target) === highlightNode;
+                if (this._graphFocusedNode) {
+                    const s = linkEndId(d.source);
+                    const t = linkEndId(d.target);
+                    const fId = this._graphFocusedNode.id;
+                    if (s === fId || t === fId) return 1.8;
+                    if (this._graphFocusNeighbors.has(s) && this._graphFocusNeighbors.has(t)) return 0.8;
+                    return 0.15;
+                }
+                const hNode = Graph.__highlightNode !== undefined ? Graph.__highlightNode : highlightNode;
+                if (!hNode) return 0.4;
+                const hit = linkEndId(d.source) === hNode || linkEndId(d.target) === hNode;
                 return hit ? 1.5 : 0.15;
             })
             .linkDirectionalParticles(d => {
-                if (!highlightNode) return 0;
-                const hit = linkEndId(d.source) === highlightNode || linkEndId(d.target) === highlightNode;
+                if (this._graphFocusedNode) {
+                    const s = linkEndId(d.source);
+                    const t = linkEndId(d.target);
+                    const fId = this._graphFocusedNode.id;
+                    return (s === fId || t === fId) ? 3 : 0;
+                }
+                const hNode = Graph.__highlightNode !== undefined ? Graph.__highlightNode : highlightNode;
+                if (!hNode) return 0;
+                const hit = linkEndId(d.source) === hNode || linkEndId(d.target) === hNode;
                 return hit ? 3 : 0;
             })
             .linkDirectionalParticleSpeed(0.01)
             .onNodeHover(node => {
-                highlightNode = node ? node.id : null;
                 container.style.cursor = node ? 'pointer' : '';
+                highlightNode = node ? node.id : null;
+                Graph.__highlightNode = highlightNode;
+                if (this._graphFocusedNode) {
+                    return; // Retain focus opacities while focus mode is active
+                }
                 // Dim non-neighbor sprites; relight neighbors
                 nodes.forEach(n => {
                     if (!n.__mat) return;
@@ -6029,7 +7448,27 @@ class MemoryDashboard {
                 Graph.linkWidth(Graph.linkWidth())
                     .linkDirectionalParticles(Graph.linkDirectionalParticles());
             })
-            .onNodeClick(node => this.handleGraph3DNodeClick(node));
+            .onNodeClick(node => {
+                const now = Date.now();
+                if (node.__lastClick && (now - node.__lastClick) < 300) {
+                    if (this._graphClickTimer) {
+                        clearTimeout(this._graphClickTimer);
+                        this._graphClickTimer = null;
+                    }
+                    node.__lastClick = 0;
+                    this.handleGraph3DNodeClick(node);
+                    return;
+                }
+                node.__lastClick = now;
+                if (this._graphClickTimer) clearTimeout(this._graphClickTimer);
+                this._graphClickTimer = setTimeout(() => {
+                    this._graphClickTimer = null;
+                    this.setGraphFocus(node, isFullscreen);
+                }, 250);
+            })
+            .onBackgroundClick(() => {
+                this.clearGraphFocus(isFullscreen);
+            });
 
         this['graph3d' + slot] = Graph;
 
@@ -6111,7 +7550,82 @@ class MemoryDashboard {
                 connection_types: e.connection_types
             });
         }
-        return { nodes, edges };
+
+        // Degree = number of distinct neighbours, counted on the collapsed,
+        // type-filtered edges so it describes the graph that is actually drawn
+        // (a mutual A<->B pair counts once; hidden types do not count).
+        const neighbours = new Map();
+        for (const e of edges) {
+            if (!neighbours.has(e.source)) neighbours.set(e.source, new Set());
+            if (!neighbours.has(e.target)) neighbours.set(e.target, new Set());
+            neighbours.get(e.source).add(e.target);
+            neighbours.get(e.target).add(e.source);
+        }
+        let maxDegree = 1;
+        neighbours.forEach(s => { if (s.size > maxDegree) maxDegree = s.size; });
+
+        // Clamp to the current range (e.g. a type was hidden and the top degree
+        // dropped); the slider shows the value that is actually applied.
+        const minDegree = Math.min(this.minGraphDegree || 1, maxDegree);
+        this._syncDegreeSlider(maxDegree, minDegree);
+
+        // At 1 the filter is off, so nodes whose only neighbours were hidden by
+        // a type pill still show up exactly as before this slider existed.
+        if (minDegree <= 1) return { nodes, edges };
+
+        const degreeOf = (id) => neighbours.has(id) ? neighbours.get(id).size : 0;
+        const keptNodes = nodes.filter(n => degreeOf(n.id) >= minDegree);
+        const keptIds = new Set(keptNodes.map(n => n.id));
+        return {
+            nodes: keptNodes,
+            edges: edges.filter(e => keptIds.has(e.source) && keptIds.has(e.target))
+        };
+    }
+
+    /**
+     * Reflect the degree filter's range and value in the slider. Setting
+     * .value/.max from script does not fire 'input', so this cannot re-enter
+     * the render path.
+     */
+    _syncDegreeSlider(maxDegree, value) {
+        const slider = document.getElementById('graphDegreeSlider');
+        if (!slider) return;
+        slider.max = String(maxDegree);
+        slider.value = String(value);
+        slider.disabled = maxDegree <= 1;
+        const label = document.getElementById('graphDegreeValue');
+        if (label) label.textContent = String(value);
+    }
+
+    /**
+     * Slider handler: set the minimum degree and re-render client-side, the
+     * same way the type pills do (no API call).
+     */
+    handleGraphDegreeChange(event) {
+        this.minGraphDegree = Number(event.target.value) || 1;
+        const label = document.getElementById('graphDegreeValue');
+        if (label) label.textContent = String(this.minGraphDegree);
+        this.applyGraphTypeFilter();
+    }
+
+    /**
+     * Drop the loaded graph and put the degree filter back to idle. Used when a
+     * reload returns nothing or fails, so the slider and the type pills cannot
+     * redraw the previous graph over the empty-result or error message.
+     */
+    _clearGraphData() {
+        this.clearGraphFocus(false);
+        this.clearGraphFocus(true);
+        this._disposeConcentricRingView(false);
+        if (this._graphFullscreenOpen) {
+            this.exitGraphFullscreen();
+        } else {
+            this._disposeConcentricRingView(true);
+        }
+        this.currentGraphData = null;
+        this.minGraphDegree = 1;
+        this.graphRingCenterId = null;
+        this._syncDegreeSlider(1, 1);
     }
 
     /**
@@ -6121,6 +7635,8 @@ class MemoryDashboard {
      */
     applyGraphTypeFilter() {
         if (!this.currentGraphData) return;
+        this.clearGraphFocus(false);
+        this.clearGraphFocus(true);
         if (this.use3DGraph) {
             const f = this._filterGraphData(this.currentGraphData);
             const graphData = {
@@ -6132,8 +7648,7 @@ class MemoryDashboard {
                 if (g) g.graphData(graphData);
             });
         } else {
-            const container = document.getElementById('graphVisualizationContainer');
-            if (container) this.renderGraphVisualization(container, this.currentGraphData);
+            this._renderCurrentGraphViews();
         }
     }
 
@@ -6263,10 +7778,16 @@ class MemoryDashboard {
     }
 
     _updateRotateButton() {
-        const text = this.graphRotationPaused ? 'Play' : 'Pause';
+        const [key, fallback] = this.graphRotationPaused
+            ? ['analytics.rotatePlay', 'Play']
+            : ['analytics.rotatePause', 'Pause'];
         ['graphRotateLabel', 'graphFullscreenRotateLabel'].forEach(id => {
-            const el = document.getElementById(id);
-            if (el) el.textContent = text;
+            this.setTranslatedText(document.getElementById(id), key, fallback);
+        });
+        const enabled = Boolean(this.use3DGraph) && this.graphLayout !== 'rings';
+        ['graphRotateBtn', 'graphFullscreenRotateBtn'].forEach(id => {
+            const button = document.getElementById(id);
+            if (button) button.disabled = !enabled;
         });
     }
 
@@ -6362,6 +7883,7 @@ class MemoryDashboard {
      * stopping its render loop and our auto-rotation rAF.
      */
     _disposeGraph3D(isFullscreen) {
+        this.clearGraphFocus(isFullscreen);
         const slot = isFullscreen ? '_fs' : '_main';
         if (this['graph3dRotate' + slot]) {
             this['graph3dRotate' + slot].alive = false;
@@ -6377,17 +7899,334 @@ class MemoryDashboard {
     }
 
     /**
+     * Focus mode on node click: highlight the node and its immediate neighbors,
+     * dim background elements, retarget edge tiers, and display a floating HUD.
+     *
+     * Adapted from second-brain-os (MIT License) by undefined-ui:
+     * focusSet neighborhood filtering, multi-tier edge opacity retargeting,
+     * and floating inspector HUD.
+     */
+    setGraphFocus(node, isFullscreen) {
+        if (!node) return;
+        this._graphFocusedNode = node;
+        const slot = isFullscreen ? '_fs' : '_main';
+        const graph3d = this['graph3d' + slot];
+        const linkEndId = (end) => (end && end.id !== undefined) ? end.id : end;
+
+        // Build neighbor set and categorized groups
+        const focusSet = new Set([node.id]);
+        const neighborGroups = {};
+        const nodeColors = this.graphTypeColors || { 'untyped': '#9B59B6' };
+
+        // Determine source data (use active 3D data or filtered 2D data)
+        const gData = graph3d ? graph3d.graphData() : null;
+        const filtered2d = this.currentGraphData ? this._filterGraphData(this.currentGraphData) : { nodes: [], edges: [] };
+        const nodes = (gData && gData.nodes) || filtered2d.nodes || [];
+        const links = (gData && gData.links) || filtered2d.edges || [];
+        const nodesById = new Map((nodes || []).map(n => [n.id, n]));
+
+        (links || []).forEach(l => {
+            const sId = linkEndId(l.source);
+            const tId = linkEndId(l.target);
+            const rel = l.relationship_type || 'related';
+
+            if (sId === node.id) {
+                focusSet.add(tId);
+                if (!neighborGroups[rel]) neighborGroups[rel] = [];
+                const targetNode = nodesById.get(tId);
+                if (targetNode) {
+                    neighborGroups[rel].push({ node: targetNode, direction: 'out' });
+                }
+            } else if (tId === node.id) {
+                focusSet.add(sId);
+                if (!neighborGroups[rel]) neighborGroups[rel] = [];
+                const sourceNode = nodesById.get(sId);
+                if (sourceNode) {
+                    neighborGroups[rel].push({ node: sourceNode, direction: 'in' });
+                }
+            }
+        });
+
+        this._graphFocusNeighbors = focusSet;
+
+        // Update 3D materials if 3D graph is active
+        if (graph3d && gData) {
+            (gData.nodes || []).forEach(n => {
+                if (!n.__mat) return;
+                const isSelf = n.id === node.id;
+                const inFocus = focusSet.has(n.id);
+                n.__mat.opacity = isSelf ? 1.0 : (inFocus ? 0.85 : 0.12);
+                n.__mat.color.set(inFocus ? n.__baseColor : '#223047');
+            });
+            graph3d.linkOpacity(graph3d.linkOpacity())
+                   .linkWidth(graph3d.linkWidth())
+                   .linkDirectionalParticles(graph3d.linkDirectionalParticles());
+        }
+
+        // Update 2D SVG if 2D graph is active
+        this._apply2DFocusState(node, focusSet, isFullscreen);
+
+        // Render HUD
+        this._renderFocusHUD(node, neighborGroups, nodeColors, isFullscreen);
+    }
+
+    /**
+     * Clear active graph focus mode and remove floating HUD.
+     */
+    clearGraphFocus(_isFullscreen) {
+        this._graphFocusedNode = null;
+        this._graphFocusNeighbors.clear();
+        if (this._graphClickTimer) {
+            clearTimeout(this._graphClickTimer);
+            this._graphClickTimer = null;
+        }
+        if (this._graph2dClickTimer) {
+            clearTimeout(this._graph2dClickTimer);
+            this._graph2dClickTimer = null;
+        }
+
+        // Re-evaluate 3D link and particle accessors across both views with focus cleared
+        ['_main', '_fs'].forEach(slot => {
+            const graph3d = this['graph3d' + slot];
+            if (graph3d && typeof graph3d.graphData === 'function') {
+                graph3d.__highlightNode = null;
+                const gData = graph3d.graphData();
+                (gData.nodes || []).forEach(n => {
+                    if (!n.__mat) return;
+                    n.__mat.opacity = 0.75;
+                    n.__mat.color.set(n.__baseColor);
+                });
+                graph3d.linkOpacity(graph3d.linkOpacity())
+                       .linkWidth(graph3d.linkWidth())
+                       .linkDirectionalParticles(graph3d.linkDirectionalParticles());
+            }
+        });
+
+        this._clear2DFocusState(false);
+        this._clear2DFocusState(true);
+        this._removeFocusHUD(false);
+        this._removeFocusHUD(true);
+    }
+
+    /**
+     * Render floating neighbor HUD in the active graph container.
+     */
+    _renderFocusHUD(node, neighborGroups, nodeColors, isFullscreen) {
+        const container = isFullscreen
+            ? document.getElementById('graphFullscreenContainer')
+            : document.getElementById('graphVisualizationContainer');
+        if (!container) return;
+
+        this._removeFocusHUD(isFullscreen);
+
+        const hud = document.createElement('div');
+        hud.className = 'graph-focus-hud';
+        hud.id = isFullscreen ? 'graphFocusHUDFullscreen' : 'graphFocusHUD';
+        hud.addEventListener('click', (e) => e.stopPropagation());
+
+        const typeColor = nodeColors[node.type || 'untyped'] || '#9B59B6';
+        const titleText = node.title || node.content || node.id;
+        const displayTitle = titleText.length > 70 ? titleText.substring(0, 67) + '...' : titleText;
+
+        let totalNeighbors = 0;
+        Object.values(neighborGroups).forEach(arr => { totalNeighbors += arr.length; });
+
+        let groupsHtml = '';
+        const edgeColors = {
+            'causes': '#E74C3C',
+            'fixes': '#27AE60',
+            'contradicts': '#E67E22',
+            'supports': '#3498DB',
+            'follows': '#9B59B6',
+            'related': '#95A5A6'
+        };
+
+        if (totalNeighbors === 0) {
+            groupsHtml = `<div class="graph-focus-hud-empty">${this.escapeHtml(this.t('analytics.graphNoNeighbors', 'No direct neighbors in current filter'))}</div>`;
+        } else {
+            for (const [rel, items] of Object.entries(neighborGroups)) {
+                const relColor = edgeColors[rel] || edgeColors['related'];
+                const relLabel = this.t(`analytics.${rel}`, rel);
+                groupsHtml += `
+                    <div class="graph-focus-hud-group">
+                        <div class="graph-focus-hud-group-title">
+                            <span><span style="color: ${relColor};">●</span> ${this.escapeHtml(relLabel)}</span>
+                            <span>(${items.length})</span>
+                        </div>
+                        ${items.map(item => {
+                            const nColor = nodeColors[item.node.type || 'untyped'] || '#9B59B6';
+                            const arrow = item.direction === 'out' ? '→' : '←';
+                            const label = item.node.title || item.node.content || item.node.id;
+                            const shortLabel = label.length > 35 ? label.substring(0, 32) + '...' : label;
+                            return `
+                                <button type="button" class="graph-focus-hud-item" data-node-id="${this.escapeHtml(item.node.id)}" title="${this.escapeHtml(label)}">
+                                    <span style="color: var(--text-muted); font-size: 0.8rem;">${arrow}</span>
+                                    <span style="color: ${nColor}; font-size: 0.75rem;">●</span>
+                                    <span class="graph-focus-hud-item-label">${this.escapeHtml(shortLabel)}</span>
+                                </button>
+                            `;
+                        }).join('')}
+                    </div>
+                `;
+            }
+        }
+
+        const minLabel = this.t('analytics.minimize', 'Minimize');
+        hud.innerHTML = `
+            <div class="graph-focus-hud-header">
+                <div class="graph-focus-hud-header-info">
+                    <h4 class="graph-focus-hud-title">${this.escapeHtml(displayTitle)}</h4>
+                    <span class="graph-focus-hud-type" style="background: ${typeColor}22; color: ${typeColor}; border: 1px solid ${typeColor}44;">
+                        ${this.escapeHtml(node.type || 'untyped')}
+                    </span>
+                </div>
+                <div class="graph-focus-hud-header-btns">
+                    <button type="button" class="graph-focus-hud-toggle" title="${this.escapeHtml(minLabel)}" aria-label="${this.escapeHtml(minLabel)}">─</button>
+                    <button type="button" class="graph-focus-hud-close" title="${this.escapeHtml(this.t('analytics.graphCloseFocus', 'Exit Focus Mode (Esc)'))}" aria-label="Close">&times;</button>
+                </div>
+            </div>
+            <div class="graph-focus-hud-actions">
+                <button type="button" class="graph-focus-hud-btn" id="graphFocusViewDetailsBtn">
+                    ${this.escapeHtml(this.t('analytics.graphViewDetails', 'View Full Details'))}
+                </button>
+            </div>
+            <div class="graph-focus-hud-body">
+                <div style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 0.35rem; font-weight: 600;">
+                    ${this.escapeHtml(this.t('analytics.graphConnectedNeighbors', 'Connected Neighbors ({count})', { count: totalNeighbors }))}
+                </div>
+                ${groupsHtml}
+            </div>
+        `;
+
+        const toggleBtn = hud.querySelector('.graph-focus-hud-toggle');
+        const updateToggleIcon = () => {
+            const isCollapsed = hud.classList.contains('collapsed');
+            if (toggleBtn) {
+                toggleBtn.textContent = isCollapsed ? '▲' : '─';
+                const label = isCollapsed
+                    ? this.t('analytics.expand', 'Expand')
+                    : this.t('analytics.minimize', 'Minimize');
+                toggleBtn.title = label;
+                toggleBtn.setAttribute('aria-label', label);
+            }
+        };
+
+        toggleBtn?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            hud.classList.toggle('collapsed');
+            updateToggleIcon();
+        });
+
+        hud.querySelector('.graph-focus-hud-header')?.addEventListener('click', (e) => {
+            if (hud.classList.contains('collapsed') && !e.target.closest('.graph-focus-hud-close')) {
+                e.stopPropagation();
+                hud.classList.remove('collapsed');
+                updateToggleIcon();
+            }
+        });
+
+        hud.querySelector('.graph-focus-hud-close')?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.clearGraphFocus(isFullscreen);
+        });
+
+        hud.querySelector('#graphFocusViewDetailsBtn')?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.handleGraph3DNodeClick(node);
+        });
+
+        hud.querySelectorAll('.graph-focus-hud-item').forEach(itemEl => {
+            itemEl.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const targetId = itemEl.getAttribute('data-node-id');
+                const slot = isFullscreen ? '_fs' : '_main';
+                const gData = this['graph3d' + slot]?.graphData();
+                const filtered2d = this.currentGraphData ? this._filterGraphData(this.currentGraphData) : { nodes: [], edges: [] };
+                const nodes = (gData && gData.nodes) || filtered2d.nodes || [];
+                const targetNode = nodes.find(n => n.id === targetId);
+                if (targetNode) {
+                    this.setGraphFocus(targetNode, isFullscreen);
+                }
+            });
+        });
+
+        container.appendChild(hud);
+    }
+
+    _removeFocusHUD(isFullscreen) {
+        const id = isFullscreen ? 'graphFocusHUDFullscreen' : 'graphFocusHUD';
+        const existing = document.getElementById(id);
+        if (existing) existing.remove();
+    }
+
+    _apply2DFocusState(node, focusSet, isFullscreen) {
+        const container = isFullscreen
+            ? document.getElementById('graphFullscreenContainer')
+            : document.getElementById('graphVisualizationContainer');
+        if (!container) return;
+        const svg = d3.select(container).select('svg');
+        if (svg.empty()) return;
+
+        const linkEndId = (end) => (end && end.id !== undefined) ? end.id : end;
+
+        svg.selectAll('.graph-node')
+            .transition().duration(200)
+            .style('opacity', d => (d.id === node.id ? 1.0 : (focusSet.has(d.id) ? 0.85 : 0.12)));
+
+        svg.selectAll('.graph-label')
+            .transition().duration(200)
+            .style('opacity', d => (focusSet.has(d.id) ? 1.0 : 0.12));
+
+        svg.selectAll('.graph-link')
+            .transition().duration(200)
+            .style('stroke-opacity', d => {
+                const s = linkEndId(d.source), t = linkEndId(d.target);
+                if (s === node.id || t === node.id) return 0.55;
+                if (focusSet.has(s) && focusSet.has(t)) return 0.16;
+                return 0.025;
+            })
+            .style('stroke-width', d => {
+                const s = linkEndId(d.source), t = linkEndId(d.target);
+                if (s === node.id || t === node.id) return 2.5;
+                if (focusSet.has(s) && focusSet.has(t)) return 1.2;
+                return 0.4;
+            });
+    }
+
+    _clear2DFocusState(isFullscreen) {
+        const container = isFullscreen
+            ? document.getElementById('graphFullscreenContainer')
+            : document.getElementById('graphVisualizationContainer');
+        if (!container) return;
+        const svg = d3.select(container).select('svg');
+        if (svg.empty()) return;
+
+        svg.selectAll('.graph-node')
+            .transition().duration(200)
+            .style('opacity', 1.0);
+
+        svg.selectAll('.graph-label')
+            .transition().duration(200)
+            .style('opacity', 1.0);
+
+        svg.selectAll('.graph-link')
+            .transition().duration(200)
+            .style('stroke-opacity', 0.6)
+            .style('stroke-width', 1.5);
+    }
+
+    /**
      * Open the memory detail modal for a clicked 3D node.
      */
     async handleGraph3DNodeClick(node) {
         if (!node) return;
         try {
-            this.showToast('Loading memory details...', 'info');
+            this.showToast(this.t('toast.memoryDetailsLoading', 'Loading memory details...'), 'info');
             const memory = await this.apiCall(`/memories/${node.id}`);
             this.showMemoryDetails(memory);
         } catch (error) {
             console.error('Failed to load memory:', error);
-            this.showToast('Failed to load memory details', 'error');
+            this.showToast(this.t('toast.memoryDetailsLoadFailed', 'Failed to load memory details'), 'error');
         }
     }
 
@@ -6396,11 +8235,55 @@ class MemoryDashboard {
      */
     toggleGraphDimension() {
         this.use3DGraph = !this.use3DGraph;
+        if (this.use3DGraph) {
+            this.graphLayout = 'force';
+            this._updateGraphLayoutButtons();
+        }
         const label = document.getElementById('graphDimensionLabel');
         if (label) label.textContent = this.use3DGraph ? '3D' : '2D';
-        if (this.currentGraphData) {
-            const container = document.getElementById('graphVisualizationContainer');
-            if (container) this.renderGraphVisualization(container, this.currentGraphData);
+        this._updateRotateButton();
+        this._renderCurrentGraphViews();
+    }
+
+    /**
+     * Switch between the force-directed and concentric-ring 2D layouts.
+     */
+    setGraphLayout(layout) {
+        if (layout !== 'force' && layout !== 'rings') return;
+        this.graphLayout = layout;
+        if (layout === 'rings') {
+            this.use3DGraph = false;
+            const dimensionLabel = document.getElementById('graphDimensionLabel');
+            if (dimensionLabel) dimensionLabel.textContent = '2D';
+        }
+        this._updateGraphLayoutButtons();
+        this._updateRotateButton();
+        this._renderCurrentGraphViews();
+    }
+
+    _updateGraphLayoutButtons() {
+        document.querySelectorAll('[data-graph-layout]').forEach(button => {
+            const active = button.dataset.graphLayout === this.graphLayout;
+            button.classList.toggle('active', active);
+            button.setAttribute('aria-pressed', String(active));
+        });
+    }
+
+    _renderCurrentGraphViews() {
+        if (!this.currentGraphData) return;
+        const container = document.getElementById('graphVisualizationContainer');
+        if (container) this.renderGraphVisualization(container, this.currentGraphData);
+        if (this._graphFullscreenOpen) {
+            const fullscreen = document.getElementById('graphFullscreenContainer');
+            if (fullscreen) {
+                this.renderGraphVisualizationInContainer(
+                    fullscreen,
+                    this.currentGraphData,
+                    fullscreen.clientWidth || window.innerWidth,
+                    fullscreen.clientHeight || Math.max(200, window.innerHeight - 64),
+                    true
+                );
+            }
         }
     }
 
@@ -6414,7 +8297,7 @@ class MemoryDashboard {
     /**
      * Format enhanced tooltip with quality score, timestamps, and metadata
      */
-    formatGraphTooltip(d) {
+    formatGraphTooltip(d, interactionHint = this.t('analytics.graphNodeHint', 'Click node to view full memory')) {
         const qualityClass = d.quality_score >= 0.7 ? 'high' : d.quality_score >= 0.4 ? 'medium' : 'low';
         const qualityColor = qualityClass === 'high' ? '#50C878' : qualityClass === 'medium' ? '#F39C12' : '#E24A4A';
 
@@ -6435,34 +8318,28 @@ class MemoryDashboard {
             <div class="graph-tooltip-content">${this.escapeHtml(d.content || '')}</div>
             <div class="graph-tooltip-meta">
                 <div class="tooltip-row">
-                    <span class="tooltip-icon">🔗</span>
                     <span>${d.connections} connection${d.connections !== 1 ? 's' : ''}</span>
                 </div>
                 <div class="tooltip-row">
-                    <span class="tooltip-icon">⭐</span>
                     <span style="color: ${qualityColor}">Quality: ${(d.quality_score * 100).toFixed(0)}%</span>
                 </div>
                 <div class="tooltip-row">
-                    <span class="tooltip-icon">📅</span>
                     <span>Created ${formatRelativeTime(createdDate)}</span>
                 </div>
                 ${updatedDate ? `
                 <div class="tooltip-row">
-                    <span class="tooltip-icon">🔄</span>
                     <span>Updated ${formatRelativeTime(updatedDate)}</span>
                 </div>
                 ` : ''}
                 ${d.tags && d.tags.length > 0 ? `
                 <div class="tooltip-row">
-                    <span class="tooltip-icon">🏷️</span>
-                    <span>${this.escapeHtml(d.tags.join(', '))}</span>
+                    <span>Tags: ${this.escapeHtml(d.tags.join(', '))}</span>
                 </div>
                 ` : ''}
                 <div class="tooltip-row tooltip-id">
-                    <span class="tooltip-icon">🔑</span>
-                    <span title="${d.id}">${d.id.substring(0, 12)}...</span>
+                    <span title="${d.id}">ID ${d.id.substring(0, 12)}...</span>
                 </div>
-                <div class="tooltip-hint">💡 Click node to view full memory</div>
+                <div class="tooltip-hint">${this.escapeHtml(interactionHint)}</div>
             </div>
         `;
     }
@@ -6479,7 +8356,7 @@ class MemoryDashboard {
 
         try {
             // Show loading indicator
-            this.showToast('Loading memory details...', 'info');
+            this.showToast(this.t('toast.memoryDetailsLoading', 'Loading memory details...'), 'info');
 
             // Fetch full memory details
             const memory = await this.apiCall(`/memories/${nodeData.id}`);
@@ -6489,7 +8366,7 @@ class MemoryDashboard {
 
         } catch (error) {
             console.error('Failed to load memory:', error);
-            this.showToast('Failed to load memory details', 'error');
+            this.showToast(this.t('toast.memoryDetailsLoadFailed', 'Failed to load memory details'), 'error');
         }
     }
 
@@ -6550,7 +8427,22 @@ class MemoryDashboard {
             const d = dims();
             const g = this.graph3d_fs;
             if (g) { g.width(d.w); g.height(d.h); }
+            if (this.ringGraph_fs) {
+                this._resizeConcentricRingView(this.ringGraph_fs, d.w, d.h);
+            }
         };
+        if (typeof ResizeObserver !== 'undefined') {
+            this._fsResizeObserver = new ResizeObserver(entries => {
+                const entry = entries[0];
+                if (!entry || !this.ringGraph_fs) return;
+                this._resizeConcentricRingView(
+                    this.ringGraph_fs,
+                    entry.contentRect.width,
+                    entry.contentRect.height
+                );
+            });
+            this._fsResizeObserver.observe(container);
+        }
         this._fsChangeHandler = () => {
             this._fsResizeHandler();
             // User left OS fullscreen (Esc / gesture) -> close the overlay too
@@ -6563,7 +8455,14 @@ class MemoryDashboard {
 
         // Escape key (for the non-OS-fullscreen fallback path)
         this.fullscreenEscapeHandler = (e) => {
-            if (e.key === 'Escape') this.exitGraphFullscreen();
+            if (e.key === 'Escape') {
+                if (this._graphFocusedNode) {
+                    this.clearGraphFocus(true);
+                    e.stopImmediatePropagation();
+                    return;
+                }
+                this.exitGraphFullscreen();
+            }
             if (e.key === 'l') {
                 e.preventDefault();
                 this.toggleGraphLegend();
@@ -6593,6 +8492,7 @@ class MemoryDashboard {
         }
 
         // Clear container
+        this._disposeConcentricRingView(true);
         document.getElementById('graphFullscreenContainer').innerHTML = '';
 
         // Remove resize / fullscreenchange handlers
@@ -6603,6 +8503,10 @@ class MemoryDashboard {
         if (this._fsChangeHandler) {
             document.removeEventListener('fullscreenchange', this._fsChangeHandler);
             this._fsChangeHandler = null;
+        }
+        if (this._fsResizeObserver) {
+            this._fsResizeObserver.disconnect();
+            this._fsResizeObserver = null;
         }
 
         // Remove escape listener
@@ -6647,7 +8551,7 @@ class MemoryDashboard {
 
         } catch (error) {
             console.error('Failed to load quality analytics:', error);
-            this.showToast('Failed to load quality analytics', 'error');
+            this.showToast(this.t('quality.analytics.loadFailed', 'Failed to load quality analytics'), 'error');
         }
     }
 
@@ -6671,9 +8575,13 @@ class MemoryDashboard {
         this.qualityDistributionChart = new Chart(ctx, {
             type: 'bar',
             data: {
-                labels: ['Low (<0.5)', 'Medium (0.5-0.7)', 'High (≥0.7)'],
+                labels: [
+                    this.t('quality.chart.distribution.low', 'Low (<0.5)'),
+                    this.t('quality.chart.distribution.medium', 'Medium (0.5-0.7)'),
+                    this.t('quality.chart.distribution.high', 'High (≥0.7)')
+                ],
                 datasets: [{
-                    label: 'Number of Memories',
+                    label: this.t('quality.chart.distribution.memoriesLabel', 'Number of Memories'),
                     data: [
                         data.low_quality_count,
                         data.medium_quality_count,
@@ -6700,7 +8608,7 @@ class MemoryDashboard {
                         beginAtZero: true,
                         title: {
                             display: true,
-                            text: 'Count',
+                            text: this.t('quality.chart.distribution.countLabel', 'Count'),
                             color: textColor
                         },
                         ticks: {
@@ -6746,14 +8654,14 @@ class MemoryDashboard {
         // Friendly provider names
         const friendlyLabels = labels.map(label => {
             switch(label) {
-                case 'ONNXRankerModel': return 'Local SLM';
+                case 'ONNXRankerModel': return this.t('quality.chart.providers.local', 'Local SLM');
                 case 'GroqEvaluator': return 'Groq API';
                 case 'GeminiEvaluator': return 'Gemini API';
-                case 'ImplicitSignalsEvaluator': return 'Implicit Only';
-                case 'local': return 'Local SLM';
+                case 'ImplicitSignalsEvaluator': return this.t('quality.chart.providers.implicit', 'Implicit Only');
+                case 'local': return this.t('quality.chart.providers.local', 'Local SLM');
                 case 'groq': return 'Groq API';
                 case 'gemini': return 'Gemini API';
-                case 'implicit': return 'Implicit Only';
+                case 'implicit': return this.t('quality.chart.providers.implicit', 'Implicit Only');
                 default: return label;
             }
         });
@@ -6822,14 +8730,13 @@ class MemoryDashboard {
         if (!container) return;
 
         if (!memories || memories.length === 0) {
-            container.innerHTML = '<p class="text-muted">No memories available</p>';
+            container.innerHTML = `<p class="text-muted" data-i18n="quality.noMemories">${this.escapeHtml(this.t('quality.noMemories', 'No memories available'))}</p>`;
             return;
         }
 
         const html = memories.map(memory => `
             <div class="memory-preview" data-content-hash="${memory.content_hash}">
                 <div class="quality-badge quality-tier-high">
-                    <span class="quality-star">★</span>
                     <span class="quality-score">${memory.quality_score.toFixed(2)}</span>
                 </div>
                 <div class="memory-content">${this.escapeHtml(memory.content)}</div>
@@ -6848,14 +8755,13 @@ class MemoryDashboard {
         if (!container) return;
 
         if (!memories || memories.length === 0) {
-            container.innerHTML = '<p class="text-muted">No memories available</p>';
+            container.innerHTML = `<p class="text-muted" data-i18n="quality.noMemories">${this.escapeHtml(this.t('quality.noMemories', 'No memories available'))}</p>`;
             return;
         }
 
         const html = memories.map(memory => `
             <div class="memory-preview" data-content-hash="${memory.content_hash}">
                 <div class="quality-badge quality-tier-low">
-                    <span class="quality-star">★</span>
                     <span class="quality-score">${memory.quality_score.toFixed(2)}</span>
                 </div>
                 <div class="memory-content">${this.escapeHtml(memory.content)}</div>
@@ -6881,8 +8787,7 @@ class MemoryDashboard {
         return `
             <div class="quality-badge quality-tier-${tier}"
                  data-quality-score="${score.toFixed(2)}"
-                 title="Quality Score: ${score.toFixed(2)} (${provider})">
-                <span class="quality-star">★</span>
+                 title="${this.escapeHtml(this.t('quality.badgeTitle', 'Quality score {score} ({provider})', { score: score.toFixed(2), provider }))}">
                 <span class="quality-score">${score.toFixed(2)}</span>
             </div>
         `;
@@ -6897,14 +8802,14 @@ class MemoryDashboard {
                     rating: rating,
                     feedback: ''
                 });
-            this.showToast(`Rating saved! Quality score updated to ${result.new_quality_score.toFixed(2)}`, 'success');
+            this.showToast(this.t('toast.ratingSaved', 'Rating saved, quality score is now {score}', { score: result.new_quality_score.toFixed(2) }), 'success');
 
             // Refresh memory display if viewing details
             // This would refresh the modal or current view
 
         } catch (error) {
             console.error('Failed to rate memory:', error);
-            this.showToast('Failed to save rating', 'error');
+            this.showToast(this.t('toast.ratingSaveFailed', 'Failed to save rating'), 'error');
         }
     }
 
@@ -6914,7 +8819,7 @@ class MemoryDashboard {
      * Show confirmation dialog for bulk operations
      */
     async confirmBulkOperation(message) {
-        return confirm(`⚠️ WARNING: ${message}
+        return confirm(`Warning: ${message}
 
 This action cannot be undone. Are you sure?`);
     }
@@ -6941,6 +8846,7 @@ This action cannot be undone. Are you sure?`);
             clearInterval(this._syncMonitorInterval);
             this._syncMonitorInterval = null;
         }
+        this.stopLiveRefresh();
     }
 }
 

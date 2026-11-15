@@ -179,6 +179,22 @@ SUPPORTED_MODELS = {
         'output_classes': ['low', 'medium', 'high'],
         'description': 'Absolute quality assessment (recommended, eliminates self-matching bias)'
     },
+    'Xenova/bge-reranker-base': {
+        'hf_name': 'Xenova/bge-reranker-base',
+        'type': 'cross-encoder',
+        'size_mb': 266,
+        'inputs': ['input_ids', 'attention_mask'],
+        'output_classes': None,
+        'description': 'bge reranker int8 (issue #1602 service-path bench model)'
+    },
+    'Xenova/ms-marco-MiniLM-L-6-v2': {
+        'hf_name': 'Xenova/ms-marco-MiniLM-L-6-v2',
+        'type': 'cross-encoder',
+        'size_mb': 23,
+        'inputs': ['input_ids', 'attention_mask', 'token_type_ids'],
+        'output_classes': None,
+        'description': 'ms-marco MiniLM int8 (issue #1602 service-path bench model)'
+    },
     'ms-marco-MiniLM-L-6-v2': {
         'hf_name': 'cross-encoder/ms-marco-MiniLM-L-6-v2',
         'type': 'cross-encoder',  # Query-document relevance ranking
@@ -209,3 +225,33 @@ def validate_model_selection(model_name: str) -> dict:
             f"Supported models: {list(SUPPORTED_MODELS.keys())}"
         )
     return SUPPORTED_MODELS[model_name]
+
+
+# --- Quality model composition (#1312) -------------------------------------
+# quality_score is a single materialized "effective" value written from two
+# origin fields kept separately in metadata: computed_quality (machine) and
+# user_rating (human -1/0/+1). Consumers that read quality_score need no change;
+# retention (forgetting) reads computed_quality directly so a human down-vote
+# de-ranks search without changing the keep/forget verdict.
+
+# Human rating -1/0/+1 mapped to a search-facing effective value. A thumbs-down
+# de-ranks hard (0.25) without pinning to an absolute floor (0.0); a single
+# thumbs-up (0.9) does not claim more certainty than the scorer's top band.
+USER_RATING_TO_QUALITY = {-1: 0.25, 0: 0.5, 1: 0.9}
+
+
+def effective_quality(computed=None, user_rating=None) -> float:
+    """Compose the materialized effective quality_score from the two origins.
+
+    Human rating wins when present (mapped via USER_RATING_TO_QUALITY); otherwise
+    the machine computed_quality; otherwise the 0.5 default. computed_quality is
+    never consumed here in a way that erases it — callers keep it as its own field.
+    """
+    if user_rating is not None:
+        try:
+            return USER_RATING_TO_QUALITY[int(user_rating)]
+        except (KeyError, ValueError, TypeError):
+            pass
+    if computed is not None:
+        return float(computed)
+    return 0.5

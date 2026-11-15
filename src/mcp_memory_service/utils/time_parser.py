@@ -74,10 +74,125 @@ PATTERNS = {
     "specific_date": re.compile(r'(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?'),
     "full_date": re.compile(r'(\d{4})-(\d{1,2})-(\d{1,2})'),
     "named_period": re.compile(r'(spring|summer|winter|fall|autumn|christmas|new\s*year|valentine|halloween|thanksgiving|spring\s*break|summer\s*break|winter\s*break)'),    "half_year": re.compile(r'(first|second)\s+half\s+of\s+(\d{4})'),
-    "quarter": re.compile(r'(first|second|third|fourth|1st|2nd|3rd|4th)\s+quarter(?:\s+of\s+(\d{4}))?'),
+    "quarter": re.compile(r'(first|second|third|fourth|1st|2nd|3rd|4th)\s+quarter(?:\s+(?:of\s+)?(\d{4}))?'),
 }
 
 _MAX_TIME_QUERY_LEN = 500  # guard against ReDoS on user-supplied input
+_RANGE_ENDPOINT_PATTERNS = (
+    "relative_days", "relative_weeks", "relative_months", "relative_years",
+    "last_n_periods", "last_period", "this_period", "month_name", "recent",
+    "specific_date", "full_date", "named_period", "half_year", "quarter",
+)
+_RANGE_DAYPART_ENDPOINT = re.compile(
+    rf"(?:{PATTERNS['relative_days'].pattern})\s+(?:in\s+the\s+)?"
+    rf"(?:{PATTERNS['time_of_day'].pattern})|"
+    rf"(?:{PATTERNS['time_of_day'].pattern})\s+(?:yesterday|today)"
+)
+_RANGE_ENDPOINT = "|".join(
+    f"(?:{PATTERNS[name].pattern})" for name in _RANGE_ENDPOINT_PATTERNS
+)
+_RANGE_MONTH_YEAR = re.compile(rf"{PATTERNS['month_name'].pattern}\s+(\d{{4}})")
+PATTERNS["from_to"] = re.compile(
+    rf"from\s+(\S[^&]{{0,50}}?)\s+to\s+"
+    rf"({_RANGE_DAYPART_ENDPOINT.pattern}|{_RANGE_MONTH_YEAR.pattern}|{_RANGE_ENDPOINT}|now)"
+    # Sentence punctuation may follow a complete endpoint; only "\s|$" made
+    # "march 2024." fall back to "march" and dropped "2024-03-31." entirely.
+    rf"(?=[\s.,;:!?]|$)"
+)
+
+
+def _resolve_yearless_date(
+    month: int, day: int, today: date, anchor_year: Optional[int] = None
+) -> Optional[date]:
+    """Resolve a yearless month/day to its most recent real occurrence.
+
+    Without ``anchor_year``, return the latest occurrence on or before
+    ``today``, walking back over years where the combination does not exist
+    (Feb 29 in non-leap years). With ``anchor_year``, return the occurrence
+    in or before that year so both ends of a date range can share one year.
+
+    Returns None when no calendar year contains the month/day (e.g. 2/30).
+    """
+    latest = today if anchor_year is None else date(anchor_year, 12, 31)
+    for year in range(latest.year, latest.year - 200, -1):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            continue
+        if candidate <= latest:
+            return candidate
+    return None
+
+_YEARLESS_MD = re.compile(r"^(\d{1,2})[/-](\d{1,2})$")
+
+
+def _anchor_yearless_range(
+    start_expr: str,
+    end_expr: str,
+    start_ts: Optional[float],
+    end_ts: Optional[float],
+) -> Tuple[Optional[float], Optional[float]]:
+    """Keep a yearless ``between M/D and M/D`` range in one annual window.
+
+    Independent rollback of both sides can invert a range ("between 1/31
+    and 12/25" in September) or stretch it across extra years ("between
+    2/29 and 12/25": Feb 29 walks back to the previous leap year while
+    the end stays in its own most recent occurrence). Anchor both ends on
+    the end's window instead: a same-year window starts in the end's
+    year, a cross-year window the year before, and when the start
+    month/day does not exist there (Feb 29 in a non-leap year) the whole
+    window moves back to the year where it does (issue #1347).
+
+    Sides that are not a bare yearless month/day (explicit years, month
+    names, relative expressions) keep the original behavior: only the
+    inverted-yearless-start re-anchor applies to them.
+    """
+    if start_ts is None or end_ts is None:
+        return start_ts, end_ts
+    start_match = _YEARLESS_MD.match(start_expr.strip().lower())
+    end_match = _YEARLESS_MD.match(end_expr.strip().lower())
+    if start_match is None or end_match is None:
+        if start_ts > end_ts:
+            end_year = datetime.fromtimestamp(end_ts).year
+            reanchored_ts, _ = parse_time_expression(start_expr, base_year=end_year)
+            if reanchored_ts is not None and reanchored_ts <= end_ts:
+                start_ts = reanchored_ts
+        return start_ts, end_ts
+    sm, sd = int(start_match.group(1)), int(start_match.group(2))
+    em, ed = int(end_match.group(1)), int(end_match.group(2))
+    today = date.today()
+    end_year = datetime.fromtimestamp(end_ts).year
+    cross_year = (sm, sd) > (em, ed)
+    start = _resolve_yearless_date(
+        sm, sd, today, end_year - 1 if cross_year else end_year
+    )
+    if start is None:
+        return start_ts, end_ts
+    end = _resolve_yearless_date(
+        em, ed, today, start.year + 1 if cross_year else start.year
+    )
+    if end is None or end < start:
+        return start_ts, end_ts
+    return (
+        datetime.combine(start, time.min).timestamp(),
+        datetime.combine(end, time.max).timestamp(),
+    )
+
+
+def _parse_range_side(expr: str) -> Tuple[Optional[float], Optional[float]]:
+    """Parse one end of a ``from X to Y`` range.
+
+    ``now`` means today, and a month name with a year ("march 2024") keeps
+    that year instead of resolving to the most recent such month.
+    """
+    expr = expr.strip()
+    if expr == "now":
+        expr = "today"
+    month_year = _RANGE_MONTH_YEAR.fullmatch(expr)
+    if month_year:
+        return get_month_range(month_year.group(1), int(month_year.group(2)))
+    return parse_time_expression(expr)
+
 
 def _calculate_season_date_range(
     period: str,
@@ -118,12 +233,16 @@ def _calculate_season_date_range(
 
     return start_dt, end_dt
 
-def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]:
+def parse_time_expression(
+    query: str, base_year: Optional[int] = None
+) -> Tuple[Optional[float], Optional[float]]:
     """
     Parse a natural language time expression and return timestamp range.
 
     Args:
         query: A natural language query with time expressions
+        base_year: Optional year to resolve yearless dates/quarters against,
+            used to keep both ends of a date range inside one calendar year
 
     Returns:
         Tuple of (start_timestamp, end_timestamp), either may be None
@@ -143,8 +262,30 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
             end_expr = date_range_match.group(2)
             start_ts, _ = parse_time_expression(start_expr)
             _, end_ts = parse_time_expression(end_expr)
+            # Both sides roll back independently; keep the result inside
+            # one annual window (see _anchor_yearless_range).
+            start_ts, end_ts = _anchor_yearless_range(
+                start_expr, end_expr, start_ts, end_ts
+            )
             return start_ts, end_ts
-        
+
+        # Documented recall example. Ends that are not times fall through
+        # ("from Alice to Bob yesterday" is still yesterday).
+        from_to_match = PATTERNS["from_to"].search(query)
+        if from_to_match:
+            start_expr = from_to_match.group(1)
+            end_expr = from_to_match.group(2)
+            start_ts, _ = _parse_range_side(start_expr)
+            _, end_ts = _parse_range_side(end_expr)
+            if start_ts is not None and end_ts is not None:
+                start_ts, end_ts = _anchor_yearless_range(
+                    start_expr, end_expr, start_ts, end_ts
+                )
+                # An inverted window ("from march to january") falls through
+                # to the single-expression parse, as before this pattern.
+                if start_ts <= end_ts:
+                    return start_ts, end_ts
+
         # Check for full ISO dates (YYYY-MM-DD) FIRST
         full_date_match = PATTERNS["full_date"].search(query)
         if full_date_match:
@@ -161,17 +302,28 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
         # Check for specific dates (MM/DD/YYYY)
         specific_date_match = PATTERNS["specific_date"].search(query)
         if specific_date_match:
-            month, day, year = specific_date_match.groups()
+            month, day, year_str = specific_date_match.groups()
             month = int(month)
             day = int(day)
+            year_given = year_str is not None
             current_year = datetime.now().year
-            year = int(year) if year else current_year
+            year = int(year_str) if year_given else current_year
             # Handle 2-digit years
-            if year and year < 100:
+            if year_given and year < 100:
                 year = 2000 + year if year < 50 else 1900 + year
-                
+
             try:
-                specific_date = date(year, month, day)
+                if year_given:
+                    specific_date = date(year, month, day)
+                else:
+                    # A yearless date refers to its most recent (past)
+                    # occurrence, same rule as holidays and seasons. Feb 29
+                    # resolves to the previous leap year instead of failing.
+                    specific_date = _resolve_yearless_date(
+                        month, day, date.today(), base_year
+                    )
+                    if specific_date is None:
+                        raise ValueError(f"no calendar year contains {month:02d}/{day:02d}")
                 start_dt = datetime.combine(specific_date, time.min)
                 end_dt = datetime.combine(specific_date, time.max)
                 return start_dt.timestamp(), end_dt.timestamp()
@@ -302,14 +454,21 @@ def parse_time_expression(query: str) -> Tuple[Optional[float], Optional[float]]
         if quarter_match:
             quarter = quarter_match.group(1).lower()
             year_str = quarter_match.group(2)
-            year = int(year_str) if year_str else datetime.now().year
-            
+            year_given = year_str is not None
+            year = int(year_str) if year_given else datetime.now().year
+
             # Map textual quarter to number
-            quarter_num = {"first": 1, "1st": 1, "second": 2, "2nd": 2, 
+            quarter_num = {"first": 1, "1st": 1, "second": 2, "2nd": 2,
                           "third": 3, "3rd": 3, "fourth": 4, "4th": 4}[quarter]
-            
-            # Calculate quarter start and end dates
+
+            # A yearless quarter that has not started yet this year refers to
+            # its most recent (past) occurrence, same rule as holidays/seasons.
             quarter_month = (quarter_num - 1) * 3 + 1
+            if not year_given:
+                if base_year is not None:
+                    year = base_year
+                elif date(year, quarter_month, 1) > date.today():
+                    year -= 1
             start_dt = datetime(year, quarter_month, 1, 0, 0, 0)
             
             if quarter_month + 3 > 12:
@@ -514,8 +673,8 @@ def get_this_period_range(period: str) -> Tuple[float, float]:
         
     return start_dt.timestamp(), end_dt.timestamp()
 
-def get_month_range(month_name: str) -> Tuple[float, float]:
-    """Get timestamp range for a named month."""
+def get_month_range(month_name: str, year: Optional[int] = None) -> Tuple[float, float]:
+    """Get timestamp range for a named month (the most recent one unless ``year`` is given)."""
     # Map month name to number
     month_map = {
         "january": 1, "february": 2, "march": 3, "april": 4,
@@ -525,11 +684,12 @@ def get_month_range(month_name: str) -> Tuple[float, float]:
     
     if month_name in month_map:
         month_num = month_map[month_name]
-        current_year = datetime.now().year
-        
-        # If the month is in the future for this year, use last year
-        current_month = datetime.now().month
-        year = current_year if month_num <= current_month else current_year - 1
+        if year is None:
+            current_year = datetime.now().year
+
+            # If the month is in the future for this year, use last year
+            current_month = datetime.now().month
+            year = current_year if month_num <= current_month else current_year - 1
         
         # Get first and last day of the month
         first_day = date(year, month_num, 1)
@@ -560,24 +720,24 @@ def get_named_period_range(period_name: str) -> Tuple[Optional[float], Optional[
             month = info["month"]
             day = info["day"]
             window = info.get("window", 1)  # Default 1-day window
-            
-            # Special case for Thanksgiving (fourth Thursday in November)
-            if day == -1 and month == 11:  # Thanksgiving
-                # Find the fourth Thursday in November
-                first_day = date(current_year, 11, 1)
-                # Find first Thursday
-                first_thursday = first_day + timedelta(days=((3 - first_day.weekday()) % 7))
-                # Fourth Thursday is 3 weeks later
-                thanksgiving = first_thursday + timedelta(weeks=3)
-                day = thanksgiving.day
-            
-            # Check if the holiday has passed this year
-            is_past = (current_month > month or 
-                        (current_month == month and current_day > day + window))
-                        
-            year = current_year if not is_past else current_year - 1
-            target_date = date(year, month, day)
-            
+
+            def _holiday_date(year: int) -> date:
+                if day == -1 and month == 11:  # Thanksgiving
+                    # Fourth Thursday in November
+                    first_day = date(year, 11, 1)
+                    first_thursday = first_day + timedelta(days=((3 - first_day.weekday()) % 7))
+                    return first_thursday + timedelta(weeks=3)
+                return date(year, month, day)
+
+            # Use the most recent occurrence whose window has started. One that
+            # is still ahead holds no memories yet. Next year's is checked
+            # first because New Year's window opens in late December.
+            today = date(current_year, current_month, current_day)
+            for year in (current_year + 1, current_year, current_year - 1):
+                target_date = _holiday_date(year)
+                if target_date - timedelta(days=window) <= today:
+                    break
+
             # Create date range with window
             start_date = target_date - timedelta(days=window)
             end_date = target_date + timedelta(days=window)
@@ -653,11 +813,16 @@ def extract_time_expression(query: str) -> Tuple[str, Tuple[Optional[float], Opt
         Tuple of (cleaned_query, (start_timestamp, end_timestamp))
         The cleaned_query has time expressions removed
     """
-    # Check for time expressions
+    # Check for time expressions. A daypart has to travel with the day:
+    # parse_time_expression("yesterday morning") is 05:00-11:59, but matching
+    # only "yesterday" left the whole day and the word "morning" as search text.
+    # "recently" must be tried before "recent" or the match stops at "recent"
+    # and the search text keeps "ly".
+    daypart = "morning|afternoon|evening|night|noon|midnight"
     time_expressions = [
-        r'\b\d+\s+days?\s+ago\b',
-        r'\byesterday\b',
-        r'\btoday\b',
+        rf'\b\d+\s+days?\s+ago(?:\s+(?:{daypart}))?\b',
+        rf'\b(?:{daypart})\s+(?:yesterday|today)\b',
+        rf'\b(?:yesterday|today)(?:\s+(?:{daypart}))?\b',
         r'\b\d+\s+weeks?\s+ago\b',
         r'\b\d+\s+months?\s+ago\b',
         r'\b\d+\s+years?\s+ago\b',
@@ -666,7 +831,7 @@ def extract_time_expression(query: str) -> Tuple[str, Tuple[Optional[float], Opt
         r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\b',
         r'\bbetween\s+.+?\s+and\s+.+?(?:\s|$)',
         r'\bin\s+the\s+(morning|afternoon|evening|night|noon|midnight)\b',
-        r'\brecent|lately|recently\b',
+        r'\b(?:recently|lately|recent)\b',
         r'\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b',
         r'\b\d{4}-\d{1,2}-\d{1,2}\b',
         r'\b(spring|summer|winter|fall|autumn|christmas|new\s*year|valentine|halloween|thanksgiving|spring\s*break|summer\s*break|winter\s*break)\b',
@@ -718,4 +883,89 @@ def parse_boundary(value: str) -> float:
         return dt.timestamp()
     if len(value.strip()) == 10:  # date only: host-local calendar day
         return dt.timestamp()
+    return dt.replace(tzinfo=timezone.utc).timestamp()
+
+
+def statement_time(value) -> Optional[float]:
+    """Epoch of a transcript or ``metadata.source_time`` timestamp, or None (#1858).
+
+    Accepts ISO strings (offset honoured, naive read as UTC, as parse_boundary
+    does), epoch seconds and epoch milliseconds, as numbers or numeric strings.
+    Anything else is None: a missing time must leave the caller's old behaviour
+    in place, never order a statement as if it were from 1970.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            try:
+                return parse_boundary(text)
+            except ValueError:
+                return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        if not seconds > 0:  # also rejects NaN
+            return None
+        return seconds / 1000.0 if seconds > 1e11 else seconds  # 1e11 s is year 5138
+    return None
+
+
+def memory_statement_time(memory) -> Optional[float]:
+    """When a stored memory was said, or None if unknown (#1858).
+
+    ``metadata.source_time`` counts only while ``metadata.source_content_hash``
+    still names the memory's content: a versioned update inherits custom
+    metadata, so after an edit the inherited time would describe text that is
+    gone. Otherwise ``created_at``, the time the current content was written.
+    """
+    metadata = getattr(memory, "metadata", None)
+    if isinstance(metadata, dict) and metadata.get("source_content_hash") == memory.content_hash:
+        said = statement_time(metadata.get("source_time"))
+        if said is not None:
+            return said
+    return statement_time(getattr(memory, "created_at", None))
+
+
+def parse_as_of(value: str) -> float:
+    """Epoch for an ``as_of`` point-in-time query (issue #1724).
+
+    Knowledge-time semantics: "what did the store contain at this instant".
+    Accepts ISO dates/datetimes plus the Carrel-style shorthands, where a
+    year or month means the **last day of that period**:
+
+    - ``"2024"`` -> 2024-12-31 23:59:59
+    - ``"2024-03"`` -> last day of March 2024, 23:59:59
+    - ``"2024-03-15"`` -> end of that calendar day (so memories created
+      during the day are included: ``created_at <= as_of``)
+    - full datetimes -> the exact instant (UTC unless an offset is given)
+
+    Bare dates resolve against the host's local day, matching parse_boundary.
+    Raises ValueError on unparseable input.
+    """
+    text = value.strip()
+    if re.fullmatch(r"\d{4}", text):  # YYYY -> Dec 31, end of day
+        year = int(text)
+        dt = datetime(year, 12, 31, 23, 59, 59, 999999)
+        return dt.timestamp()  # host-local, like parse_boundary's bare dates
+    if re.fullmatch(r"\d{4}-\d{2}", text):  # YYYY-MM -> last day of month, end of day
+        year, month = int(text[:4]), int(text[5:7])
+        if not 1 <= month <= 12:
+            raise ValueError(f"Invalid as_of month: {value!r}. Use YYYY, YYYY-MM, or an ISO date.")
+        # Last instant of the month: timestamps keep sub-second precision, so
+        # the bound includes the whole final second.
+        if month == 12:
+            last = datetime(year, 12, 31, 23, 59, 59, 999999)
+        else:
+            last = datetime(year, month + 1, 1, 23, 59, 59, 999999) - timedelta(days=1)
+        return last.timestamp()  # host-local, like parse_boundary's bare dates
+    dt = datetime.fromisoformat(text)  # raises ValueError when unparseable
+    if dt.tzinfo is not None:
+        return dt.timestamp()
+    if len(text) == 10:  # bare YYYY-MM-DD -> end of that calendar day
+        return dt.replace(hour=23, minute=59, second=59, microsecond=999999).timestamp()
     return dt.replace(tzinfo=timezone.utc).timestamp()

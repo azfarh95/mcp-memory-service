@@ -67,6 +67,16 @@ Welcome to the comprehensive documentation for MCP Memory Service - a Model Cont
 
 - **[Memory Metadata API](api/memory-metadata-api.md)** - Advanced metadata operations
 - **[Tag Standardization](api/tag-standardization.md)** - Tag schema and conventions
+- **[Token-Efficient Retrieval](guides/token-efficient-retrieval.md)** - Keep retrieval cheap in long sessions
+- **[Memory Type Ontology](memory-ontology.md)** - Built-in taxonomy and the `MCP_CUSTOM_MEMORY_TYPES` env var
+- **[Team Setup](setup-guide.md#path-4-full-stack)** - Full-stack path for shared deployments
+- **[Wiki](https://github.com/doobidoo/mcp-memory-service/wiki)** - Programmatic usage and long-form guides
+
+### 🎬 Media & External
+
+- **[Technical Video Demo (2 min)](https://www.youtube.com/watch?v=veJME5qVu-A)** - Performance, architecture, AI/ML intelligence
+- **[Ask DeepWiki](https://deepwiki.com/doobidoo/mcp-memory-service)** - AI-powered documentation assistant
+- **[MCP Starter Kit](https://kruppster57.gumroad.com/l/glbhd)** - Build your own MCP server using the patterns from this project
 
 ### 🛠️ Development & Technical
 
@@ -95,20 +105,23 @@ MCP Memory Service enables persistent, semantic memory for AI applications throu
 ### Key Features
 
 - ✅ **Semantic Memory Storage**: Store and retrieve memories using natural language
-- ✅ **Multi-Client Access**: Share memories across Claude Desktop, VS Code, and other MCP clients
+- ✅ **Multi-Client Access**: Share memories across Claude Desktop, VS Code, Kiro CLI, and other MCP clients
 - ✅ **Flexible Storage**: Choose SQLite-vec (local/dev), Cloudflare (cloud/edge), or Hybrid (production)
-- ✅ **Cross-Platform**: Native support for macOS (Intel & Apple Silicon), Windows, and Linux
+- ✅ **NLI Cascade**: Advanced contradiction resolution using cascade reasoning (`MCP_NLI_BACKEND=cascade`)
+- ✅ **Semantic Deduplication**: Automatic vector similarity deduplication (`MCP_SEMANTIC_DEDUP_ENABLED=true`). `MCP_SEMANTIC_DEDUP_MODE=supersede` stores an updated fact and retires the match; the default `reject` is unchanged.
+- ✅ **Entity Tag Control**: Filter entity tags with include/exclude patterns (`MCP_ENTITY_TAG_INCLUDE` / `MCP_ENTITY_TAG_EXCLUDE`)
+- ✅ **Autonomous Session Harvesting**: Automatic session discovery and harvesting (`MCP_HARVEST_SCHEDULE`)
+- ✅ **Decay & Retention Policies**: Dynamic memory lifecycle management and custom retention (`MCP_DECAY_ENABLED`)
+- ✅ **Multi-Language Web GUI**: Full localization across multiple languages with dark/light themes and real-time delta-sync status
+- ✅ **Cross-Platform**: Native support for macOS (Intel & Apple Silicon), Windows, and Linux (Python 3.11+)
 - ✅ **Docker Ready**: Complete containerization support with multiple deployment options
 - ✅ **Hardware Optimized**: Automatic detection and optimization for available hardware (CUDA, MPS, DirectML)
 - ✅ **Production Ready**: HTTP/SSE API, authentication, monitoring, and scaling features
 
-### Recent Updates
+### Release History
 
-- **v0.2.2+**: Enhanced multi-client support with automatic MCP application detection
-- **SQLite-vec Backend**: Lightweight local backend with ~5 ms reads — default for development and single-user setups
-- **Homebrew Integration**: Native support for Homebrew-installed PyTorch on macOS
-- **Docker Improvements**: Fixed boot loops, added multiple deployment configurations
-- **HTTP/SSE API**: Real-time multi-client communication with Server-Sent Events
+Every release is in [CHANGELOG.md](../CHANGELOG.md); older entries live in
+[docs/archive/CHANGELOG-HISTORIC.md](archive/CHANGELOG-HISTORIC.md).
 
 ## Getting Help
 
@@ -133,13 +146,6 @@ We welcome contributions! See the [Development Guide](technical/development.md) 
 - Running tests
 - Submitting pull requests
 - Code style and conventions
-
-## Version History
-
-- **Latest**: Enhanced documentation organization, consolidated guides, improved navigation
-- **v0.2.2**: Multi-client improvements, SQLite-vec backend, Homebrew integration
-- **v0.2.1**: Docker deployment fixes, HTTP/SSE API enhancements
-- **v0.2.0**: Multi-client support, cross-platform compatibility improvements
 
 ---
 

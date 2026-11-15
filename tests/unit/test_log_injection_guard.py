@@ -47,6 +47,85 @@ GUARDED_MODULES = [
     "mcp_memory_service/storage/hybrid.py",
     "mcp_memory_service/config/storage.py",
     "mcp_memory_service/web/app.py",
+    "mcp_memory_service/storage/milvus.py",
+    "mcp_memory_service/config/base.py",
+    "mcp_memory_service/server/handlers/memory.py",
+    "mcp_memory_service/storage/graph.py",
+    "mcp_memory_service/storage/mixins/migrations.py",
+    "mcp_memory_service/storage/mixins/embeddings.py",
+    "mcp_memory_service/discovery/client.py",
+    "mcp_memory_service/discovery/mdns_service.py",
+    "mcp_memory_service/sync/importer.py",
+    "mcp_memory_service/sync/exporter.py",
+    "mcp_memory_service/backup/scheduler.py",
+    "mcp_memory_service/web/api/analytics.py",
+    "mcp_memory_service/storage/mixins/base.py",
+    "mcp_memory_service/storage/mixins/metadata.py",
+    "mcp_memory_service/web/oauth/middleware.py",
+    "mcp_memory_service/web/oauth/storage/sqlite.py",
+    "mcp_memory_service/health/integrity.py",
+    "mcp_memory_service/models/memory.py",
+    "mcp_memory_service/storage/mixins/delete.py",
+    "mcp_memory_service/api/client.py",
+    "mcp_memory_service/api/operations.py",
+    "mcp_memory_service/api/sync_wrapper.py",
+    "mcp_memory_service/storage/mixins/store.py",
+    "mcp_memory_service/utils/db_utils.py",
+    "mcp_memory_service/utils/health_check.py",
+    "mcp_memory_service/utils/debug.py",
+    "mcp_memory_service/utils/content_splitter.py",
+    "mcp_memory_service/server/handlers/utility.py",
+    "mcp_memory_service/server/handlers/documents.py",
+    "mcp_memory_service/web/api/server.py",
+    "mcp_memory_service/web/api/mcp.py",
+    "mcp_memory_service/web/api/oauth_status.py",
+    "mcp_memory_service/web/api/quality.py",
+    "mcp_memory_service/web/api/memories.py",
+    "mcp_memory_service/web/sse.py",
+    "mcp_memory_service/server/environment.py",
+    "mcp_memory_service/server/cache_manager.py",
+    "mcp_memory_service/server/client_detection.py",
+    "mcp_memory_service/utils/cache_manager.py",
+    "mcp_memory_service/mcp_server.py",
+    "mcp_memory_service/lm_studio_compat.py",
+    "mcp_memory_service/embeddings/onnx_embeddings.py",
+    "mcp_memory_service/embeddings/external_api.py",
+    "mcp_memory_service/config/search.py",
+    "mcp_memory_service/config/quality.py",
+    "mcp_memory_service/quality/metadata_codec.py",
+    "mcp_memory_service/quality/ai_evaluator.py",
+    "mcp_memory_service/config/backup.py",
+    "mcp_memory_service/config/oauth.py",
+    "mcp_memory_service/config/ontology.py",
+    "mcp_memory_service/ingestion/semtools_loader.py",
+    "mcp_memory_service/ingestion/json_loader.py",
+    "mcp_memory_service/ingestion/csv_loader.py",
+    "mcp_memory_service/ingestion/text_loader.py",
+    "mcp_memory_service/ingestion/pdf_loader.py",
+    "mcp_memory_service/ingestion/chunker.py",
+    "mcp_memory_service/ingestion/registry.py",
+    "mcp_memory_service/reasoning/inference.py",
+    "mcp_memory_service/reasoning/entity_linker.py",
+    "mcp_memory_service/reasoning/nli.py",
+    "mcp_memory_service/reasoning/multi_strategy.py",
+    "mcp_memory_service/harvest/parser.py",
+    "mcp_memory_service/harvest/patterns/__init__.py",
+    "mcp_memory_service/harvest/harvester.py",
+    "mcp_memory_service/harvest/extractor.py",
+    "mcp_memory_service/harvest/auto_capture.py",
+    "mcp_memory_service/server_impl.py",
+    "mcp_memory_service/utils/system_detection.py",
+    "mcp_memory_service/web/oauth/discovery.py",
+    "mcp_memory_service/web/oauth/storage/factory.py",
+    "mcp_memory_service/storage/milvus_graph.py",
+    "mcp_memory_service/models/ontology.py",
+    "mcp_memory_service/config/documents.py",
+    "mcp_memory_service/consolidation/associations.py",
+    "mcp_memory_service/storage/migration_runner.py",
+    "mcp_memory_service/sync/litestream_config.py",
+    "mcp_memory_service/utils/directory_ingestion.py",
+    "mcp_memory_service/consolidation/quarantine.py",
+    "mcp_memory_service/consolidation/relationship_inference.py",
 ]
 
 # The levels check 6.5 looks at, verbatim.
@@ -63,7 +142,145 @@ EXTERNAL_NAMES = frozenset({
     "result", "response", "payload", "data",
     "content", "content_hash", "tag", "tags",
     "query", "params", "path", "message", "msg",
+    # Looks like a counter, but reaches find_connected() straight from an MCP
+    # tool's arguments dict (mcp_server.py, server/handlers/graph.py) with no
+    # int coercion or clamp on that path, so a caller can hand it text. Its one
+    # guarded logger call (storage/graph.py) is already wrapped; listing the
+    # name keeps a later unwrap from passing the ratchet green.
+    "max_hops",
+    # The ServiceDetails a mDNS listener builds from another host's announcement
+    # (discovery/mdns_service.py): its name and url are chosen by that host. The
+    # object name is listed rather than `name`/`url`, which are ordinary internal
+    # identifiers elsewhere in the guarded modules.
+    "service_details",
+    # What the importer (sync/importer.py) is handed from outside: the path of
+    # each export file passed on the command line, and the machine name the
+    # export itself declares in its metadata. The per-source summary loop is
+    # named `source_machine` for this reason; a bare `source` stays unlisted,
+    # it is an ordinary internal identifier elsewhere.
+    "json_file",
+    "source_machine",
+    # The backup service (backup/scheduler.py) logs names it did not choose:
+    # the `filename` a caller hands restore_backup(), and each backup["filename"]
+    # list_backups() reads off the backups directory. The name the service
+    # generates itself is `backup_filename`, a different token, and it stays
+    # unlisted on purpose.
+    "filename",
+    # What storage/mixins/base.py logs that it did not produce: the `json_str`
+    # excerpt `_safe_json_loads` prints on a decode error is the `metadata`
+    # column read back off a row; `pragma_name`/`pragma_value` are split out of
+    # `MCP_MEMORY_SQLITE_PRAGMAS` (migrations.py wraps the same pair already);
+    # `db_path` is the configured path, as #1394 listed the backup paths.
+    "json_str",
+    "pragma_name",
+    "pragma_value",
+    "db_path",
+    # What web/oauth/middleware.py logs about the caller during authentication,
+    # read back out of the token's claims or the token store: `scope` is what
+    # the caller asked for when it authorized; `client_id` is generated by the
+    # server at registration, but it is still data the log did not produce.
+    "client_id",
+    "scope",
+    # web/oauth/storage/sqlite.py logs the authorization `code` a client
+    # presents to the token endpoint when it turns out to be already consumed.
+    # It arrives in the request body, so it is outside data like the two above.
+    # No other guarded module logs a bare `code` (`status_code` is a different
+    # token), so listing it decides for nobody else.
+    "code",
+    # web/sse.py logs the address a connection came from, taken off the request.
+    "client_ip",
+    # ...and the Last-Event-ID header the client resumes from.
+    "last_event_id",
+    # What server/environment.py logs about the host it runs on: the venv and
+    # site-packages paths come from the filesystem and `site`, and the installed
+    # version is whatever the package metadata says. `path` is listed above;
+    # the source version is the package's own constant and stays unlisted.
+    "venv_path",
+    "user_path",
+    "installed_version",
+    # The path health/integrity.py exports surviving memories to, built from the database location.
+    "export_path",
+    # What storage/mixins/store.py logs when the backend fails while it stores or purges:
+    # the error of an embedding delete, and the message built from a transaction error.
+    "vec_err",
+    "error_msg",
+    # The errors utils/db_utils.py logs while it validates, reads and repairs a backend.
+    "init_error",
+    "embed_error",
+    "stats_error",
+    "cache_key", "HTTP_HOST",
+    # Output of the git and pip commands web/api/server.py runs during an update.
+    "git_output",
+    "pip_output",
+    # What embeddings/onnx_embeddings.py logs about a custom model, read from
+    # the environment: the Hub repo id (`MCP_ONNX_MODEL_REPO`, or built from the
+    # model name) and the cache directory derived from that name. `model_name`
+    # itself stays unlisted: quality/onnx_ranker.py logs it bare in `%`-style
+    # calls and is not guarded yet, so listing the name would decide for it.
+    "_hf_repo",
+    "_model_dir",
+    # The three strings config/search.py, config/quality.py and config/backup.py
+    # take verbatim (lower-cased) from the environment and log at import time.
+    # The numeric settings next to them come out of safe_get_*_env or float()
+    # and stay unlisted.
+    "MCP_HYBRID_FUSION_METHOD",
+    "MCP_QUALITY_AI_PROVIDER",
+    "BACKUP_INTERVAL",
+    # The document a caller asks the ingestion/ loaders to read: every loader
+    # logs it when it starts and when the parser fails. No guarded module logs
+    # the name bare in a %-style call, so listing it decides for nobody else.
+    # `error_msg` above already covers the stderr of the semtools subprocess.
+    "file_path",
+    # What harvest/parser.py and harvest/patterns/ log about files they did not
+    # name: the session or pattern file (`filepath`) and the `memory_type` key
+    # read out of a pattern YAML. No other guarded module logs either bare.
+    "filepath",
+    "memory_type",
+    # An entity name EntityExtractor pulled out of a memory's content or tags
+    # (reasoning/entity_linker.py logs it when the lookup fails and when the
+    # per-entity link cap is hit). No guarded module logs the name bare in a
+    # %-style call, so listing it decides for nobody else.
+    "entity_name",
+    # The label a caller hands utils/cache_manager.py's get_or_create() for its
+    # log lines. No other guarded module logs the name, so listing it decides
+    # for nobody else.
+    "context_label",
+    # The endpoint embeddings/external_api.py posts to, from
+    # MCP_EXTERNAL_EMBEDDING_URL or the constructor. No other guarded module
+    # logs the name, so listing it decides for nobody else.
+    "api_url",
+    # ingestion/registry.py's canonical form of the path a caller asks it to
+    # load, logged when the file does not exist. No other guarded module logs
+    # the name, so listing it decides for nobody else.
+    "resolved_path",
 })
+
+# Names that are outside data in one module only, checked on top of
+# EXTERNAL_NAMES for that module. `backend` is the storage backend a caller
+# hands utils/cache_manager.py's get_or_create(); elsewhere it is internal
+# (`self.backend` in ingestion/pdf_loader.py and reasoning/nli.py), so listing
+# it globally would flag those two. `model_name` is MCP_EXTERNAL_EMBEDDING_MODEL
+# in embeddings/external_api.py; reasoning/nli.py logs its own model name bare,
+# and quality/onnx_ranker.py is not guarded yet (see `_hf_repo` above).
+MODULE_EXTERNAL_NAMES = {
+    "mcp_memory_service/utils/cache_manager.py": frozenset({"backend"}),
+    "mcp_memory_service/embeddings/external_api.py": frozenset({"model_name"}),
+    "mcp_memory_service/server_impl.py": frozenset({"MILVUS_URI", "MILVUS_COLLECTION_NAME"}),
+    # The dict config/ontology.py parses from MCP_CUSTOM_MEMORY_TYPES; its keys
+    # are logged. models/ontology.py and the ontology tests use the same name
+    # for built-in data, so it is listed for this module only.
+    "mcp_memory_service/config/ontology.py": frozenset({"custom_types"}),
+    # `metadata.issuer` in web/oauth/discovery.py comes from OAUTH_ISSUER in the
+    # environment, and `db_dir` in web/oauth/storage/factory.py is derived from
+    # the caller's `db_path`.
+    "mcp_memory_service/web/oauth/discovery.py": frozenset({"issuer"}),
+    "mcp_memory_service/web/oauth/storage/factory.py": frozenset({"db_dir"}),
+    # `name` in storage/migration_runner.py is parsed out of a filename inside
+    # `migrations_dir`, and `config_path` in sync/litestream_config.py may be
+    # passed in by the caller.
+    "mcp_memory_service/storage/migration_runner.py": frozenset({"name"}),
+    "mcp_memory_service/sync/litestream_config.py": frozenset({"config_path"}),
+}
 
 # Fields of an outside object that cannot carry injectable text. An HTTP status
 # is an integer in a fixed range, so `response.status_code` is not the `response`
@@ -94,13 +311,21 @@ def _is_sanitised(node: ast.expr) -> bool:
 
 
 def _is_guarded_logger_call(node: ast.AST) -> bool:
-    """True for `logger.<level>(...)` at one of the levels the gate guards."""
-    return (
+    """True for `logger.<level>(...)`, `logging.<level>(...)`, or `self.logger.<level>(...)`."""
+    if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr in GUARDED_LEVELS
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "logger"
+    ):
+        return False
+    target = node.func.value
+    if isinstance(target, ast.Name) and target.id in ("logger", "logging"):
+        return True
+    return (
+        isinstance(target, ast.Attribute)
+        and target.attr == "logger"
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
     )
 
 
@@ -115,8 +340,8 @@ def _unsanitised_placeholders(call: ast.Call) -> bool:
     return False
 
 
-def _external_arguments(call: ast.Call) -> bool:
-    """True if a %-argument names outside data and is not wrapped."""
+def _external_arguments(call: ast.Call, names: frozenset[str]) -> bool:
+    """True if a %-argument mentions one of `names` and is not wrapped."""
     for argument in call.args[1:]:
         if _is_sanitised(argument):
             continue
@@ -124,12 +349,12 @@ def _external_arguments(call: ast.Call) -> bool:
         if source.rsplit(".", 1)[-1] in SAFE_ATTRIBUTES:
             continue
         tokens = set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", source))
-        if tokens & EXTERNAL_NAMES and not (tokens & {SANITIZER}):
+        if tokens & names and not (tokens & {SANITIZER}):
             return True
     return False
 
 
-def _lazy_findings(source: str) -> list[str]:
+def _lazy_findings(source: str, extra_names: frozenset[str] = frozenset()) -> list[str]:
     """Unsanitised outside data handed to a %-style logger call.
 
     Moving off f-strings takes the values out of reach of the two scans above,
@@ -138,12 +363,16 @@ def _lazy_findings(source: str) -> list[str]:
     a person -- so it works off EXTERNAL_NAMES: names this codebase uses for
     data it did not produce. It catches the regression that matters (an
     exception or payload logged raw) and stays quiet about counters.
+
+    `extra_names` adds names that are outside data in the scanned module only
+    (see MODULE_EXTERNAL_NAMES).
     """
+    names = EXTERNAL_NAMES | extra_names
     tree = ast.parse(source)
     return [
         f"{node.lineno}: logger.{node.func.attr}(...)"
         for node in ast.walk(tree)
-        if _is_guarded_logger_call(node) and _external_arguments(node)
+        if _is_guarded_logger_call(node) and _external_arguments(node, names)
     ]
 
 
@@ -189,7 +418,7 @@ def test_no_unsanitised_interpolation_into_logs(module):
 @pytest.mark.parametrize("module", GUARDED_MODULES)
 def test_no_unsanitised_outside_data_in_lazy_log_calls(module):
     """The %-style calls this issue introduced must still wrap outside data."""
-    findings = _lazy_findings(_read(module))
+    findings = _lazy_findings(_read(module), MODULE_EXTERNAL_NAMES.get(module, frozenset()))
     assert not findings, (
         f"{module}: {len(findings)} logger calls passing outside data unwrapped\n  "
         + "\n  ".join(findings[:15])
@@ -210,6 +439,267 @@ def test_lazy_scan_catches_what_the_other_two_cannot():
 def test_lazy_scan_leaves_internal_scalars_alone():
     """Counters and durations stay unwrapped; demanding otherwise is the noise."""
     assert not _lazy_findings('logger.info("synced %s in %.2fs", synced_count, elapsed)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_caller_controlled_max_hops():
+    """max_hops looks like a counter but arrives from an MCP tool's arguments.
+
+    Its only guarded logger call (storage/graph.py) is already wrapped, so the
+    module scan stays green whether or not the name is listed. This is the
+    sample that fails if the entry is dropped from EXTERNAL_NAMES.
+    """
+    bare = 'logger.debug("within %s hops", max_hops)\n'
+    wrapped = 'logger.debug("within %s hops", _sanitize_log_value(max_hops))\n'
+    assert _lazy_findings(bare)
+    assert not _lazy_findings(wrapped)
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_mdns_service_details():
+    """service_details is parsed from a mDNS announcement made by another host.
+
+    Every guarded logger call in discovery/mdns_service.py already wraps its
+    fields, so the module scan stays green whether or not the object is
+    listed. This is the sample that fails if the entry is dropped from
+    EXTERNAL_NAMES; a bare `name` stays unlisted on purpose.
+    """
+    bare = 'logger.info("Discovered: %s", service_details.name)\n'
+    wrapped = 'logger.info("Discovered: %s", _sanitize_log_value(service_details.name))\n'
+    assert _lazy_findings(bare)
+    assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.info("Discovered: %s", name)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_importer_inputs():
+    """json_file and source_machine reach sync/importer.py from outside.
+
+    The path is whatever the command line passed in; the machine name is
+    read out of the export's own metadata. Every guarded logger call in the
+    importer already wraps both, so the module scan stays green whether or
+    not they are listed. These are the samples that fail if either entry is
+    dropped from EXTERNAL_NAMES; a bare `source` stays unlisted on purpose.
+    """
+    for bare, wrapped in (
+        ('logger.info("Processing %s", json_file)\n',
+         'logger.info("Processing %s", _sanitize_log_value(json_file))\n'),
+        ('logger.info("  %s: done", source_machine)\n',
+         'logger.info("  %s: done", _sanitize_log_value(source_machine))\n'),
+    ):
+        assert _lazy_findings(bare)
+        assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.info("  %s: done", source)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_backup_filenames():
+    """filename reaches backup/scheduler.py from its callers and from the disk.
+
+    restore_backup() is handed one; list_backups() reads one off every file
+    in the backups directory and cleanup logs it back. Every guarded logger
+    call in the scheduler already wraps them, so the module scan stays green
+    whether or not the name is listed. These are the samples that fail if
+    the entry is dropped from EXTERNAL_NAMES; the service's own generated
+    `backup_filename` stays unlisted on purpose.
+    """
+    for bare, wrapped in (
+        ('logger.info("Restored %s", filename)\n',
+         'logger.info("Restored %s", _sanitize_log_value(filename))\n'),
+        ('logger.info("Removed %s", backup["filename"])\n',
+         'logger.info("Removed %s", _sanitize_log_value(backup["filename"]))\n'),
+    ):
+        assert _lazy_findings(bare)
+        assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.info("Created %s", backup_filename)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_base_mixin_inputs():
+    """What storage/mixins/base.py logs from outside: stored text, env pragmas, the path.
+
+    `_safe_json_loads` logs an excerpt of the metadata column it failed to
+    parse; `_connect_and_load_extension` logs each pragma pair split out of
+    the environment; `__init__` logs the configured database path. Every
+    guarded logger call in the module already wraps them, so the module scan
+    stays green whether or not the names are listed. These are the samples
+    that fail if an entry is dropped from EXTERNAL_NAMES; the `context` label
+    (a literal at every call site) and the parsed `timeout_seconds` stay
+    unlisted on purpose.
+    """
+    for bare, wrapped in (
+        ('logger.error("bad json: %s", json_str[:100])\n',
+         'logger.error("bad json: %s", _sanitize_log_value(json_str[:100]))\n'),
+        ('logger.debug("pragma %s=%s", pragma_name, pragma_value)\n',
+         'logger.debug("pragma %s=%s", _sanitize_log_value(pragma_name), _sanitize_log_value(pragma_value))\n'),
+        ('logger.info("storage at %s", self.db_path)\n',
+         'logger.info("storage at %s", _sanitize_log_value(self.db_path))\n'),
+    ):
+        assert _lazy_findings(bare)
+        assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.error("bad json in %s", context)\n')
+    assert not _lazy_findings('logger.info("timeout %ss", timeout_seconds)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_oauth_client_values():
+    """What web/oauth/middleware.py logs about the caller: client_id and scope.
+
+    Both reach the log from the JWT claims or the stored token; scope is what
+    the caller asked for when it authorized. Every guarded logger call in the module
+    already wraps them, so the module scan stays green whether or not the names
+    are listed. These are the samples that fail if an entry is dropped from
+    EXTERNAL_NAMES; the configured JWT `algorithm` stays unlisted on purpose.
+    """
+    for bare, wrapped in (
+        ('logger.debug("client_id=%s", client_id)\n',
+         'logger.debug("client_id=%s", _sanitize_log_value(client_id))\n'),
+        ('logger.debug("scope=%s", scope)\n',
+         'logger.debug("scope=%s", _sanitize_log_value(scope))\n'),
+    ):
+        assert _lazy_findings(bare)
+        assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.debug("algorithm: %s", algorithm)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_oauth_authorization_code():
+    """The authorization code web/oauth/storage/sqlite.py logs on a reused code.
+
+    It comes from the token request, so a client chooses it. The module's only
+    call that logs it is already wrapped, so the module scan stays green
+    whether or not the name is listed. This is the sample that fails if the
+    entry is dropped from EXTERNAL_NAMES; `status_code` stays a separate token.
+    """
+    bare = 'logger.warning("Authorization code already consumed: %s", code)\n'
+    wrapped = (
+        'logger.warning("Authorization code already consumed: %s", '
+        '_sanitize_log_value(code))\n'
+    )
+    assert _lazy_findings(bare)
+    assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.info("HTTP %s", status_code)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_sse_client_address():
+    """What web/sse.py logs about a connection: the address and the Last-Event-ID.
+
+    The guarded call already wraps it, so the module scan stays green whether or
+    not the name is listed; this sample fails if the entry is dropped.
+    """
+    assert _lazy_findings('logger.info("from %s", client_ip)\n')
+    assert not _lazy_findings('logger.info("from %s", _sanitize_log_value(client_ip))\n')
+    assert _lazy_findings('logger.info("after %s", last_event_id)\n')
+    assert not _lazy_findings('logger.info("after %s", _sanitize_log_value(last_event_id))\n')
+
+
+def test_lazy_scan_flags_environment_host_values():
+    """What server/environment.py logs about the host: paths and the installed version.
+
+    Every guarded logger call in the module already wraps them, so the module
+    scan stays green whether or not the names are listed. These are the samples
+    that fail if an entry is dropped from EXTERNAL_NAMES; the package's own
+    `source_version` stays unlisted on purpose.
+    """
+    for bare, wrapped in (
+        ('logger.debug("Added venv path: %s", venv_path)\n',
+         'logger.debug("Added venv path: %s", _sanitize_log_value(venv_path))\n'),
+        ('logger.debug("Added user site-packages: %s", user_path)\n',
+         'logger.debug("Added user site-packages: %s", _sanitize_log_value(user_path))\n'),
+        ('logger.warning("Installed: v%s", installed_version)\n',
+         'logger.warning("Installed: v%s", _sanitize_log_value(installed_version))\n'),
+    ):
+        assert _lazy_findings(bare)
+        assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.debug("Version check OK: v%s", source_version)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_mcp_server_cache_key_and_host():
+    """cache_key and HTTP_HOST carry environment values into mcp_server.py's log.
+
+    The cache key is the storage backend joined to the database path, both
+    read from the environment; HTTP_HOST is the bind address from the
+    environment. Every guarded logger call that hands either name is already
+    wrapped, so the module scan stays green whether or not they are listed.
+    This is the sample that fails if either entry is dropped from
+    EXTERNAL_NAMES.
+    """
+    for bare, wrapped in (
+        ('logger.info("Cached storage instance (key: %s)", cache_key)\n',
+         'logger.info("Cached storage instance (key: %s)", _sanitize_log_value(cache_key))\n'),
+        ('logger.info("Starting server on %s:%s", HTTP_HOST, HTTP_PORT)\n',
+         'logger.info("Starting server on %s:%s", _sanitize_log_value(HTTP_HOST), HTTP_PORT)\n'),
+    ):
+        assert _lazy_findings(bare)
+        assert not _lazy_findings(wrapped)
+
+
+def test_lazy_scan_flags_update_command_output():
+    """What web/api/server.py logs when an update step fails: the git and pip output."""
+    for name in ("git_output", "pip_output"):
+        assert _lazy_findings(f'logger.error("failed: %s", {name})\n')
+        assert not _lazy_findings(f'logger.error("failed: %s", _sanitize_log_value({name}))\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_db_utils_backend_errors():
+    """What utils/db_utils.py logs when a backend call fails."""
+    for name in ("init_error", "embed_error", "stats_error"):
+        assert _lazy_findings(f'logger.warning("failed: %s", {name})\n')
+        assert not _lazy_findings(f'logger.warning("failed: %s", _sanitize_log_value({name}))\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_store_backend_errors():
+    """What storage/mixins/store.py logs when the backend raises while it stores."""
+    for name in ("vec_err", "error_msg"):
+        assert _lazy_findings(f'logger.error("failed: %s", {name})\n')
+        assert not _lazy_findings(f'logger.error("failed: %s", _sanitize_log_value({name}))\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_milvus_graph_backend_errors():
+    """What storage/milvus_graph.py logs when a pymilvus call raises.
+
+    The `exc` of each `except Exception` block is wrapped, as the entity-link
+    blocks in the same module already did. The hop list that
+    `find_shortest_path` reconstructs is named `hops`, not `path`: the guard
+    reads `path` as a file path, and this list holds content hashes.
+    """
+    assert _lazy_findings('logger.error("Failed to store association: %s", exc)\n')
+    assert not _lazy_findings('logger.error("Failed to store association: %s", _sanitize_log_value(exc))\n')
+    assert _lazy_findings('logger.debug("Found path of length %d: %s → %s", len(path), hash1, hash2)\n')
+    assert not _lazy_findings('logger.debug("Found path of length %d: %s → %s", len(hops), hash1, hash2)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_quarantine_hashes():
+    """What consolidation/quarantine.py logs about the memory it checks.
+
+    The `content_hash[:8]` prefix is wrapped, as storage/hybrid.py already
+    does for the same slice; `content_hash` is listed. The count the NLI check
+    returns is read into `pairs_detected` before it is logged: `result` is
+    listed, an integer field of it is not outside data.
+    """
+    assert _lazy_findings('logger.error("Failed to quarantine memory %s: %s", content_hash[:8], _sanitize_log_value(msg))\n')
+    assert not _lazy_findings('logger.error("Failed to quarantine memory %s: %s", _sanitize_log_value(content_hash[:8]), _sanitize_log_value(msg))\n')
+    assert _lazy_findings('logger.info("NLI background check: pairs_detected=%s", result.get("pairs_detected", 0))\n')
+    assert not _lazy_findings('logger.info("NLI background check: pairs_detected=%s", pairs_detected)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_integrity_export_path():
+    """What health/integrity.py logs about the file it exports memories to."""
+    assert _lazy_findings('logger.info("to %s", export_path)\n')
+    assert not _lazy_findings('logger.info("to %s", _sanitize_log_value(export_path))\n')
+
+
+def test_scans_cover_logging_module_calls():
+    """A guarded module that logs through the root `logging` module is scanned too."""
+    assert _lazy_findings('logging.error("failed: %s", e)\n')
+    assert not _lazy_findings('logging.error("failed: %s", _sanitize_log_value(e))\n')
 
 
 @pytest.mark.unit
@@ -235,3 +725,217 @@ def test_detectors_accept_the_two_supported_safe_forms():
     )
     assert not _gate_findings(sample)
     assert not _ast_findings(sample)
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_config_environment_strings():
+    """The environment strings config/search.py, quality.py and backup.py log.
+
+    Every guarded logger call in the three modules already wraps them, so the
+    module scans stay green whether or not the names are listed. These are the
+    samples that fail if an entry is dropped from EXTERNAL_NAMES; the parsed
+    numbers logged next to them stay unlisted on purpose.
+    """
+    for bare, wrapped in (
+        ('logger.warning("Invalid fusion method: %s", MCP_HYBRID_FUSION_METHOD)\n',
+         'logger.warning("Invalid fusion method: %s", _sanitize_log_value(MCP_HYBRID_FUSION_METHOD))\n'),
+        ('logger.info("Quality System: provider=%s", MCP_QUALITY_AI_PROVIDER)\n',
+         'logger.info("Quality System: provider=%s", _sanitize_log_value(MCP_QUALITY_AI_PROVIDER))\n'),
+        ('logger.warning("Invalid backup interval: %s", BACKUP_INTERVAL)\n',
+         'logger.warning("Invalid backup interval: %s", _sanitize_log_value(BACKUP_INTERVAL))\n'),
+    ):
+        assert _lazy_findings(bare)
+        assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.info("Backup configuration: retention=%s days", BACKUP_RETENTION)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_config_oauth_and_ontology_values():
+    """What config/oauth.py and config/ontology.py log at import time.
+
+    oauth.py logs the ValueError from validate_oauth_configuration(), whose
+    text carries MCP_OAUTH_ISSUER and a key path verbatim; `e` is already
+    listed. ontology.py logs the base-type names parsed from
+    MCP_CUSTOM_MEMORY_TYPES; `custom_types` is listed for that module only,
+    through MODULE_EXTERNAL_NAMES. The JWT algorithm and the two counts stay
+    unlisted on purpose.
+    """
+    extra = MODULE_EXTERNAL_NAMES["mcp_memory_service/config/ontology.py"]
+    for bare, wrapped in (
+        ('logger.error("OAuth configuration validation failed: %s", e)\n',
+         'logger.error("OAuth configuration validation failed: %s", _sanitize_log_value(e))\n'),
+        ('logger.info("  Custom base types: %s", ", ".join(custom_types.keys()))\n',
+         'logger.info("  Custom base types: %s", _sanitize_log_value(", ".join(custom_types.keys())))\n'),
+    ):
+        assert _lazy_findings(bare, extra)
+        assert not _lazy_findings(wrapped, extra)
+    assert not _lazy_findings('logger.info("  Custom base types: %s", ", ".join(custom_types.keys()))\n')
+    assert not _lazy_findings('logger.debug("OAuth JWT algorithm validation: %s", algorithm)\n')
+    assert not _lazy_findings('logger.info("  Custom types: %d base types, %d subtypes", total_base, total_subtypes)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_ingestion_file_path():
+    """The path the ingestion/ loaders are handed, logged at start and on failure.
+
+    Every guarded logger call in the five loaders already wraps it, so the module
+    scans stay green whether or not the name is listed. This is the sample that
+    fails if `file_path` is dropped from EXTERNAL_NAMES; the character count and
+    the PDF backend name logged next to it stay unlisted on purpose.
+    """
+    bare = 'logger.info("Extracting chunks from JSON file: %s", file_path)\n'
+    wrapped = 'logger.info("Extracting chunks from JSON file: %s", _sanitize_log_value(file_path))\n'
+    assert _lazy_findings(bare)
+    assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.debug("Successfully parsed %s, extracted %d characters", _sanitize_log_value(file_path), len(markdown_content))\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_reasoning_entity_name():
+    """An entity name pulled out of memory content, logged by reasoning/entity_linker.py.
+
+    Both guarded logger calls that carry it already wrap it, so the module scans
+    stay green whether or not the name is listed. This is the sample that fails
+    if `entity_name` is dropped from EXTERNAL_NAMES; the link cap and the edge
+    count logged next to it stay unlisted on purpose.
+    """
+    bare = 'logger.debug("EntityLinker: hit cap (%s) for entity \'%s\'", MAX_LINKS_PER_ENTITY, entity_name)\n'
+    wrapped = 'logger.debug("EntityLinker: hit cap (%s) for entity \'%s\'", MAX_LINKS_PER_ENTITY, _sanitize_log_value(entity_name))\n'
+    assert _lazy_findings(bare)
+    assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.info("EntityLinker: created %s shares_entity edges for %s", edges_created, memory_hash)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_cache_manager_caller_inputs():
+    """What utils/cache_manager.py's get_or_create() is handed and logs.
+
+    `context_label` is listed in EXTERNAL_NAMES; `backend` only for this module,
+    through MODULE_EXTERNAL_NAMES. Every guarded logger call in the module
+    already wraps both, so the module scan stays green whether or not they are
+    listed. These are the samples that fail if either entry is dropped; the
+    PDF loader's internal `self.backend` stays allowed everywhere else.
+    """
+    extra = MODULE_EXTERNAL_NAMES["mcp_memory_service/utils/cache_manager.py"]
+    for bare, wrapped in (
+        ('logger.info("%s Call #%d", context_label, total_calls)\n',
+         'logger.info("%s Call #%d", _sanitize_log_value(context_label), total_calls)\n'),
+        ('logger.info("Reusing %s instance", backend)\n',
+         'logger.info("Reusing %s instance", _sanitize_log_value(backend))\n'),
+    ):
+        assert _lazy_findings(bare, extra)
+        assert not _lazy_findings(wrapped, extra)
+    assert not _lazy_findings('logger.info("PDF: %s using %s", _sanitize_log_value(file_path), self.backend)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_external_embedding_endpoint():
+    """The endpoint and model embeddings/external_api.py logs when it connects.
+
+    `api_url` is listed in EXTERNAL_NAMES; `model_name` only for this module,
+    through MODULE_EXTERNAL_NAMES. The module's guarded call already wraps both,
+    so the module scan stays green whether or not they are listed. These are
+    the samples that fail if either entry is dropped; the embedding dimension
+    logged next to them, and reasoning/nli.py's own model name, stay allowed.
+    """
+    extra = MODULE_EXTERNAL_NAMES["mcp_memory_service/embeddings/external_api.py"]
+    for bare, wrapped in (
+        ('logger.info("connected: %s, dims: %d", self.api_url, self.embedding_dimension)\n',
+         'logger.info("connected: %s, dims: %d", _sanitize_log_value(self.api_url), self.embedding_dimension)\n'),
+        ('logger.info("model: %s", self.model_name)\n',
+         'logger.info("model: %s", _sanitize_log_value(self.model_name))\n'),
+    ):
+        assert _lazy_findings(bare, extra)
+        assert not _lazy_findings(wrapped, extra)
+    assert not _lazy_findings('logger.info("NLI model: %s", self.model_name)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_ingestion_resolved_path():
+    """The resolved form of a caller's path, logged by ingestion/registry.py.
+
+    The registry's guarded call already wraps it, so the module scan stays
+    green whether or not the name is listed. This is the sample that fails if
+    `resolved_path` is dropped from EXTERNAL_NAMES; the loader class name logged
+    next to the path stays unlisted on purpose.
+    """
+    bare = 'logger.warning("File does not exist: %s", resolved_path)\n'
+    wrapped = 'logger.warning("File does not exist: %s", _sanitize_log_value(resolved_path))\n'
+    assert _lazy_findings(bare)
+    assert not _lazy_findings(wrapped)
+    assert not _lazy_findings('logger.debug("Found fallback loader %s for %s", loader_class.__name__, _sanitize_log_value(file_path))\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_server_impl_milvus_settings():
+    """MILVUS_URI and MILVUS_COLLECTION_NAME reach server_impl.py's init logs
+    from the environment, and neither is in EXTERNAL_NAMES, so they are listed
+    through MODULE_EXTERNAL_NAMES. Both init paths already wrap them; this is
+    the sample that fails if either name is dropped from the entry.
+    """
+    extra = MODULE_EXTERNAL_NAMES["mcp_memory_service/server_impl.py"]
+    for name in ("MILVUS_URI", "MILVUS_COLLECTION_NAME"):
+        bare = f'logger.info("Creating MilvusMemoryStorage (uri=%s)", {name})\n'
+        wrapped = f'logger.info("Creating MilvusMemoryStorage (uri=%s)", _sanitize_log_value({name}))\n'
+        assert _lazy_findings(bare, extra)
+        assert not _lazy_findings(bare), "not an EXTERNAL_NAMES entry: the module list carries it"
+        assert not _lazy_findings(wrapped, extra)
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_oauth_discovery_and_factory_values():
+    """`metadata.issuer` in web/oauth/discovery.py comes from OAUTH_ISSUER in
+    the environment, and `db_dir` in web/oauth/storage/factory.py is derived
+    from the caller's `db_path`. Neither name is in EXTERNAL_NAMES, so each is
+    listed through MODULE_EXTERNAL_NAMES; these samples fail if either entry is
+    dropped.
+    """
+    discovery_extra = MODULE_EXTERNAL_NAMES["mcp_memory_service/web/oauth/discovery.py"]
+    bare_issuer = 'logger.debug("Returning OAuth metadata: issuer=%s", metadata.issuer)\n'
+    wrapped_issuer = 'logger.debug("Returning OAuth metadata: issuer=%s", _sanitize_log_value(metadata.issuer))\n'
+    assert _lazy_findings(bare_issuer, discovery_extra)
+    assert not _lazy_findings(bare_issuer), "not an EXTERNAL_NAMES entry: the module list carries it"
+    assert not _lazy_findings(wrapped_issuer, discovery_extra)
+
+    factory_extra = MODULE_EXTERNAL_NAMES["mcp_memory_service/web/oauth/storage/factory.py"]
+    bare_db_dir = 'logger.info("Created OAuth database directory: %s", db_dir)\n'
+    wrapped_db_dir = 'logger.info("Created OAuth database directory: %s", _sanitize_log_value(db_dir))\n'
+    assert _lazy_findings(bare_db_dir, factory_extra)
+    assert not _lazy_findings(bare_db_dir), "not an EXTERNAL_NAMES entry: the module list carries it"
+    assert not _lazy_findings(wrapped_db_dir, factory_extra)
+
+
+@pytest.mark.unit
+def test_scans_cover_instance_logger_calls():
+    """Classes such as FileIngestionProcessor and CreativeAssociationEngine log
+    through `self.logger.<level>(...)`, which the shell gate already matches.
+    The AST and lazy scans must inspect `self.logger` calls too.
+    """
+    fstring_sample = "self.logger.info(" + 'f"Processing: {file_path.name}")\n'
+    assert _gate_findings(fstring_sample)
+    assert _ast_findings(fstring_sample)
+    assert _lazy_findings('self.logger.info("Processing: %s", file_path.name)\n')
+    assert not _lazy_findings('self.logger.info("Processing: %s", _sanitize_log_value(file_path.name))\n')
+    assert not _lazy_findings('self.logger.info("Discovered %d associations from %d pairs", count, total)\n')
+
+
+@pytest.mark.unit
+def test_lazy_scan_flags_migration_runner_and_litestream_paths():
+    """`name` in storage/migration_runner.py is parsed from migration filenames
+    on disk, and `config_path` in sync/litestream_config.py comes from the
+    caller. Neither name is in EXTERNAL_NAMES globally, so both are guarded via
+    MODULE_EXTERNAL_NAMES.
+    """
+    mig_extra = MODULE_EXTERNAL_NAMES["mcp_memory_service/storage/migration_runner.py"]
+    bare_mig = 'logger.info("Migration %03d_%s applied successfully", version, name)\n'
+    wrapped_mig = 'logger.info("Migration %03d_%s applied successfully", version, _sanitize_log_value(name))\n'
+    assert _lazy_findings(bare_mig, mig_extra)
+    assert not _lazy_findings(bare_mig), "not an EXTERNAL_NAMES entry: the module list carries it"
+    assert not _lazy_findings(wrapped_mig, mig_extra)
+
+    ls_extra = MODULE_EXTERNAL_NAMES["mcp_memory_service/sync/litestream_config.py"]
+    bare_ls = 'logger.info("Litestream configuration written to %s", config_path)\n'
+    wrapped_ls = 'logger.info("Litestream configuration written to %s", _sanitize_log_value(config_path))\n'
+    assert _lazy_findings(bare_ls, ls_extra)
+    assert not _lazy_findings(bare_ls), "not an EXTERNAL_NAMES entry: the module list carries it"
+    assert not _lazy_findings(wrapped_ls, ls_extra)

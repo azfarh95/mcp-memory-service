@@ -130,7 +130,9 @@ class ParallelSqliteVecStorage:
             ).fetchone()[0]
         except Exception as exc:
             logger.debug("Primary readiness check failed (%s); assuming not ready", exc)
-            return False
+            # Cache the negative verdict too, or a broken primary re-runs a failing
+            # COUNT on every single semantic read.
+            return self._cache_ready(False)
         # An empty local corpus has nothing to serve, so the primary is trivially
         # "ready" and must not be reported as lagging.
         if secondary_rows == 0:
@@ -222,11 +224,13 @@ class ParallelSqliteVecStorage:
         if self._primary_available():
             try:
                 primary_results = await self.primary.store_batch(memories, store=store)
-                for i, (ok, msg) in enumerate(primary_results):
-                    if not ok and self._is_embed_failure(msg):
-                        self._mark_primary_down(msg)
+                failed = [i for i, (ok, msg) in enumerate(primary_results)
+                          if not ok and self._is_embed_failure(msg)]
+                if failed:
+                    self._mark_primary_down(primary_results[failed[0]][1])
+                    # Mark every failure, not just the first, so the backfill can find them.
+                    for i in failed:
                         await self._mark_embed_pending(memories[i])
-                        break
             except Exception as exc:
                 self._mark_primary_down(str(exc))
                 for memory in memories:
@@ -281,7 +285,10 @@ class ParallelSqliteVecStorage:
         return self._flag_degraded(await self.secondary.recall(query, n_results, **kwargs))
 
     async def recall_memory(self, query: str, n_results: int = 5) -> List[Memory]:
-        return await self.recall(query, n_results)
+        # Non-embedding read (returns Memory, not MemoryQueryResult): delegate to the
+        # complete local index. Routing it through recall() returned the wrong type
+        # and would break memory-shaped access in callers (review, 2026-11-16).
+        return await self.secondary.recall_memory(query, n_results)
 
     async def search(self, query: str, n_results: int = 5) -> List[MemoryQueryResult]:
         results = await self._semantic_from_primary(query, n_results, "search")

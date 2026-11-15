@@ -67,21 +67,6 @@ for _dimension_var in (
         print(f"[Test Safety] Ignoring host {_dimension_var} so the embedding dimension is deterministic")
         del os.environ[_dimension_var]
 
-# Voyage is the production-default embedding backend, but it is a cloud API: the
-# test harness is deterministic and offline, so force the local backend and scrub
-# ambient Voyage settings. Tests that exercise the voyage/parallel paths set
-# these explicitly via monkeypatch (the ladder reads the env at initialize time;
-# the factory reads the config module attributes at call time).
-for _voyage_var in (
-    'MCP_MEMORY_EMBED_BACKEND',
-    'MCP_MEMORY_PARALLEL_INDEX',
-    'MCP_VOYAGE_API_KEY',
-    'MCP_VOYAGE_MODEL',
-    'MCP_VOYAGE_OUTPUT_DIM',
-):
-    os.environ.pop(_voyage_var, None)
-os.environ['MCP_MEMORY_EMBED_BACKEND'] = 'local'
-
 # CRITICAL: Force sqlite_vec backend for tests to prevent accidental Cloudflare operations
 # This prevents tests from soft-deleting production memories in Cloudflare D1
 #
@@ -125,19 +110,58 @@ def _disable_plugins(request, monkeypatch):
 @pytest.fixture(autouse=True)
 def _clear_embedding_caches():
     """Reset embedding caches after each test for isolation."""
-    import mcp_memory_service.storage.mixins.embeddings as emb_mod
+    import mcp_memory_service.storage.mixins.embeddings as emb_mod  # inline import
     from mcp_memory_service.storage.mixins.embeddings import (
-        _MODEL_CACHE, _DIMENSION_CACHE, _EMBEDDING_CACHE
+        _MODEL_CACHE, _DIMENSION_CACHE
     )
+    from mcp_memory_service.storage.shared import _embedding_cache_clear
     # SETUP: only reset warning flag (allow model reuse like main)
     emb_mod._HASH_FALLBACK_WARNED = False
-    _EMBEDDING_CACHE.clear()
+    _embedding_cache_clear()
     yield
     # TEARDOWN: full cleanup (prevent ONNX/ST leak to next test)
     _MODEL_CACHE.clear()
     _DIMENSION_CACHE.clear()
-    _EMBEDDING_CACHE.clear()
+    _embedding_cache_clear()
     emb_mod._HASH_FALLBACK_WARNED = False
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _share_default_onnx_session():
+    """Create the default ONNX model's InferenceSession once per run.
+
+    _clear_embedding_caches empties _MODEL_CACHE after every test, so each test
+    that initializes storage builds a new ONNXEmbeddingModel, and creating its
+    InferenceSession costs about 0.3 s. With the ml extras installed that was
+    about 680 tests and close to half the job's run time. The model object stays
+    per-test; only the session for the real default model file is shared.
+    Anything else (another path, a test's own model file, extra arguments) goes
+    to the real constructor, and a test that patches ort.InferenceSession
+    replaces this wrapper for its own duration.
+    """
+    try:
+        import onnxruntime as ort  # inline import
+        from mcp_memory_service.embeddings.onnx_embeddings import ONNXEmbeddingModel
+    except ImportError:
+        yield
+        return
+    default_model = str(
+        ONNXEmbeddingModel.DOWNLOAD_PATH / ONNXEmbeddingModel.EXTRACTED_FOLDER_NAME / "model.onnx"
+    )
+    create = ort.InferenceSession
+    sessions = {}
+
+    def shared(path, *args, **kwargs):
+        if str(path) != default_model or args or set(kwargs) - {"providers"}:
+            return create(path, *args, **kwargs)
+        key = tuple(kwargs.get("providers") or ())
+        if key not in sessions:
+            sessions[key] = create(path, **kwargs)
+        return sessions[key]
+
+    ort.InferenceSession = shared
+    yield
+    ort.InferenceSession = create
 
 
 @pytest.fixture
@@ -230,7 +254,6 @@ def pytest_sessionfinish(session, exitstatus):
     """
     try:
         from mcp_memory_service.config import SQLITE_VEC_PATH, STORAGE_BACKEND
-        import tempfile
 
         # Get database path based on backend
         if STORAGE_BACKEND == 'hybrid':
@@ -352,7 +375,6 @@ def pytest_sessionstart(session):
 
     try:
         from mcp_memory_service.config import SQLITE_VEC_PATH, STORAGE_BACKEND
-        import tempfile
 
         # Check backend
         if STORAGE_BACKEND not in ['sqlite_vec', 'cloudflare']:
@@ -399,6 +421,25 @@ def pytest_sessionstart(session):
     except Exception as e:
         print(f"Error during isolation verification: {e}")
         print("="*80 + "\n")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Keep only this CI shard's test files when MCP_TEST_SHARD is set (see tests/ci_shard.py)."""
+    from tests.ci_shard import parse_shard, shard_of  # inline import: only needed in sharded CI runs
+
+    try:
+        shard = parse_shard(os.environ.get("MCP_TEST_SHARD"))
+    except ValueError as e:
+        raise pytest.UsageError(str(e))
+    if shard is None:
+        return
+    index, total = shard
+    keep, drop = [], []
+    for item in items:
+        (keep if shard_of(item.nodeid, total) == index else drop).append(item)
+    if drop:
+        config.hook.pytest_deselected(items=drop)
+        items[:] = keep
 
 
 # Cleanup temp test database directory at session end

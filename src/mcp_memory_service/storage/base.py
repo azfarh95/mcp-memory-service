@@ -19,13 +19,99 @@ Licensed under the MIT License. See LICENSE file in the project root for full li
 """
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Sequence, Tuple, Set
 from datetime import datetime, timezone, timedelta, date
 from ..compat import _sanitize_log_value
 from ..models.memory import Memory, MemoryQueryResult
 
 logger = logging.getLogger(__name__)
+
+
+class EmbeddingModelMismatchError(RuntimeError):
+    """Exception raised when embedding models between local and remote storage don't match."""
+
+    def __init__(self, message: str, local_model: Optional[str] = None, remote_model: Optional[str] = None):
+        super().__init__(message)
+        self.local_model = local_model
+        self.remote_model = remote_model
+
+
+class UntaggedCountChanged(RuntimeError):
+    """Raised when the untagged set is no longer the size the caller confirmed.
+
+    ``delete-untagged`` is guarded by a confirmation count, and the count and
+    the delete are two awaits apart: another request can strip the last tag
+    off a memory in between, which would widen the delete past what the user
+    agreed to. The backends re-check the size where the rows are selected for
+    deletion - inside the connection lock and the transaction on SQLite - and
+    raise this before anything is written.
+    """
+
+    def __init__(self, expected: int, actual: int):
+        super().__init__(
+            f"Untagged memory count changed from {expected} to {actual} before the delete"
+        )
+        self.expected = expected
+        self.actual = actual
+
+
+class RecreateRefused(str):
+    """The (False, message) string store()/store_batch() return when ``recreate=False``
+    met a delete on record for the content_hash (#1560).
+
+    It *is* the plain message of the ``Tuple[bool, str]`` storage contract — a direct
+    caller that only logs or prints sees text — and it also carries the delete the
+    caller would have overridden, so entry points that answer structurally (REST 409,
+    MCP plain-text refusal) read attributes instead of parsing the text.
+
+    Attributes:
+        event_id: ``event_id`` of the dominant delete on record (what ADR-0012 v2 would
+            have stamped as ``recreate_of``).
+        hlc: the delete's ``[hlc_physical, hlc_logical, agent_id]`` anchor
+            (``recreate_of_hlc``). ``hlc_physical`` is epoch milliseconds.
+        deleted_at: ISO-8601 UTC timestamp derived from ``hlc_physical``.
+    """
+
+    event_id: str
+    hlc: list
+    deleted_at: str
+
+    def __new__(cls, event_id: str, hlc, *, flag_name: str = "recreate=True"):
+        anchor = list(hlc) if hlc is not None else []
+        physical = int(anchor[0] or 0) if anchor else 0
+        deleted_at = datetime.fromtimestamp(physical / 1000, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        text = (
+            f"Not stored: this content was deleted on {deleted_at} "
+            f"(delete event {event_id}); pass {flag_name} to bring it back"
+        )
+        obj = super().__new__(cls, text)
+        obj.event_id = event_id
+        obj.hlc = anchor
+        obj.deleted_at = deleted_at
+        return obj
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"event_id": self.event_id, "hlc": self.hlc, "deleted_at": self.deleted_at}
+
+
+def recreate_kwargs(storage: Any, recreate: Optional[bool]) -> Dict[str, bool]:
+    """Keyword arguments that forward ``recreate`` (#1560) to ``storage.store()``.
+
+    The flag is forwarded only when there is something to forward (``recreate`` is
+    not ``None``) **and** the backend says it can act on it
+    (``supports_recreate_refusal`` is ``True``). Every other backend — a third-party
+    ``MemoryStorage`` written before #1560, a test double with the previous
+    signature, a backend that keeps no delete record — receives exactly the call it
+    received before and is never handed a keyword it does not know.
+    """
+    if recreate is None or getattr(storage, "supports_recreate_refusal", False) is not True:
+        return {}
+    return {"recreate": recreate}
+
 
 class MemoryStorage(ABC):
     """Abstract base class for memory storage implementations."""
@@ -53,13 +139,36 @@ class MemoryStorage(ABC):
         """
         pass
 
+    @property
+    def supports_capacity_monitoring(self) -> bool:
+        """Backend monitors capacity limits (e.g. Cloudflare Vectorize). Default False."""
+        return False
+
+    @property
+    def supports_recreate_refusal(self) -> bool:
+        """Backend can refuse to re-create deleted content (``store(recreate=False)``,
+        #1560) because it keeps a delete record to refuse against. Default False: the
+        flag is then never forwarded to this backend (see ``recreate_kwargs``)."""
+        return False
+
+    @property
+    def requires_metadata_normalization(self) -> bool:
+        """Backend needs metadata normalized/compressed before store (e.g. Cloudflare). Default False."""
+        return False
+
+    @property
+    def supports_delete_operations(self) -> bool:
+        """Backend supports bulk date-range delete + drift listing (e.g. Cloudflare). Default False."""
+        return False
+
     @abstractmethod
     async def initialize(self) -> None:
         """Initialize the storage backend."""
         pass
-    
+
     @abstractmethod
-    async def store(self, memory: Memory, skip_semantic_dedup: bool = False, store: Optional[str] = "default") -> Tuple[bool, str]:
+    async def store(self, memory: Memory, skip_semantic_dedup: bool = False, store: Optional[str] = "default",
+                    recreate: Optional[bool] = None) -> Tuple[bool, str]:
         """Store a memory. Returns (success, message).
 
         Args:
@@ -68,6 +177,15 @@ class MemoryStorage(ABC):
                 Exact hash deduplication is always enforced.
             store: Target store partition (multi-store, #57 Phase 1). Backends
                 that are not partitioned accept it and ignore it.
+            recreate: What to do when the content_hash has a delete on record
+                (ADR-0012 v2, #1560). ``None`` (default) keeps today's behaviour:
+                purge the tombstone and stamp the create with ``recreate_of`` —
+                direct callers (consolidation, ingestion, CLI, ``api/operations.py``)
+                are unchanged. ``False`` refuses the write: no tombstone purge, no
+                create event, and the message is a ``RecreateRefused`` naming the
+                delete's event_id and HLC. ``True`` purges and stamps as ``None``
+                does, but says so explicitly. Backends that keep no delete record
+                accept the flag and have nothing to refuse.
 
         Note: the #57 change added `store` to every concrete backend and to all
         four call sites (`services/memory_service.py`, `server/handlers/documents.py`,
@@ -77,7 +195,7 @@ class MemoryStorage(ABC):
         """
         pass
 
-    async def store_batch(self, memories: List[Memory]) -> List[Tuple[bool, str]]:
+    async def store_batch(self, memories: List[Memory], recreate: Optional[bool] = None) -> List[Tuple[bool, str]]:
         """
         Store multiple memories in a single operation.
 
@@ -87,6 +205,7 @@ class MemoryStorage(ABC):
 
         Args:
             memories: List of Memory objects to store
+            recreate: Same tri-state as ``store()`` (#1560); a refusal is per item.
 
         Returns:
             A list of (success, message) tuples, one for each memory in the batch.
@@ -95,7 +214,7 @@ class MemoryStorage(ABC):
             return []
 
         results = await asyncio.gather(
-            *(self.store(memory) for memory in memories),
+            *(self.store(memory, **recreate_kwargs(self, recreate)) for memory in memories),
             return_exceptions=True
         )
 
@@ -108,9 +227,9 @@ class MemoryStorage(ABC):
             else:
                 final_results.append(res)
         return final_results
-    
+
     @abstractmethod
-    async def retrieve(self, query: str, n_results: int = 5, tags: Optional[List[str]] = None, min_confidence: float = 0.0, include_superseded: bool = False, start_time: Optional[float] = None, end_time: Optional[float] = None) -> List[MemoryQueryResult]:
+    async def retrieve(self, query: str, n_results: int = 5, tags: Optional[List[str]] = None, min_confidence: float = 0.0, include_superseded: bool = False, start_time: Optional[float] = None, end_time: Optional[float] = None, store: Optional[str] = None, as_of: Optional[float] = None) -> List[MemoryQueryResult]:
         """Retrieve memories by semantic search.
 
         Args:
@@ -122,6 +241,9 @@ class MemoryStorage(ABC):
             min_confidence: Minimum effective confidence score (0.0-1.0).
                   When > 0, stale memories below threshold are filtered out.
                   Default 0.0 disables filtering (backward compatible).
+            as_of: Optional epoch seconds for a point-in-time query (issue
+                  #1724): only memories with created_at <= as_of that had not
+                  yet been superseded at as_of are returned. None disables.
         """
         pass
 
@@ -133,6 +255,13 @@ class MemoryStorage(ABC):
         """Resolve a conflict. Default: not supported."""
         return False, "Conflict resolution not supported by this backend"
 
+    async def reconcile_conflict_tags(self, dry_run: bool = True) -> Dict[str, Any]:
+        """Clear conflict:unresolved from current memories with no current partner (#1840).
+
+        Default: not supported. Reported as such, not as a clean result.
+        """
+        return {"supported": False}
+
     async def retrieve_with_quality_boost(
         self,
         query: str,
@@ -140,7 +269,9 @@ class MemoryStorage(ABC):
         tags: Optional[List[str]] = None,
         quality_boost: Optional[bool] = None,
         quality_weight: Optional[float] = None,
-        include_superseded: bool = False
+        include_superseded: bool = False,
+        store: Optional[str] = "default",
+        as_of: Optional[float] = None,
     ) -> List[MemoryQueryResult]:
         """
         Retrieve memories with optional quality-based reranking.
@@ -185,12 +316,12 @@ class MemoryStorage(ABC):
 
         if not quality_boost:
             # Standard retrieval, no reranking
-            return await self.retrieve(query, n_results, tags=tags, include_superseded=include_superseded)
+            return await self.retrieve(query, n_results, tags=tags, include_superseded=include_superseded, store=store, as_of=as_of)
 
         # Quality-boosted retrieval
         # Step 1: Over-fetch (3x) to have pool for reranking
         oversample_factor = 3
-        candidates = await self.retrieve(query, n_results * oversample_factor, tags=tags, include_superseded=include_superseded)
+        candidates = await self.retrieve(query, n_results * oversample_factor, tags=tags, include_superseded=include_superseded, store=store, as_of=as_of)
 
         if not candidates:
             return []
@@ -226,12 +357,15 @@ class MemoryStorage(ABC):
         return candidates[:n_results]
 
     @abstractmethod
-    async def search_by_tag(self, tags: List[str], time_start: Optional[float] = None) -> List[Memory]:
+    async def search_by_tag(self, tags: List[str], time_start: Optional[float] = None, include_superseded: bool = True) -> List[Memory]:
         """Search memories by tags with optional time filtering.
 
         Args:
             tags: List of tags to search for
             time_start: Optional Unix timestamp (in seconds) to filter memories created after this time
+            include_superseded: If False, leave out memories replaced by a newer
+                version, as ``retrieve()`` does. Default True keeps every live
+                row for internal callers (#1803)
 
         Returns:
             List of Memory objects matching the tag criteria and time filter
@@ -244,7 +378,9 @@ class MemoryStorage(ABC):
         tags: List[str],
         operation: str = "AND",
         time_start: Optional[float] = None,
-        time_end: Optional[float] = None
+        time_end: Optional[float] = None,
+        include_pending: bool = False,
+        include_superseded: bool = True,
     ) -> List[Memory]:
         """Search memories by tags with AND/OR semantics and time range filtering.
 
@@ -253,6 +389,7 @@ class MemoryStorage(ABC):
             operation: "AND" (all tags must match) or "OR" (any tag matches)
             time_start: Optional Unix timestamp for inclusive range start
             time_end: Optional Unix timestamp for inclusive range end
+            include_superseded: Same meaning as in ``search_by_tag`` (#1803)
 
         Returns:
             List of Memory objects matching the criteria
@@ -282,11 +419,20 @@ class MemoryStorage(ABC):
             memories = memories[:limit]
 
         return memories
-    
+
     @abstractmethod
-    async def delete(self, content_hash: str) -> Tuple[bool, str]:
-        """Delete a memory by its hash."""
+    async def delete(self, content_hash: str, store: Optional[str] = None) -> Tuple[bool, str]:
+        """Delete a memory by its hash. If store is given, scope deletion to that partition (#1465)."""
         pass
+
+    async def delete_memory(self, content_hash: str) -> bool:
+        """Delete a memory by hash, returning only success.
+
+        The consolidator's storage protocol calls this when applying
+        forgetting results; backends that only implement delete() get it here.
+        """
+        success, _ = await self.delete(content_hash)
+        return success
 
     async def is_deleted(self, content_hash: str) -> bool:
         """
@@ -306,6 +452,19 @@ class MemoryStorage(ABC):
             Override in backends that support tombstones (e.g., sqlite_vec).
         """
         return False
+
+    async def list_content_hashes(self, include_deleted: bool = False) -> "Set[str]":
+        """Return the set of content hashes (RFC #1304 Phase 1). Default delegates
+        to get_all_content_hashes when present; backends without it return empty."""
+        getter = getattr(self, 'get_all_content_hashes', None)
+        if getter is not None:
+            return await getter(include_deleted=include_deleted)
+        return set()
+
+    async def list_content_hashes_page(self, after_id: int = 0, limit: int = 1000, include_deleted: bool = False) -> "List[Tuple[int, str]]":
+        """Cursor-paginated (id-based) list of (id, content_hash). Default returns []
+        for backends without an efficient paginated listing."""
+        return []
 
     async def health_probe(self) -> bool:
         """
@@ -375,7 +534,7 @@ class MemoryStorage(ABC):
         raise NotImplementedError("Subclasses must implement delete_before_date")
 
     @abstractmethod
-    async def get_by_exact_content(self, content: str) -> List[Memory]:
+    async def get_by_exact_content(self, content: str, store: Optional[str] = None) -> List[Memory]:
         """
         Retrieve memories by exact content match.
 
@@ -387,8 +546,15 @@ class MemoryStorage(ABC):
         """
         raise NotImplementedError("Subclasses must implement get_by_exact_content")
 
+    # Whether get_by_hash honors ``store`` (confines the lookup to that
+    # partition). Backends that accept ``store`` but ignore it leave this
+    # False, so a store-scoped hash-addressed operation must fail closed on
+    # them until the storage layer enforces ``store`` everywhere (follow-up
+    # issue). Overridden True on sqlite_vec and hybrid.
+    get_by_hash_is_store_scoped: bool = False
+
     @abstractmethod
-    async def get_by_hash(self, content_hash: str) -> Optional[Memory]:
+    async def get_by_hash(self, content_hash: str, store: Optional[str] = None) -> Optional[Memory]:
         """
         Get a memory by its content hash using direct O(1) lookup.
 
@@ -405,7 +571,7 @@ class MemoryStorage(ABC):
         """Delete memories by tag. Returns (count_deleted, message)."""
         pass
 
-    async def delete_by_tags(self, tags: List[str]) -> Tuple[int, str, List[str]]:
+    async def delete_by_tags(self, tags: List[str], store: Optional[str] = None) -> Tuple[int, str, List[str]]:
         """
         Delete memories matching ANY of the given tags.
 
@@ -518,7 +684,7 @@ class MemoryStorage(ABC):
             if content_hash:
                 if dry_run:
                     # Check if memory exists
-                    memory = await self.get_by_hash(content_hash)
+                    memory = await self.get_by_hash(content_hash, store=store)
                     if memory:
                         return {
                             "success": True,
@@ -537,7 +703,7 @@ class MemoryStorage(ABC):
                         }
 
                 # Execute deletion
-                success, message = await self.delete(content_hash)
+                success, message = await self.delete(content_hash, store=store)
                 return {
                     "success": success,
                     "deleted_count": 1 if success else 0,
@@ -566,7 +732,7 @@ class MemoryStorage(ABC):
             if tags and not before and not after and tag_match == "any":
                 # Optimized path: tag-only deletion with ANY match
                 if hasattr(self, 'delete_by_tags') and not dry_run:
-                    count, message, deleted_hashes = await self.delete_by_tags(tags)
+                    count, message, deleted_hashes = await self.delete_by_tags(tags, store=store)
                     return {
                         "success": count > 0,
                         "deleted_count": count,
@@ -598,7 +764,8 @@ class MemoryStorage(ABC):
 
                         filtered_memories = await self.get_memories_by_time_range(
                             start_time=start_time,
-                            end_time=end_time
+                            end_time=end_time,
+                            store=store
                         )
                     except ValueError as e:
                         return {
@@ -610,8 +777,11 @@ class MemoryStorage(ABC):
                         }
 
             # Fallback: Load all memories and filter in Python (slower but always works)
+            # NOTE: this is the DELETE path — keep the full listing (no exclude_pending).
+            # Deletion must never skip pending rows (they would silently survive and reappear
+            # in search after embedding repair). Pending exclusion belongs on SEARCH paths only.
             if not use_optimized:
-                all_memories = await self.get_all_memories()
+                all_memories = await self.get_all_memories(store=store)
 
                 for memory in all_memories:
                     # Tag filter
@@ -683,7 +853,7 @@ class MemoryStorage(ABC):
 
             for memory in filtered_memories:
                 try:
-                    success, msg = await self.delete(memory.content_hash)
+                    success, msg = await self.delete(memory.content_hash, store=store)
                     if success:
                         deleted_count += 1
                         deleted_hashes.append(memory.content_hash)
@@ -727,9 +897,15 @@ class MemoryStorage(ABC):
     async def cleanup_duplicates(self) -> Tuple[int, str]:
         """Remove duplicate memories. Returns (count_removed, message)."""
         pass
-    
+
     @abstractmethod
-    async def update_memory_metadata(self, content_hash: str, updates: Dict[str, Any], preserve_timestamps: bool = True) -> Tuple[bool, str]:
+    async def update_memory_metadata(
+        self,
+        content_hash: str,
+        updates: Dict[str, Any],
+        preserve_timestamps: bool = True,
+        store: Optional[str] = None,
+    ) -> Tuple[bool, str]:
         """
         Update memory metadata without recreating the entire memory entry.
 
@@ -737,6 +913,10 @@ class MemoryStorage(ABC):
             content_hash: Hash of the memory to update
             updates: Dictionary of metadata fields to update
             preserve_timestamps: Whether to preserve original created_at timestamp
+            store: Confine the update to this store; a memory in another store
+                is reported as not found. ``None`` or ``"all"`` is unscoped.
+                Only backends with ``get_by_hash_is_store_scoped`` honor it
+                (#1683); callers pass it only to those.
 
         Returns:
             Tuple of (success, message)
@@ -815,7 +995,7 @@ class MemoryStorage(ABC):
         """
         # Default: no-op. Concrete backends override with real implementation.
         return 0
-    
+
     async def get_stats(self) -> Dict[str, Any]:
         """Get storage statistics. Override for specific implementations."""
         return {
@@ -823,12 +1003,12 @@ class MemoryStorage(ABC):
             "storage_backend": self.__class__.__name__,
             "status": "operational"
         }
-    
+
     async def get_all_tags(self) -> List[str]:
         """Get all unique tags in the storage. Override for specific implementations."""
         return []
 
-    async def get_all_tags_with_counts(self) -> List[Dict[str, Any]]:
+    async def get_all_tags_with_counts(self, store: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all tags with their usage counts, ordered by count descending.
 
         Returns a list of ``{"tag": str, "count": int}``. Declared here because
@@ -848,6 +1028,7 @@ class MemoryStorage(ABC):
         n_results: int = 5,
         start_timestamp: Optional[float] = None,
         end_timestamp: Optional[float] = None,
+        store: Optional[str] = None,
     ) -> List[MemoryQueryResult]:
         """Retrieve memories by time window, optionally ranked by a semantic query.
 
@@ -867,11 +1048,11 @@ class MemoryStorage(ABC):
         # Default implementation just uses regular search
         results = await self.retrieve(query, n_results)
         return [r.memory for r in results]
-    
+
     async def search(self, query: str, n_results: int = 5) -> List[MemoryQueryResult]:
         """Search memories. Default implementation uses retrieve."""
         return await self.retrieve(query, n_results)
-    
+
     # NOTE: ``include_embeddings`` is a new kwarg (see #881). The three
     # overriding subclasses (sqlite_vec, hybrid, cloudflare) still carry
     # their pre-#881 signatures and will be updated in the follow-up PR
@@ -890,6 +1071,9 @@ class MemoryStorage(ABC):
         stale_days: Optional[int] = None,
         include_embeddings: bool = False,
         store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
+        exclude_pending: bool = False,
+        include_superseded: bool = True,
     ) -> List[Memory]:
         """
         Get all memories in storage ordered by creation time (newest first).
@@ -908,19 +1092,34 @@ class MemoryStorage(ABC):
                 stages. Backends without local embeddings (e.g. Cloudflare)
                 MAY ignore the flag. Default False keeps the CRUD cost
                 envelope unchanged.
+            include_superseded: If False, leave out memories replaced by a
+                newer version (``superseded_by`` set), the way ``retrieve()``
+                does by default. Default True keeps every live row for the
+                sync, export and maintenance callers (#1803).
 
         Returns:
             List of Memory objects ordered by created_at DESC, optionally filtered by type and tags
         """
         return []
-    
-    async def count_all_memories(self, memory_type: Optional[str] = None, tags: Optional[List[str]] = None, tag_match: str = "any", stale_days: Optional[int] = None, store: Optional[str] = "default") -> int:
+
+    async def get_stores(self) -> List[str]:
+        """Return the name of every store that holds at least one live memory.
+
+        Backends without named stores keep the default: the single ``default`` store.
+        Callers that need every memory, such as the export, walk this list and call
+        ``get_all_memories(store=...)`` for each name (#1520).
+        """
+        return ["default"]
+
+    async def count_all_memories(self, memory_type: Optional[str] = None, tags: Optional[List[str]] = None, tag_match: str = "any", stale_days: Optional[int] = None, store: Optional[str] = "default", agent_id: Optional[str] = None, include_superseded: bool = True) -> int:
         """
         Get total count of memories in storage.
 
         Args:
             memory_type: Optional filter by memory type
             tags: Optional filter by tags (memories matching ANY of the tags)
+            include_superseded: If False, do not count superseded versions;
+                same meaning as in ``get_all_memories`` (#1803)
 
         Returns:
             Total number of memories, optionally filtered by type and/or tags
@@ -941,6 +1140,18 @@ class MemoryStorage(ABC):
         memories = await self.search_by_tag(tags)
         return len(memories)
 
+    async def count_untagged_memories(self) -> int:
+        """Count memories with no tags (NULL, empty string, or whitespace only)."""
+        raise NotImplementedError("count_untagged_memories not supported by this backend")
+
+    async def delete_untagged_memories(self, expected_count: Optional[int] = None) -> Tuple[int, str]:
+        """Delete memories with no tags. Returns (affected_count, message)."""
+        raise NotImplementedError("delete_untagged_memories not supported by this backend")
+
+    async def get_db_embedding_dimension(self) -> Optional[int]:
+        """Get the embedding dimension configured in the underlying database table/collection."""
+        return None
+
     # NOTE: ``include_embeddings`` — see ``get_all_memories`` above.
     # Subclass signatures updated in the follow-up PR.
     async def get_memories_by_time_range(
@@ -948,6 +1159,7 @@ class MemoryStorage(ABC):
         start_time: float,
         end_time: float,
         include_embeddings: bool = False,
+        store: Optional[str] = None,
     ) -> List[Memory]:
         """Get memories within a time range. Override for specific implementations.
 
@@ -963,16 +1175,26 @@ class MemoryStorage(ABC):
             A list of Memory objects within the specified time range.
         """
         return []
-    
+
     async def get_memory_connections(self) -> Dict[str, int]:
         """Get memory connection statistics. Override for specific implementations."""
         return {}
 
-    async def get_access_patterns(self) -> Dict[str, datetime]:
-        """Get memory access pattern statistics. Override for specific implementations."""
+    async def get_access_patterns(
+        self, content_hashes: Optional[Sequence[str]] = None
+    ) -> Dict[str, datetime]:
+        """Get memory access pattern statistics. Override for specific implementations.
+
+        Args:
+            content_hashes: Optional candidate window. When provided, backends should
+                return access times only for these hashes, so consolidation memory use
+                and latency scale with the candidate batch instead of the whole
+                ever-accessed population. When ``None`` the full set is returned
+                (backwards-compatible default).
+        """
         return {}
 
-    async def get_memory_timestamps(self, days: Optional[int] = None) -> List[float]:
+    async def get_memory_timestamps(self, days: Optional[int] = None, store: Optional[str] = None) -> List[float]:
         """
         Get memory creation timestamps only, without loading full memory objects.
 
@@ -1012,7 +1234,8 @@ class MemoryStorage(ABC):
     async def get_graph_visualization_data(
         self,
         limit: int = 100,
-        min_connections: int = 1
+        min_connections: int = 1,
+        store: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Get graph data for visualization in D3.js-compatible format.
@@ -1047,7 +1270,99 @@ class MemoryStorage(ABC):
                 ]
             }
         """
-        return {"nodes": [], "edges": []}
+        # Includes "meta" because the /api/analytics/graph-visualization
+        # response model requires it — returning only nodes/edges made the
+        # endpoint 500 on every backend that fell through to this default.
+        return {
+            "nodes": [],
+            "edges": [],
+            "meta": {
+                "total_nodes": 0,
+                "total_edges": 0,
+                "min_connections": min_connections,
+                "limit": limit,
+            },
+        }
+
+    @staticmethod
+    def _post_filter_as_of(
+        results: List[MemoryQueryResult], as_of_ts: float
+    ) -> List[MemoryQueryResult]:
+        """Best-effort point-in-time post-filter (issue #1724).
+
+        For backends without SQL-level as_of support (cloudflare, milvus,
+        remote_http): drop memories created after as_of, and drop memories
+        that are superseded without a known replacement moment (their
+        supersede time cannot be proven to be after as_of, so they cannot be
+        shown as current at as_of). Backends with native support (sqlite_vec,
+        hybrid via primary) already filtered; this is a no-op for them.
+        """
+        filtered = []
+        for r in results:
+            created = r.memory.created_at
+            if created is not None and created > as_of_ts:
+                continue
+            sup_by = r.superseded_by
+            sup_at = r.superseded_at
+            if sup_by and (sup_at is None or sup_at <= as_of_ts):
+                continue
+            filtered.append(r)
+        return filtered
+
+    async def _get_supersession_map(
+        self, content_hashes: List[str], store: Optional[str] = None
+    ) -> Dict[str, Tuple[Optional[str], Optional[float]]]:
+        """Batch supersession-lineage lookup: content_hash -> (superseded_by, superseded_at).
+
+        Issue #1724 follow-up: exact / time-only / tag-only search paths build
+        results from raw Memory objects that never flow through retrieve(), so
+        their lineage fields are empty. The base implementation returns {}
+        (backend cannot provide it — those paths then get only the created_at
+        bound); SQLite overrides with a single batched query.
+        """
+        return {}
+
+    async def _enrich_supersession(
+        self, results: List[MemoryQueryResult], store: Optional[str] = None
+    ) -> List[MemoryQueryResult]:
+        """Backfill supersession lineage on results that lack it. Never raises:
+        on any failure the results pass through unchanged (created_at bound
+        still applies via _post_filter_as_of)."""
+        try:
+            need = [
+                r for r in results
+                if r.superseded_by is None and r.superseded_at is None
+            ]
+            if not need:
+                return results
+            mapping = await self._get_supersession_map(
+                [r.memory.content_hash for r in need], store=store
+            )
+            if not mapping:
+                return results
+            for r in need:
+                hit = mapping.get(r.memory.content_hash)
+                if hit:
+                    r.superseded_by, r.superseded_at = hit
+            return results
+        except Exception as e:
+            logger.warning(
+                "Supersession enrichment failed, continuing without lineage: %s",
+                _sanitize_log_value(str(e)),
+            )
+            return results
+
+    async def _drop_superseded(
+        self, results: List[MemoryQueryResult], store: Optional[str] = None
+    ) -> List[MemoryQueryResult]:
+        """Leave out superseded versions on the paths that bypass retrieve() (#1803).
+
+        retrieve() hides superseded rows by default; the exact, tag-only and
+        time-only search paths build their results from raw Memory objects, so
+        they backfill the lineage first and apply the same rule here.
+        """
+        results = await self._enrich_supersession(results, store=store)
+        return [r for r in results if not r.superseded_by]
 
     async def search_memories(
         self,
@@ -1064,6 +1379,8 @@ class MemoryStorage(ABC):
         include_superseded: bool = False,
         ranking_weights: Optional[Dict[str, float]] = None,
         store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
+        as_of: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Unified memory search with flexible modes and filters.
@@ -1180,7 +1497,7 @@ class MemoryStorage(ABC):
                         start_time = start_timestamp
                     if end_timestamp is not None:
                         end_time = end_timestamp
-                except Exception as e:
+                except Exception:
                     # Continue without time filter rather than failing
                     pass
 
@@ -1211,6 +1528,23 @@ class MemoryStorage(ABC):
                             "error": f"Invalid before date format: {before}. Use YYYY-MM-DD"
                         }
 
+            # Point-in-time query (issue #1724): knowledge-time semantics —
+            # "what did the store contain at as_of". Accepts ISO dates and the
+            # YYYY / YYYY-MM shorthands (last day of the period).
+            as_of_ts = None
+            if as_of is not None:
+                from ..utils.time_parser import parse_as_of  # inline import
+                try:
+                    as_of_ts = parse_as_of(as_of)
+                except ValueError:
+                    return {
+                        "memories": [],
+                        "total": 0,
+                        "query": query,
+                        "mode": mode,
+                        "error": f"Invalid as_of date format: {as_of}. Use YYYY, YYYY-MM, or an ISO date/datetime"
+                    }
+
             # Perform search based on mode
             results = []
 
@@ -1227,11 +1561,12 @@ class MemoryStorage(ABC):
                 from ..reasoning.ranked_search import apply_ranked_rerank, RankedSearchWeights
                 # Over-fetch without pre-filtering: the shared tail applies
                 # tag_match and time filters uniformly (fixes #1028 review).
-                oversample = limit * 5 if (tags or start_time or end_time) else limit * 3
+                oversample = limit * 5 if (tags or start_time or end_time or agent_id) else limit * 3
                 candidates = await self.retrieve(
                     query, n_results=oversample,
                     include_superseded=include_superseded,
                     store=store,
+                    as_of=as_of_ts,
                 )
                 if candidates:
                     weights = RankedSearchWeights.from_dict(ranking_weights)
@@ -1251,12 +1586,22 @@ class MemoryStorage(ABC):
                     }
 
                 # Get memories with exact content match
-                matched_memories = await self.get_by_exact_content(query)
+                matched_memories = await self.get_by_exact_content(query, store=store)
                 # Convert to MemoryQueryResult format for consistency
                 results = [
                     MemoryQueryResult(memory=m, relevance_score=1.0, debug_info=None)
                     for m in matched_memories
                 ]
+                # Issue #1724 follow-up: exact matches never flow through
+                # retrieve(), so backfill supersession lineage (for the status
+                # flags below) and apply the point-in-time bound. Without
+                # either, superseded versions are hidden as retrieve() does (#1803).
+                if as_of_ts is not None or include_superseded:
+                    results = await self._enrich_supersession(results, store=store)
+                if as_of_ts is not None:
+                    results = self._post_filter_as_of(results, as_of_ts)
+                elif not include_superseded:
+                    results = await self._drop_superseded(results, store=store)
                 pre_filter_count = len(results)
 
             elif mode in ("semantic", "hybrid"):
@@ -1278,7 +1623,14 @@ class MemoryStorage(ABC):
                     # Over-fetch when time filters are present AND using a path that
                     # cannot pass start_time/end_time to SQL (hybrid/quality_boost).
                     # Standard semantic retrieve() already filters at SQL level.
-                    if (start_time is not None or end_time is not None) and (quality_boost > 0 or mode == "hybrid"):
+                    if (start_time is not None or end_time is not None or tags) and (quality_boost > 0 or mode == "hybrid"):
+                        fetch_limit = max(fetch_limit, limit * 5)
+                    # agent_id is NOT passed down to retrieve() (it is applied as an
+                    # in-memory post-filter below), so over-fetch is ALWAYS required
+                    # when it is set — including in plain semantic mode. Otherwise
+                    # higher-ranked memories from other agents fill the limit slots
+                    # and matching memories are truncated before the filter runs.
+                    if agent_id is not None:
                         fetch_limit = max(fetch_limit, limit * 5)
 
                     # Choose search method based on mode and available features
@@ -1289,7 +1641,9 @@ class MemoryStorage(ABC):
                             results = await self.retrieve_hybrid(
                                 query,
                                 n_results=fetch_limit,
-                                include_superseded=include_superseded
+                                include_superseded=include_superseded,
+                                store=store,
+                                as_of=as_of_ts,
                             )
                         else:
                             # Fall back to semantic if hybrid disabled in config
@@ -1301,10 +1655,12 @@ class MemoryStorage(ABC):
                                     tags=tags,
                                     quality_boost=True,
                                     quality_weight=quality_boost,
-                                    include_superseded=include_superseded
+                                    include_superseded=include_superseded,
+                                    store=store,
+                                    as_of=as_of_ts,
                                 )
                             else:
-                                results = await self.retrieve(query, n_results=fetch_limit, tags=tags, include_superseded=include_superseded, start_time=start_time, end_time=end_time, store=store)
+                                results = await self.retrieve(query, n_results=fetch_limit, tags=tags, include_superseded=include_superseded, start_time=start_time, end_time=end_time, store=store, as_of=as_of_ts)
                     elif quality_boost > 0:
                         # Use quality-boosted retrieval
                         results = await self.retrieve_with_quality_boost(
@@ -1313,11 +1669,13 @@ class MemoryStorage(ABC):
                             tags=tags,
                             quality_boost=True,
                             quality_weight=quality_boost,
-                            include_superseded=include_superseded
+                            include_superseded=include_superseded,
+                            store=store,
+                            as_of=as_of_ts,
                         )
                     else:
                         # Standard semantic search
-                        results = await self.retrieve(query, n_results=fetch_limit, tags=tags, include_superseded=include_superseded, start_time=start_time, end_time=end_time, store=store)
+                        results = await self.retrieve(query, n_results=fetch_limit, tags=tags, include_superseded=include_superseded, start_time=start_time, end_time=end_time, store=store, as_of=as_of_ts)
 
                     pre_filter_count = len(results)
                 else:
@@ -1330,7 +1688,7 @@ class MemoryStorage(ABC):
                             use_optimized_search = True
                             st = start_time if start_time is not None else 0.0
                             et = end_time if end_time is not None else datetime.now().timestamp()
-                            memories = await self.get_memories_by_time_range(st, et)
+                            memories = await self.get_memories_by_time_range(st, et, exclude_pending=True, store=store)
                             results = [
                                 MemoryQueryResult(memory=m, relevance_score=0.5, debug_info=None)
                                 for m in memories
@@ -1339,11 +1697,24 @@ class MemoryStorage(ABC):
 
                     # Fallback: load all memories then filter
                     if not use_optimized_search:
-                        all_memories = await self.get_all_memories()
+                        all_memories = await self.get_all_memories(exclude_pending=True, store=store)
                         results = [
                             MemoryQueryResult(memory=m, relevance_score=0.5, debug_info=None)
                             for m in all_memories
                         ]
+                        pre_filter_count = len(results)
+
+                    # Issue #1724 follow-up: time-only / tag-only paths also
+                    # bypass retrieve() — same enrichment + point-in-time bound
+                    # as the exact branch above.
+                    if as_of_ts is not None or include_superseded:
+                        results = await self._enrich_supersession(results, store=store)
+                    if as_of_ts is not None:
+                        results = self._post_filter_as_of(results, as_of_ts)
+                        pre_filter_count = len(results)
+                    elif not include_superseded:
+                        # Issue #1803: hide superseded versions, as retrieve() does.
+                        results = await self._drop_superseded(results, store=store)
                         pre_filter_count = len(results)
 
             # Apply time filters
@@ -1380,6 +1751,16 @@ class MemoryStorage(ABC):
                             filtered_results.append(result)
                 results = filtered_results
 
+            # Apply agent_id filter (unified metadata.agent_id OR tag agent:<id>)
+            if agent_id is not None:
+                filtered_results = []
+                for result in results:
+                    # Check metadata.agent_id or agent:<id> tag
+                    if (result.memory.agent_id == agent_id or
+                        f"agent:{agent_id}" in (result.memory.tags or [])):
+                        filtered_results.append(result)
+                results = filtered_results
+
             # Limit results
             results = results[:limit]
 
@@ -1391,6 +1772,22 @@ class MemoryStorage(ABC):
                 mem_dict["similarity_score"] = r.relevance_score
                 if r.debug_info:
                     mem_dict["debug_info"] = r.debug_info
+                # Issue #1724: status flags. The status is evaluated at the
+                # query time (as_of when given, otherwise now): a memory whose
+                # supersede happened after as_of was still current then.
+                if include_superseded:
+                    query_ts = as_of_ts if as_of_ts is not None else time.time()
+                    sup_by = r.superseded_by
+                    sup_at = r.superseded_at
+                    is_superseded = bool(sup_by) and (sup_at is None or sup_at <= query_ts)
+                    mem_dict["status"] = "superseded" if is_superseded else "current"
+                    if sup_by:
+                        mem_dict["superseded_by"] = sup_by
+                    if sup_at is not None:
+                        mem_dict["superseded_at"] = sup_at
+                        mem_dict["superseded_at_iso"] = (
+                            datetime.fromtimestamp(sup_at, tz=timezone.utc).isoformat()
+                        )
                 memories.append(mem_dict)
 
             # Build response

@@ -46,6 +46,9 @@ the method optional. The rest are not, which makes the method mandatory for
 every backend the web server can be pointed at. WEB_API_REQUIRED_METHODS is that
 second list: each entry must be declared on MemoryStorage and overridden by all
 four backends, so a missing method fails here instead of on a dashboard tab.
+
+The `agent_id` keyword (issue #1650) is guarded the same way as `store`:
+AGENT_ID_CONTRACT_METHODS lists the methods callers pass it to.
 """
 
 import importlib
@@ -63,6 +66,38 @@ STORE_CONTRACT_METHODS = [
     "count_all_memories",
     "search_memories",
     "delete_memories",
+    # Added with the HTTP store-scope work (#1106): web/api now passes store=
+    # to these as well. Milvus.retrieve was missing the keyword entirely, so a
+    # by-time search with a semantic query raised TypeError -> HTTP 500.
+    "retrieve",
+    "recall",
+    "get_by_hash",
+    "get_memory_timestamps",
+    "get_all_tags_with_counts",
+    "get_graph_visualization_data",
+]
+
+# Methods that callers invoke with `agent_id=` (#1297): services/memory_service.py
+# passes it to get_all_memories and count_all_memories, and the MCP search
+# handler (server/handlers/memory.py::_retrieve_search_results) always passes it
+# to search_memories, None included. Milvus overrides search_memories and shipped
+# without the keyword, so every memory_search call on Milvus raised TypeError
+# (issue #1650) — the same drift as #133, for a different keyword.
+AGENT_ID_CONTRACT_METHODS = [
+    "get_all_memories",
+    "count_all_memories",
+    "search_memories",
+]
+
+# Methods that services/memory_service.py (list_memories, search_by_tag) and
+# web/api/search.py call with `include_superseded=` (#1803), so the list and tag
+# searches only show current versions. Every backend must accept the keyword.
+INCLUDE_SUPERSEDED_CONTRACT_METHODS = [
+    "get_all_memories",
+    "count_all_memories",
+    # MemoryService.search_by_tag (the search_by_tag MCP handler) passes it too.
+    "search_by_tag",
+    "search_by_tags",
 ]
 
 # Methods that web/api/*.py calls on `storage` WITHOUT a hasattr guard, i.e.
@@ -116,6 +151,58 @@ BASE_DEFAULT_ALLOWED = {
     "get_graph_visualization_data",
     "get_relationship_type_distribution",
 }
+
+# Milvus parity methods (issue #1201). These are not guaranteed on every
+# backend: older backends may intentionally inherit a base fallback, and the
+# web layer still has a SQLite-only compatibility path for type counts (the
+# untagged one went to the storage layer in #1870). Milvus, however, is expected to implement all of them, and the
+# calls below mirror every shape used by web/api and the MCP handlers. Keeping
+# the call shapes here prevents a rebase from silently changing a keyword name
+# or dropping a parameter that production callers pass.
+MILVUS_PARITY_CALL_SHAPES = {
+    "count_untagged_memories": [
+        ((), {}),
+    ],
+    "delete_untagged_memories": [
+        ((), {}),
+    ],
+    "get_type_counts": [
+        ((), {}),
+    ],
+    "get_relationship_type_distribution": [
+        ((), {}),
+    ],
+    "get_graph_visualization_data": [
+        ((), {}),
+        ((10, 2), {}),
+        ((), {"limit": 10, "min_connections": 2}),
+    ],
+    "update_memory_versioned": [
+        (("old-hash", "new content"), {}),
+        (
+            ("old-hash", "new content"),
+            {
+                "new_tags": ["updated"],
+                "new_memory_type": "decision",
+                "reason": "source changed",
+            },
+        ),
+    ],
+}
+
+# The reasoning service treats GraphStorage as a duck-typed protocol. These
+# methods are called by the MCP graph handlers and two-phase aggregation code,
+# so MilvusGraphStorage must stay signature-compatible with the SQLite
+# GraphStorage implementation instead of growing a private variant.
+GRAPH_STORAGE_PARITY_METHODS = [
+    "store_entity_link",
+    "list_entities",
+    "find_memories_by_entity",
+    "get_entities_for_memory",
+    "get_entity_profile",
+    "transitive_closure",
+    "common_neighbors",
+]
 
 # Backend modules to check. Each must be importable WITHOUT its optional heavy
 # deps (pymilvus, etc.) so this guard runs in the ML-free CI image.
@@ -202,6 +289,39 @@ def test_base_interface_declares_store_kwarg(method_name):
     )
 
 
+@pytest.mark.parametrize("method_name", AGENT_ID_CONTRACT_METHODS)
+def test_all_backends_accept_agent_id_kwarg(method_name):
+    """Each backend, inherited or overridden, accepts the `agent_id` callers pass."""
+    offenders = []
+    for name, cls, err in BACKENDS:
+        if cls is None:
+            continue
+        method = getattr(cls, method_name, None)
+        assert method is not None, f"{name} is missing {method_name}()"
+        params = inspect.signature(method).parameters
+        accepts_agent_id = (
+            "agent_id" in params
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        )
+        if not accepts_agent_id:
+            offenders.append(name)
+    assert not offenders, (
+        f"{method_name}() is missing the `agent_id` keyword on: {offenders}. "
+        f"Callers pass agent_id=... to this method (issue #1650)."
+    )
+
+
+@pytest.mark.parametrize("method_name", AGENT_ID_CONTRACT_METHODS)
+def test_base_interface_declares_agent_id_kwarg(method_name):
+    """The abstract interface declares `agent_id` for every method callers pass it to."""
+    method = getattr(MemoryStorage, method_name, None)
+    assert method is not None, f"MemoryStorage is missing {method_name}()"
+    assert "agent_id" in inspect.signature(method).parameters, (
+        f"MemoryStorage.{method_name}() does not declare `agent_id`, but callers "
+        f"pass it (issue #1650)."
+    )
+
+
 @pytest.mark.parametrize("method_name", WEB_API_REQUIRED_METHODS)
 def test_base_interface_declares_web_api_methods(method_name):
     """The abstract interface declares every method the web API calls unguarded.
@@ -240,4 +360,97 @@ def test_all_backends_implement_web_api_methods(method_name):
         f"{method_name}() is not implemented on: {offenders}. web/api/ calls it "
         f"without a hasattr guard, so those backends fail the endpoint at "
         f"runtime (issue #213)."
+    )
+
+
+def _backend_class(module_name: str, class_name: str):
+    module = importlib.import_module(module_name)
+    return getattr(module, class_name)
+
+
+def _public_signature(method):
+    """Return a class method's signature without the leading ``self``."""
+    signature = inspect.signature(method)
+    parameters = list(signature.parameters.values())
+    if parameters and parameters[0].name in {"self", "cls"}:
+        signature = signature.replace(parameters=parameters[1:])
+    return signature
+
+
+def _signature_shape(method):
+    """Comparable parameter shape, intentionally ignoring annotations."""
+    return [
+        (parameter.name, parameter.kind, parameter.default)
+        for parameter in inspect.signature(method).parameters.values()
+    ]
+
+
+@pytest.mark.parametrize("method_name", MILVUS_PARITY_CALL_SHAPES)
+def test_milvus_parity_methods_accept_web_api_call_shapes(method_name):
+    """Milvus implements the method and accepts every production call shape."""
+    milvus = _backend_class(
+        "mcp_memory_service.storage.milvus", "MilvusMemoryStorage"
+    )
+    method = milvus.__dict__.get(method_name)
+    assert method is not None, (
+        f"MilvusMemoryStorage does not override {method_name}(); issue #1201 "
+        f"requires a real Milvus implementation, not a base fallback"
+    )
+    assert inspect.iscoroutinefunction(method), (
+        f"MilvusMemoryStorage.{method_name}() must be async to match its callers"
+    )
+
+    signature = _public_signature(method)
+    for args, kwargs in MILVUS_PARITY_CALL_SHAPES[method_name]:
+        try:
+            signature.bind(*args, **kwargs)
+        except TypeError as exc:
+            raise AssertionError(
+                f"MilvusMemoryStorage.{method_name}{signature} does not accept "
+                f"the web/MCP call shape args={args!r}, kwargs={kwargs!r}: {exc}"
+            ) from exc
+
+
+@pytest.mark.parametrize("method_name", GRAPH_STORAGE_PARITY_METHODS)
+def test_milvus_graph_storage_matches_graph_storage_signature(method_name):
+    """MilvusGraphStorage implements the same duck-typed GraphStorage protocol."""
+    from mcp_memory_service.storage.graph import GraphStorage
+
+    sqlite_method = getattr(GraphStorage, method_name, None)
+    assert sqlite_method is not None, f"GraphStorage is missing {method_name}()"
+
+    milvus_graph = _backend_class(
+        "mcp_memory_service.storage.milvus_graph", "MilvusGraphStorage"
+    )
+    milvus_method = getattr(milvus_graph, method_name, None)
+    assert milvus_method is not None, (
+        f"MilvusGraphStorage is missing {method_name}(); issue #1201 requires "
+        f"parity with GraphStorage"
+    )
+    assert inspect.iscoroutinefunction(milvus_method), (
+        f"MilvusGraphStorage.{method_name}() must be async to match GraphStorage"
+    )
+    assert _signature_shape(milvus_method) == _signature_shape(sqlite_method), (
+        f"MilvusGraphStorage.{method_name}{inspect.signature(milvus_method)} "
+        f"does not match GraphStorage.{method_name}{inspect.signature(sqlite_method)}"
+    )
+
+
+@pytest.mark.parametrize("method_name", INCLUDE_SUPERSEDED_CONTRACT_METHODS)
+def test_all_backends_accept_include_superseded_kwarg(method_name):
+    """Each backend and the base interface accept the `include_superseded` callers pass."""
+    offenders = []
+    for name, cls in [("MemoryStorage", MemoryStorage)] + [
+        (name, cls) for name, cls, err in BACKENDS if cls is not None
+    ]:
+        method = getattr(cls, method_name, None)
+        assert method is not None, f"{name} is missing {method_name}()"
+        params = inspect.signature(method).parameters
+        if "include_superseded" not in params and not any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            offenders.append(name)
+    assert not offenders, (
+        f"{method_name}() is missing the `include_superseded` keyword on: "
+        f"{offenders}. MemoryService and the REST tag search pass it (issue #1803)."
     )

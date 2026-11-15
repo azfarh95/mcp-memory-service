@@ -21,6 +21,8 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mcp_memory_service.server.handlers.quality as qmod
+from mcp_memory_service.consolidation.insights import InsightCard
 from mcp_memory_service.server.handlers.quality import (
     handle_maintain,
     handle_maintain_status,
@@ -41,6 +43,9 @@ def mock_server():
     storage.count_all_memories = AsyncMock(return_value=5)
     storage.get_all_memories = AsyncMock(return_value=[])
     storage.resolve_conflict = AsyncMock(return_value=(True, "resolved"))
+    storage.reconcile_conflict_tags = AsyncMock(
+        return_value={"supported": True, "found": 0, "cleared": 0, "hashes": []}
+    )
     storage.graph = None  # No graph storage in tests by default
 
     server._ensure_storage_initialized = AsyncMock(return_value=storage)
@@ -215,6 +220,25 @@ async def test_maintain_step_error_does_not_abort(mock_server):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_maintain_conflict_tag_reconcile_error_keeps_conflict_totals(mock_server):
+    """A failing tag reconcile (#1840) is reported without losing the conflicts step."""
+    server, storage = mock_server
+    storage.get_conflicts = AsyncMock(return_value=[
+        {"hash_a": "a" * 64, "hash_b": "b" * 64, "similarity": 0.5},
+    ])
+    storage.reconcile_conflict_tags = AsyncMock(side_effect=RuntimeError("tag sweep failed"))
+    result = await handle_maintain(server, {})
+    report = json.loads(result[0].text)
+
+    conflicts = report["steps"]["conflicts"]
+    assert conflicts["total"] == 1
+    assert conflicts["stale_tags"] == {"error": "tag sweep failed"}
+    assert "conflict_tags: tag sweep failed" in report["errors"]
+    assert report["success"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_maintain_entity_extraction_sees_memory_tags(mock_server):
     """Batch extraction must see a memory's tags (Issue #218).
 
@@ -301,7 +325,6 @@ async def test_maintain_entity_extraction_survives_missing_tags(mock_server):
 async def test_maintain_status_never_run():
     """maintain_status returns never_run when no run has happened."""
     # Reset module state
-    import mcp_memory_service.server.handlers.quality as qmod
     qmod._last_maintain_run = {}
 
     result = await handle_maintain_status()
@@ -320,3 +343,34 @@ async def test_maintain_status_after_run(mock_server):
     data = json.loads(result[0].text)
     assert data["action"] == "maintain"
     assert "elapsed_seconds" in data
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_maintain_insight_cards_write_edges_to_graph(mock_server):
+    """The insight-card step passes the graph handle to store_insights(), so
+    derived_from edges reach graph storage (#1319). Memory storage has no
+    store_association(), so without the handle no edge would be written."""
+    server, storage = mock_server
+    storage.store = AsyncMock(return_value=(True, "ok"))
+    storage.get_by_hash = AsyncMock(return_value=None)
+    card = InsightCard(title="t", content="c", source_hashes=["s1", "s2"],
+                       insight_type="pattern", confidence=0.7)
+    graph = MagicMock()
+    graph.store_association = AsyncMock(return_value=True)
+    graph.has_edge = AsyncMock(return_value=False)  # empty graph
+
+    # The handler imports MCP_INSIGHT_CARDS_ENABLED from config, which reads
+    # the environment once at import, so patch the value, not the env var.
+    with patch("mcp_memory_service.config.MCP_INSIGHT_CARDS_ENABLED", True), \
+         patch("mcp_memory_service.server.handlers.graph.get_graph_storage",
+               AsyncMock(return_value=graph)), \
+         patch("mcp_memory_service.consolidation.insights.InsightGenerator.generate_insights",
+               return_value=[card]):
+        result = await handle_maintain(server, {"dry_run": False})
+
+    report = json.loads(result[0].text)
+    assert report["steps"]["insights"].get("stored") == 1, report["steps"]["insights"]
+    sources = sorted(c.kwargs["source_hash"] for c in graph.store_association.await_args_list
+                     if c.kwargs.get("relationship_type") == "derived_from")
+    assert sources == ["s1", "s2"]

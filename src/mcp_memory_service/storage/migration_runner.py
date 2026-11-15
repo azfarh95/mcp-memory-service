@@ -1,11 +1,14 @@
 """Schema migration runner with version tracking and registry."""
 
 import hashlib
+import locale
 import logging
 import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+
+from ..compat import _sanitize_log_value
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,25 @@ class MigrationRunner:
             )
         """)
 
+    def _ensure_metadata_table(self, conn):
+        """Create the metadata table that holds schema_version (#1628).
+
+        The runner records `schema_version` there after every migration, but only
+        `SqliteVecMemoryStorage.initialize()` used to create the table. `memory
+        migrate` calls `run_pending()` on a plain `sqlite3.connect()` and never went
+        through `initialize()`, so on a database written before v8.7.0 the write
+        failed, the rollback took the migration that had just applied down with it,
+        and every later migration was skipped.
+
+        Creating it here covers both callers. Same definition the storage uses.
+        """
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
     def _get_applied_versions(self, conn) -> set[int]:
         """Read migration_registry to find already-applied versions."""
         try:
@@ -76,9 +98,33 @@ class MigrationRunner:
         except sqlite3.OperationalError:
             return 7
 
+    @staticmethod
+    def _read_sql(path: Path) -> str:
+        """Read a migration file as UTF-8, the encoding the files are written in.
+
+        Without an explicit encoding Python on Windows (before 3.15) decodes with
+        the locale code page, and cp950/cp949 cannot decode the UTF-8 punctuation
+        in 008 and 010, which stopped every later migration (#1789).
+        """
+        return path.read_text(encoding="utf-8")
+
     def _checksum(self, path: Path) -> str:
         """SHA256 checksum of migration file content."""
-        return hashlib.sha256(path.read_text().encode()).hexdigest()
+        return hashlib.sha256(self._read_sql(path).encode()).hexdigest()
+
+    @staticmethod
+    def _legacy_checksum(path: Path) -> str | None:
+        """Checksum as runners before #1789 recorded it on this machine.
+
+        They decoded with the locale encoding. Where that is not UTF-8 but could
+        still decode the file (cp1252, for one), the stored checksum hashes the
+        mis-decoded text and must not be reported as a modified migration.
+        """
+        encoding = locale.getpreferredencoding(False)
+        try:
+            return hashlib.sha256(path.read_text(encoding=encoding).encode()).hexdigest()
+        except (UnicodeDecodeError, LookupError):
+            return None
 
     def _stamp_baseline(self, conn) -> list[int]:
         """Stamp pre-existing migrations as applied without re-executing.
@@ -89,16 +135,78 @@ class MigrationRunner:
 
         Returns list of stamped versions.
         """
-        applied = self._get_applied_versions(conn)
-        if applied:
-            return []  # Registry already populated, nothing to stamp
+        applied = set(self._get_applied_versions(conn))
 
-        # Probe for artifacts left by each known migration
+        # Independent recovery probes (15/16 delta-sync, 20 belief embedding): probe these
+        # INDEPENDENTLY of the legacy baseline below, and only when absent from the registry.
+        # A partial manual rollback can leave the primary artifact (table/column) in place
+        # while its registry row was removed; without this, the forward migration would re-run
+        # the unconditional ADD COLUMN/TABLE and fail duplicate (Greptile). Strict no-op unless
+        # the artifact exists AND its registry row is missing — never changes the legacy 8-11
+        # baseline semantics handled further down.
+        delta_probes = {
+            15: "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_events'",
+            16: "SELECT 1 FROM pragma_table_info('sync_events') WHERE name='hlc_physical'",
+            20: "SELECT 1 FROM pragma_table_info('beliefs') WHERE name='embedding'",
+        }
+        recovered = self._stamp_probes(
+            conn, {v: sql for v, sql in delta_probes.items() if v not in applied}
+        )
+        if recovered:
+            # Advance schema_version to the highest recovered migration, but NEVER lower an
+            # already-higher value. After the documented partial rollback schema_version is 15;
+            # recovering v16 must bump it to 16 so the schema check reports the real state
+            # (otherwise run_pending skips v16 and the version stays stale at 15 — Greptile).
+            self._raise_schema_version(conn, max(recovered))
+
+        # Legacy baseline (008-011): only on a fresh existing DB with an EMPTY registry, detect
+        # artifacts left by the old idempotent runner and stamp them so run_pending skips them.
+        # Preserved exactly as before (early-return when the registry is already populated).
+        if applied:
+            return recovered
+
         probes = {
             8: "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_graph'",
             9: "SELECT 1 FROM pragma_table_info('memory_graph') WHERE name='relationship_type'",
             10: "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_graph'",  # graph indexes
             11: "SELECT 1 FROM pragma_table_info('memories') WHERE name='version'",
+        }
+        stamped = recovered + self._stamp_probes(conn, probes)
+        if stamped:
+            max_version = max(stamped)
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+                (str(max_version),),
+            )
+            conn.commit()
+            logger.info("Baseline stamp: registered migrations %s (existing DB detected)", stamped)
+
+        return stamped
+
+    def _stamp_probes(self, conn, probes: dict) -> list[int]:
+        """Stamp each probed version whose artifact exists but whose registry row is missing.
+
+        Shared by the delta-sync recovery and the legacy 8-11 baseline. Does NOT touch
+        schema_version (callers decide); commits only the registry inserts it performs.
+
+        Before stamping, repairs any SECONDARY artifact a partial rollback may have dropped
+        while the primary artifact (the probed column/table) was retained — otherwise the
+        migration is marked applied forever but a dropped index/trigger never comes back.
+        Repairs are idempotent (IF NOT EXISTS).
+
+        Returns the list of versions stamped.
+        """
+        if not probes:
+            return []
+
+        # Idempotent repairs for secondary artifacts, keyed by migration version. The primary
+        # artifact is detected by the probe; these restore the rest (e.g. the HLC index that a
+        # rollback dropped alongside the retained hlc columns — Greptile).
+        artifact_repairs = {
+            16: "CREATE INDEX IF NOT EXISTS idx_sync_events_hlc "
+                "ON sync_events(hlc_physical, hlc_logical, agent_id, event_id)",
+            20: "CREATE INDEX IF NOT EXISTS idx_beliefs_embedding_pending "
+                "ON beliefs(belief_hash) WHERE embedding IS NULL",
         }
 
         stamped = []
@@ -110,6 +218,10 @@ class MigrationRunner:
             try:
                 cursor = conn.execute(probe_sql)
                 if cursor.fetchone():
+                    # Secondary-artifact repair (idempotent) before stamping.
+                    repair_sql = artifact_repairs.get(version)
+                    if repair_sql:
+                        conn.execute(repair_sql)
                     # Artifact exists — stamp as applied
                     name, path = migrations_by_version.get(version, (f"legacy_{version}", None))
                     checksum = self._checksum(path) if path else ""
@@ -123,15 +235,27 @@ class MigrationRunner:
                 continue
 
         if stamped:
-            max_version = max(stamped)
+            conn.commit()
+        return stamped
+
+    def _raise_schema_version(self, conn, version: int) -> None:
+        """Set schema_version to `version`, but never lower an already-higher value.
+
+        Used after recovery stamps a migration (e.g. v16) on a DB whose schema_version was
+        left behind by a partial rollback, so the reported version matches reality.
+        """
+        try:
+            cur = conn.execute("SELECT value FROM metadata WHERE key='schema_version'")
+            row = cur.fetchone()
+            current = int(row[0]) if row and row[0] is not None else 0
+        except (sqlite3.OperationalError, ValueError, TypeError):
+            current = 0
+        if version > current:
             conn.execute(
                 "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
-                (str(max_version),),
+                (str(version),),
             )
             conn.commit()
-            logger.info(f"Baseline stamp: registered migrations {stamped} (existing DB detected)")
-
-        return stamped
 
     def run_pending(self, conn, dry_run=False) -> dict:
         """Run all pending migrations in order.
@@ -142,6 +266,10 @@ class MigrationRunner:
         try:
             if not dry_run:
                 self._ensure_registry_table(conn)
+                # `schema_version` lives in `metadata`, and every migration below
+                # writes it. Create it here so callers that never initialize()
+                # — `memory migrate` — are covered too (#1628).
+                self._ensure_metadata_table(conn)
                 conn.commit()  # Ensure no open transaction before we begin
                 # Stamp pre-existing migrations on upgrade from old runner
                 self._stamp_baseline(conn)
@@ -157,7 +285,7 @@ class MigrationRunner:
                     result["applied"].append({"version": version, "name": name})
                     continue
 
-                sql = path.read_text()
+                sql = self._read_sql(path)
                 checksum = self._checksum(path)
                 now = datetime.now(timezone.utc).isoformat()
 
@@ -176,11 +304,16 @@ class MigrationRunner:
                     )
                     conn.execute("COMMIT")
                     result["applied"].append({"version": version, "name": name})
-                    logger.info(f"Migration {version:03d}_{name} applied successfully")
+                    logger.info("Migration %03d_%s applied successfully", version, _sanitize_log_value(name))
                 except Exception as e:
                     conn.execute("ROLLBACK")
                     result["error"] = f"Migration {version:03d}_{name} failed: {e}"
-                    logger.error(result["error"])
+                    logger.error(
+                        "Migration %03d_%s failed: %s",
+                        version,
+                        _sanitize_log_value(name),
+                        _sanitize_log_value(e),
+                    )
                     break
 
         except Exception as e:
@@ -209,7 +342,7 @@ class MigrationRunner:
         for version, name, path in migrations:
             if version in registry_by_version:
                 stored = registry_by_version[version].get("checksum")
-                if stored and stored != self._checksum(path):
+                if stored and stored not in (self._checksum(path), self._legacy_checksum(path)):
                     checksum_mismatches.append({"version": version, "name": name, "filename": path.name})
 
         healthy = len(pending) == 0 and len(checksum_mismatches) == 0

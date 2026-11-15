@@ -27,14 +27,11 @@ from mcp import types
 logger = logging.getLogger(__name__)
 
 
-def _sanitize_log_value(value: object) -> str:
-    """Sanitize a user-provided value for safe inclusion in log messages."""
-    return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
-
+from ...compat import _sanitize_log_value
 
 async def handle_memory_ingest(server, arguments: dict) -> List[types.TextContent]:
     """Unified handler for document/directory ingestion."""
-    import json
+    import json  # inline import: keep optional dependencies lazy
 
     file_path = arguments.get("file_path")
     directory_path = arguments.get("directory_path")
@@ -64,8 +61,9 @@ async def handle_ingest_document(server, arguments: dict) -> List[types.TextCont
         from pathlib import Path
         from ...ingestion import get_loader_for_file
         from ...models.memory import Memory
+        from ...models.ontology import coerce_memory_type
         from ...utils import create_memory_from_chunk
-        import time
+        import time  # inline import: keep optional dependencies lazy
 
         # Initialize storage lazily when needed
         storage = await server._ensure_storage_initialized()
@@ -133,7 +131,7 @@ async def handle_ingest_document(server, arguments: dict) -> List[types.TextCont
                     content=chunk.content,
                     content_hash=generate_content_hash(chunk.content),
                     tags=list(set(all_tags)),  # Remove duplicates
-                    memory_type=memory_type,
+                    memory_type=coerce_memory_type(memory_type),
                     metadata=chunk.metadata
                 )
 
@@ -167,11 +165,11 @@ async def handle_ingest_document(server, arguments: dict) -> List[types.TextCont
                 result_lines.extend([f"   - {error}" for error in errors[:3]])
                 result_lines.append(f"   ... and {len(errors) - 3} more errors")
 
-        logger.info(f"Document ingestion completed: {chunks_stored}/{chunks_processed} chunks stored")
+        logger.info("Document ingestion completed: %s/%s chunks stored", chunks_stored, chunks_processed)
         return [types.TextContent(type="text", text="\n".join(result_lines))]
 
     except Exception as e:
-        logger.error(f"Error in document ingestion: {str(e)}")
+        logger.error("Error in document ingestion: %s", _sanitize_log_value(e))
         return [types.TextContent(
             type="text",
             text=f"Error ingesting document: {str(e)}"
@@ -182,7 +180,7 @@ async def handle_ingest_directory(server, arguments: dict) -> List[types.TextCon
     """Handle directory ingestion requests."""
     try:
         from pathlib import Path
-        import time
+        import time  # inline import: keep optional dependencies lazy
         from ...services.memory_service import normalize_tags
         from ...utils.directory_ingestion import (
             DirectoryFileDiscovery,
@@ -263,11 +261,16 @@ async def handle_ingest_directory(server, arguments: dict) -> List[types.TextCon
             processing_time=processing_time
         )
 
-        logger.info(f"Directory ingestion completed: {stats['total_chunks_stored']}/{stats['total_chunks_processed']} chunks from {stats['files_processed']} files")
+        logger.info(
+            "Directory ingestion completed: %s/%s chunks from %s files",
+            stats['total_chunks_stored'],
+            stats['total_chunks_processed'],
+            stats['files_processed'],
+        )
         return [types.TextContent(type="text", text="\n".join(result_lines))]
 
     except Exception as e:
-        logger.error(f"Error in directory ingestion: {str(e)}")
+        logger.error("Error in directory ingestion: %s", _sanitize_log_value(e))
         return [types.TextContent(
             type="text",
             text=f"Error ingesting directory: {str(e)}"

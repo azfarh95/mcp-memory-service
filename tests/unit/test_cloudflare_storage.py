@@ -433,7 +433,8 @@ class TestCloudflareStorage:
             sql_payload = mock_request.call_args_list[0].kwargs["json"]
             sql_text = sql_payload["sql"].upper()
             assert "JOIN MEMORY_TAGS" in sql_text and "GROUP BY M.ID" in sql_text
-            assert sql_payload["params"] == ["status:initialized", 10]
+            # store defaults to "default" and is bound first (#1915).
+            assert sql_payload["params"] == ["default", "status:initialized", 10]
 
     @pytest.mark.asyncio
     async def test_count_all_memories_with_tag_filter(self, cloudflare_storage):
@@ -451,7 +452,7 @@ class TestCloudflareStorage:
             sql_payload = mock_request.call_args.kwargs["json"]
             sql_text = sql_payload["sql"].upper()
             assert "COUNT(*) AS COUNT FROM" in sql_text and "GROUP BY M.ID" in sql_text
-            assert sql_payload["params"] == ["alpha", "beta"]
+            assert sql_payload["params"] == ["default", "alpha", "beta"]
 
     @pytest.mark.asyncio
     async def test_delete_memory(self, cloudflare_storage):
@@ -824,7 +825,6 @@ class TestCloudflareTimeBasedDeletion:
 
             assert memories == []
 
-    @pytest.mark.xfail(reason="Pre-existing bug: Invalid memory_type 'reference' - should be 'observation'")
     @pytest.mark.asyncio
     async def test_get_by_exact_content_parse_rows(self, cloudflare_storage):
         """Test get_by_exact_content properly parses multiple memory rows."""
@@ -840,7 +840,7 @@ class TestCloudflareTimeBasedDeletion:
                         "id": 1,
                         "content_hash": "hash1",
                         "content": content,
-                        "memory_type": "standard",
+                        "memory_type": "note",
                         "created_at": 1234567890,
                         "metadata_json": "{}"
                     },
@@ -871,7 +871,7 @@ class TestCloudflareTimeBasedDeletion:
             # Verify both memories parsed
             assert len(memories) == 2
             assert memories[0].content_hash == "hash1"
-            assert memories[0].memory_type == "standard"
+            assert memories[0].memory_type == "note"
             assert memories[1].content_hash == "hash2"
             assert memories[1].memory_type == "reference"
             assert memories[1].metadata == {"source": "test"}
@@ -942,6 +942,56 @@ async def test_restore_deleted_memory_sql_lifecycle(cloudflare_storage, monkeypa
             assert row["tags"] == (",".join(tags) if tags else None)
             assert bool(row["r2_key"]) == large_content
             assert (await cloudflare_storage.delete(memory.content_hash))[0]
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_get_by_hash_excludes_soft_deleted(cloudflare_storage, monkeypatch):
+    """A soft-deleted row must not resurface through get_by_hash: the Memory model
+    carries no deleted_at field, so a caller (e.g. the hybrid pull) cannot detect
+    the deletion after construction and would restore the memory locally."""
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+
+    async def query_d1(method, url, **kwargs):
+        assert method == "POST" and url == f"{cloudflare_storage.d1_url}/query"
+        payload = kwargs["json"]
+        try:
+            sql = payload["sql"]
+            if sql.count(";") > 1:
+                db.executescript(sql)
+                rows, row_id = [], 0
+            else:
+                cursor = db.execute(sql, payload.get("params", []))
+                rows = [dict(row) for row in cursor.fetchall()]
+                row_id = cursor.lastrowid
+            db.commit()
+            result = {"success": True, "result": [{"results": rows, "meta": {"last_row_id": row_id}}]}
+        except sqlite3.Error as error:
+            result = {"success": False, "errors": [str(error)]}
+        return Mock(json=Mock(return_value=result))
+
+    monkeypatch.setattr(cloudflare_storage, "_retry_request", query_d1)
+    for name in ("_store_vectorize_vector", "_delete_vectorize_vector"):
+        monkeypatch.setattr(cloudflare_storage, name, AsyncMock())
+    monkeypatch.setattr(cloudflare_storage, "_generate_embedding", AsyncMock(return_value=[0.1]))
+    try:
+        await cloudflare_storage._initialize_d1_schema()
+        content = "soft deleted memory"
+        memory = Memory(content=content, content_hash=generate_content_hash(content), tags=["keep"])
+        assert (await cloudflare_storage.store(memory))[0]
+
+        live = await cloudflare_storage.get_by_hash(memory.content_hash)
+        assert live is not None and live.content == content
+
+        assert (await cloudflare_storage.delete(memory.content_hash))[0]
+        assert db.execute("SELECT deleted_at FROM memories").fetchone()[0] is not None
+        assert await cloudflare_storage.get_by_hash(memory.content_hash) is None, (
+            "soft-deleted memory resurfaced through get_by_hash — the hybrid pull "
+            "would restore data deleted concurrently in Cloudflare"
+        )
     finally:
         db.close()
 

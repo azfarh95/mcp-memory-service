@@ -20,9 +20,9 @@ eliminating code duplication between the MCP server and web interface initializa
 """
 
 import logging
-import os
 from typing import Type
 
+from ..compat import _sanitize_log_value
 from .base import MemoryStorage
 
 logger = logging.getLogger(__name__)
@@ -59,24 +59,24 @@ def get_storage_backend_class() -> Type[MemoryStorage]:
             from .cloudflare import CloudflareStorage
             return CloudflareStorage
         except ImportError as e:
-            logger.error(f"Failed to import Cloudflare storage: {e}")
+            logger.error("Failed to import Cloudflare storage: %s", _sanitize_log_value(e))
             raise
     elif backend == "hybrid":
         try:
             from .hybrid import HybridMemoryStorage
             return HybridMemoryStorage
         except ImportError as e:
-            logger.error(f"Failed to import Hybrid storage: {e}")
+            logger.error("Failed to import Hybrid storage: %s", _sanitize_log_value(e))
             return _fallback_to_sqlite_vec()
     elif backend == "milvus":
         try:
             from .milvus import MilvusMemoryStorage
             return MilvusMemoryStorage
         except ImportError as e:
-            logger.error(f"Failed to import Milvus storage: {e}")
+            logger.error("Failed to import Milvus storage: %s", _sanitize_log_value(e))
             raise
     else:
-        logger.warning(f"Unknown storage backend '{backend}', defaulting to SQLite-vec")
+        logger.warning("Unknown storage backend '%s', defaulting to SQLite-vec", _sanitize_log_value(backend))
         from .sqlite_vec import SqliteVecMemoryStorage
         return SqliteVecMemoryStorage
 
@@ -103,15 +103,16 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
         MILVUS_URI, MILVUS_TOKEN, MILVUS_COLLECTION_NAME
     )
 
-    logger.info(f"Creating storage backend instance (sqlite_path: {sqlite_path}, server_type: {server_type})...")
+    logger.info("Creating storage backend instance (sqlite_path: %s, server_type: %s)...", _sanitize_log_value(sqlite_path), _sanitize_log_value(server_type))
 
     # Check if we should override hybrid backend based on sync ownership (v8.27.0+)
     effective_backend = STORAGE_BACKEND
     if STORAGE_BACKEND == 'hybrid' and server_type and HYBRID_SYNC_OWNER != 'both':
         if HYBRID_SYNC_OWNER != server_type:
             logger.info(
-                f"Sync ownership configured for '{HYBRID_SYNC_OWNER}' but this is '{server_type}' server. "
-                f"Using SQLite-vec storage instead of Hybrid to avoid duplicate sync queues."
+                "Sync ownership configured for '%s' but this is '%s' server. "
+                "Using SQLite-vec storage instead of Hybrid to avoid duplicate sync queues.",
+                _sanitize_log_value(HYBRID_SYNC_OWNER), _sanitize_log_value(server_type)
             )
             effective_backend = 'sqlite_vec'
 
@@ -127,71 +128,67 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
     # Create storage instance based on backend type
     if StorageClass.__name__ == "SqliteVecMemoryStorage":
         from ..config import EMBED_BACKEND, PARALLEL_INDEX, VOYAGE_DATABASE_PATH
+        from .mixins.embeddings import EmbeddingsMixin
 
-        if EMBED_BACKEND == "voyage":
-            # Voyage is the default, but it is a cloud API that needs a key. Decide
-            # ONCE, via the shared resolver that every construction site uses, so a
-            # keyless install degrades identically whether it comes through this
-            # factory or a direct SqliteVecMemoryStorage() call.
-            from .mixins.embeddings import EmbeddingsMixin
+        effective_embed, reason = EmbeddingsMixin.resolve_embed_backend(sqlite_path)
 
-            effective_backend, reason = EmbeddingsMixin.resolve_embed_backend(sqlite_path)
+        if (EMBED_BACKEND == "voyage" and effective_embed == "voyage" and reason == "key"
+                and PARALLEL_INDEX and VOYAGE_DATABASE_PATH):
+            # Parallel index: Voyage primary in its own file (1024-dim) with the classic
+            # local index (384-dim) kept live as the fallback and complete source of truth.
+            from .parallel import ParallelSqliteVecStorage
 
-            if effective_backend == "voyage" and reason == "key" and PARALLEL_INDEX and VOYAGE_DATABASE_PATH:
-                # Parallel index: Voyage primary (own file — 1024-dim vectors can never
-                # share a table with MiniLM's 384) + the classic local index as the
-                # always-available fallback and source of truth for non-embedding reads.
-                from .parallel import ParallelSqliteVecStorage
-
-                primary = StorageClass(
-                    db_path=VOYAGE_DATABASE_PATH,
-                    embedding_model=EMBEDDING_MODEL_NAME,
-                    embed_backend="voyage",
-                )
-                secondary = StorageClass(
-                    db_path=sqlite_path,
-                    embedding_model=EMBEDDING_MODEL_NAME,
-                    embed_backend="local",
-                )
-                storage = ParallelSqliteVecStorage(primary=primary, secondary=secondary)
-                logger.info(
-                    f"Initialized parallel SQLite-vec storage: voyage at {VOYAGE_DATABASE_PATH} "
-                    f"(primary) + local at {sqlite_path} (fallback)"
-                )
-            elif reason == "explicit-no-key":
-                # The operator asked for Voyage by name. Honour that literally so the
-                # misconfiguration is visible instead of silently running local. Point
-                # at the voyage file: sqlite_path holds a 384-dim vec table, so putting
-                # a 1024-dim model there is a dimension clash, not an actionable error.
-                storage = StorageClass(
-                    db_path=VOYAGE_DATABASE_PATH or sqlite_path,
-                    embedding_model=EMBEDDING_MODEL_NAME,
-                    embed_backend="voyage",
-                )
-                logger.warning(
-                    "MCP_MEMORY_EMBED_BACKEND=voyage was explicitly set but no Voyage API "
-                    "key is configured; storage creation will fail with an actionable error."
-                )
-            else:
-                # Default backend, no key: run the local model. Semantic search keeps
-                # working; the cloud lane simply is not configured on this machine.
-                storage = StorageClass(
-                    db_path=sqlite_path,
-                    embedding_model=EMBEDDING_MODEL_NAME,
-                    embed_backend="local",
-                )
-                logger.warning(
-                    "Voyage is the default embedding backend but no API key is configured "
-                    "(MCP_VOYAGE_API_KEY or the keyring entry) — using local embeddings. "
-                    "Set the key to enable the cloud index, or set "
-                    "MCP_MEMORY_EMBED_BACKEND=local to silence this warning."
-                )
-        else:
+            primary = StorageClass(
+                db_path=VOYAGE_DATABASE_PATH,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="voyage",
+            )
+            secondary = StorageClass(
+                db_path=sqlite_path,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="local",
+            )
+            storage = ParallelSqliteVecStorage(primary=primary, secondary=secondary)
+            logger.info(
+                "Initialized parallel SQLite-vec storage: voyage at %s (primary) + local at %s (fallback)",
+                _sanitize_log_value(VOYAGE_DATABASE_PATH), _sanitize_log_value(sqlite_path))
+        elif EMBED_BACKEND == "voyage" and reason == "key" and not (PARALLEL_INDEX and VOYAGE_DATABASE_PATH):
+            # A key exists and voyage was requested, but the parallel index is off (or
+            # there is no voyage path). Honour voyage on the primary path rather than
+            # silently dropping to local and blaming a missing key (review, 2026-11-16).
             storage = StorageClass(
                 db_path=sqlite_path,
-                embedding_model=EMBEDDING_MODEL_NAME
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="voyage",
             )
-            logger.info(f"Initialized SQLite-vec storage at {sqlite_path}")
+            logger.warning(
+                "Voyage backend active WITHOUT the local fallback index (parallel index "
+                "disabled or no voyage path resolvable). Set MCP_MEMORY_PARALLEL_INDEX=1 for "
+                "the fallback, or accept that a Voyage outage loses semantic search.")
+        elif EMBED_BACKEND == "voyage" and reason == "explicit-no-key":
+            # Operator named voyage but there is no key: honour it so the misconfiguration
+            # is visible, and point at the voyage file (the local one is 384-dim).
+            storage = StorageClass(
+                db_path=VOYAGE_DATABASE_PATH or sqlite_path,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="voyage",
+            )
+            logger.warning(
+                "MCP_MEMORY_EMBED_BACKEND=voyage was explicitly set but no Voyage API key is "
+                "configured; storage creation will fail with an actionable error.")
+        else:
+            # Ambient default with no key: run local so semantic search keeps working.
+            storage = StorageClass(
+                db_path=sqlite_path,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="local" if EMBED_BACKEND == "voyage" else None,
+            )
+            if EMBED_BACKEND == "voyage":
+                logger.warning(
+                    "Voyage is the default embedding backend but no API key is configured - "
+                    "using local embeddings. Set MCP_VOYAGE_API_KEY or the keyring entry, or set "
+                    "MCP_MEMORY_EMBED_BACKEND=local to silence this warning.")
+            logger.info("Initialized SQLite-vec storage at %s", _sanitize_log_value(sqlite_path))
 
     elif StorageClass.__name__ == "CloudflareStorage":
         storage = StorageClass(
@@ -205,7 +202,7 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
             max_retries=CLOUDFLARE_MAX_RETRIES,
             base_delay=CLOUDFLARE_BASE_DELAY
         )
-        logger.info(f"Initialized Cloudflare storage with vectorize index: {CLOUDFLARE_VECTORIZE_INDEX}")
+        logger.info("Initialized Cloudflare storage with vectorize index: %s", _sanitize_log_value(CLOUDFLARE_VECTORIZE_INDEX))
 
     elif StorageClass.__name__ == "MilvusMemoryStorage":
         storage = StorageClass(
@@ -215,7 +212,8 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
             embedding_model=EMBEDDING_MODEL_NAME,
         )
         logger.info(
-            f"Initialized Milvus storage (uri={MILVUS_URI}, collection={MILVUS_COLLECTION_NAME})"
+            "Initialized Milvus storage (uri=%s, collection=%s)",
+            _sanitize_log_value(MILVUS_URI), _sanitize_log_value(MILVUS_COLLECTION_NAME)
         )
 
     elif StorageClass.__name__ == "HybridMemoryStorage":
@@ -241,7 +239,7 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
             sync_interval=HYBRID_SYNC_INTERVAL,
             batch_size=HYBRID_BATCH_SIZE
         )
-        logger.info(f"Initialized hybrid storage with SQLite at {sqlite_path}")
+        logger.info("Initialized hybrid storage with SQLite at %s", _sanitize_log_value(sqlite_path))
 
     else:
         # Unknown storage backend - this should not happen as get_storage_backend_class
@@ -250,6 +248,6 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
 
     # Initialize storage backend
     await storage.initialize()
-    logger.info(f"Storage backend {StorageClass.__name__} initialized successfully")
+    logger.info("Storage backend %s initialized successfully", _sanitize_log_value(StorageClass.__name__))
 
     return storage

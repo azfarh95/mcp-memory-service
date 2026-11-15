@@ -49,10 +49,7 @@ def _is_unresolved_prompt_placeholder(value) -> bool:
     return isinstance(value, str) and bool(_PROMPT_PLACEHOLDER_RE.match(value.strip()))
 
 
-def _sanitize_log_value(value: object) -> str:
-    """Sanitize a user-provided value for safe inclusion in log messages."""
-    return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
-
+from .compat import _sanitize_log_value
 
 # Import from server package modules
 from .server import (
@@ -87,6 +84,12 @@ except (ImportError, AttributeError):
 # Package imports
 from .dependency_check import get_recommended_timeout
 from .utils.hashing import generate_content_hash
+from .utils.agent_context import (
+    get_current_agent_id,
+    log_agent_id_resolution,
+    resolve_agent_id,
+)
+from .utils.tool_rate_limit import ToolRateLimiter, resolve_caller_identity
 from .config import (
     BACKUPS_PATH,
     SERVER_NAME,
@@ -307,8 +310,8 @@ class MemoryServer:
                 self.memory_service = MemoryService(storage)
                 self._storage_initialized = True
                 logger.info(
-                    f"Using caller-provided {storage.__class__.__name__} storage; "
-                    f"deferred init skipped"
+                    "Using caller-provided %s storage; deferred init skipped",
+                    storage.__class__.__name__,
                 )
             else:
                 # DEFER STORAGE INITIALIZATION - Initialize storage lazily when needed
@@ -332,6 +335,10 @@ class MemoryServer:
         # Register handlers
         self.register_handlers()
         logger.info("Server initialization complete")
+
+        # Per-caller sliding-window limiter for MCP tool calls (#1096).
+        # Unlimited by default; configured via MCP_RATE_LIMIT_* env vars.
+        self._tool_rate_limiter = ToolRateLimiter()
         
         # Test handler registration with proper arguments
         try:
@@ -500,8 +507,10 @@ class MemoryServer:
                 logger.info("🧬 EAGER INIT: Importing MilvusMemoryStorage...")
                 from .storage.milvus import MilvusMemoryStorage
                 logger.info(
-                    f"🧬 EAGER INIT: Creating MilvusMemoryStorage (uri={MILVUS_URI}, "
-                    f"collection={MILVUS_COLLECTION_NAME}, auth={'yes' if MILVUS_TOKEN else 'no'})"
+                    "🧬 EAGER INIT: Creating MilvusMemoryStorage (uri=%s, collection=%s, auth=%s)",
+                    _sanitize_log_value(MILVUS_URI),
+                    _sanitize_log_value(MILVUS_COLLECTION_NAME),
+                    "yes" if MILVUS_TOKEN else "no",
                 )
                 self.storage = MilvusMemoryStorage(
                     uri=MILVUS_URI,
@@ -663,8 +672,10 @@ class MemoryServer:
                     logger.info("🧬 LAZY INIT: Importing MilvusMemoryStorage...")
                     from .storage.milvus import MilvusMemoryStorage
                     logger.info(
-                        f"🧬 LAZY INIT: Creating MilvusMemoryStorage (uri={MILVUS_URI}, "
-                        f"collection={MILVUS_COLLECTION_NAME}, auth={'yes' if MILVUS_TOKEN else 'no'})"
+                        "🧬 LAZY INIT: Creating MilvusMemoryStorage (uri=%s, collection=%s, auth=%s)",
+                        _sanitize_log_value(MILVUS_URI),
+                        _sanitize_log_value(MILVUS_COLLECTION_NAME),
+                        "yes" if MILVUS_TOKEN else "no",
                     )
                     self.storage = MilvusMemoryStorage(
                         uri=MILVUS_URI,
@@ -1022,6 +1033,19 @@ class MemoryServer:
             """Read a specific memory resource."""
             await self._ensure_storage_initialized()
 
+            # Resources (tags, recent, search, stats) span every store and carry
+            # no store selector, so a store-restricted caller — a token with a
+            # read:<store> scope but no global `read` — can't be confined here
+            # and is refused. A global-read caller, or stdio / a no-auth loopback
+            # (no recorded scope), is unaffected. Per-store resource filtering is
+            # the follow-up issue; until then this fails closed.
+            _scope = self._caller_scope_str()
+            if _scope is not None and "read" not in _scope.split():
+                raise PermissionError(
+                    "insufficient_scope: MCP resources require a global 'read' scope; "
+                    "a store-restricted token cannot read cross-store resources"
+                )
+
             from urllib.parse import unquote
 
             # Convert AnyUrl to string if necessary (fix for issue #254)
@@ -1206,6 +1230,17 @@ class MemoryServer:
         async def handle_get_prompt(name: str, arguments: dict) -> types.GetPromptResult:
             """Handle prompt execution with provided arguments."""
             await self._ensure_storage_initialized()
+
+            # Prompts read through store-less helpers (search_by_tag spans every
+            # store, the rest read `default`), so a store-restricted caller (a
+            # read:<store> token without global `read`) can't be confined here
+            # and is refused, as in handle_read_resource (GHSA-wpp8-2qcw-x4pc).
+            _scope = self._caller_scope_str()
+            if _scope is not None and "read" not in _scope.split():
+                raise PermissionError(
+                    "insufficient_scope: MCP prompts require a global 'read' scope; "
+                    "a store-restricted token cannot read cross-store prompts"
+                )
 
             # Dispatch to specific prompt handler
             if name == "memory_review":
@@ -1422,6 +1457,13 @@ class MemoryServer:
                     )
                 ]
 
+            # Storing is a write that bypasses call_tool, so it needs its own
+            # scope check (GHSA-9x7v-2vjj-xghg). The preview path above stays
+            # open to read-only callers.
+            if not self._caller_has_write_scope():
+                logger.warning("Refused prompt learning_session for a read-only caller")
+                raise PermissionError("insufficient_scope: prompt 'learning_session' requires 'write' access")
+
             # Store the learning note
             content_hash = generate_content_hash(learning_note)
             memory = Memory(
@@ -1451,7 +1493,9 @@ class MemoryServer:
             return await self.list_tools()
         
         @self.server.call_tool()
-        async def handle_call_tool(name: str, arguments: dict | None) -> List[types.TextContent]:
+        async def handle_call_tool(
+            name: str, arguments: dict | None
+        ) -> List[types.TextContent] | types.CallToolResult:
             return await self.call_tool(name, arguments)
 
 
@@ -1483,6 +1527,175 @@ class MemoryServer:
         """True when `name` must not be served to the current caller."""
         return self.remote_transport and name in self.local_only_tools()
 
+    def _caller_has_write_scope(self) -> bool:
+        """False when the credential behind THIS request lacks the 'write' scope.
+
+        SSE and Streamable HTTP record the authenticated scope on the ASGI
+        scope of each POST (`_credentials_authenticate` in
+        utils/startup_orchestrator), and the SDK hands that request to the
+        handler as `request_context.request`. Reading it per message, not per
+        connection, keeps an SSE stream from lending one token's scope to a
+        later message (GHSA-9x7v-2vjj-xghg).
+
+        No request context (stdio, the FastAPI shim, which gates on its own)
+        or no recorded scope (a loopback server with no auth configured)
+        keeps full access, as before.
+        """
+        try:
+            request = self.server.request_context.request
+        except LookupError:
+            return True
+        if request is None:
+            return True
+        scope = request.scope.get("mcp_auth_scope")
+        return scope is None or "write" in scope.split()
+
+    def _caller_scope_str(self) -> Optional[str]:
+        """The OAuth scope string recorded on THIS request by the SDK transports
+        (``mcp_auth_scope``), or ``None`` for stdio, the FastAPI ``/mcp`` shim
+        (which gates on its own), or a loopback server with no auth configured
+        (full access, unchanged). Read per message, like
+        ``_caller_has_write_scope``, so an SSE stream can't lend one token's
+        scope to a later message."""
+        try:
+            request = self.server.request_context.request
+        except LookupError:
+            return None
+        if request is None:
+            return None
+        return request.scope.get("mcp_auth_scope")
+
+    @staticmethod
+    def _scope_grants(scope_str: str, operation: str, store: Optional[str]) -> bool:
+        """Whether ``scope_str`` grants ``operation`` ('read'/'write') on ``store``
+        (``None`` = cross-partition / store-less, which needs the global grant).
+        A global ``read``/``write`` grants every store; ``read:<s>``/``write:<s>``
+        grants exactly ``<s>``. ``admin`` is an administrative scope, not a data
+        grant, so it confers nothing here on its own. Mirrors the HTTP layer's
+        ``AuthenticationResult.has_store_scope`` exactly, so every transport (SSE,
+        Streamable HTTP, the shim) enforces identically without the core
+        importing the web OAuth module."""
+        scopes = (scope_str or "").split()
+        if operation in scopes:
+            return True
+        if store is None:
+            return False
+        return f"{operation}:{store}" in scopes
+
+    def _rate_limit_caller_identity(self, explicit_identity: str | None = None) -> str:
+        """Resolve the rate-limit identity for the current tool call (#1096).
+
+        The ``/mcp`` FastAPI shim calls ``call_tool`` outside any SDK request
+        context, so it resolves the identity from its own HTTP request and
+        passes it in explicitly. On the SDK transports (SSE, Streamable
+        HTTP) the identity is resolved here from the per-request ASGI
+        request, exactly like ``_caller_has_write_scope`` does.
+
+        Never reads tool arguments: for ``memory_search``/``memory_list``
+        the ``agent_id`` argument is an author filter, not a caller identity.
+        """
+
+        if explicit_identity:
+            return explicit_identity
+        try:
+            request = self.server.request_context.request
+        except (LookupError, AttributeError):
+            request = None
+        if request is None:
+            return resolve_caller_identity(None, None)
+        header = request.headers.get("X-Agent-ID")
+        client = request.client
+        host = client.host if client is not None else None
+        return resolve_caller_identity(header, host)
+
+    @staticmethod
+    def _rate_limit_error(
+        tool_name: str, decision
+    ) -> types.CallToolResult:
+        """Build the standard MCP tool-error result for a denied call."""
+
+        payload = {
+            "error": {
+                "code": -32029,
+                "type": "rate_limit_exceeded",
+                "message": "MCP tool rate limit exceeded",
+                "tool": tool_name,
+                "limit_per_minute": decision.limit_per_minute,
+                "retry_after_seconds": decision.retry_after_seconds,
+            }
+        }
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(payload))],
+            isError=True,
+        )
+
+    # Tools whose handlers keep reads and writes inside the claimed ``store``
+    # on a backend whose get_by_hash honours it. A per-store grant
+    # (read:<s>/write:<s>) authorizes only these: every other tool acts on all
+    # partitions, so naming a store there must not unlock it. memory_explore
+    # and memory_detail are left out: the entity graph is not partitioned, so
+    # their entity names and related entities span every store (#1683).
+    STORE_CONFINED_TOOLS = frozenset({
+        "memory_store", "memory_store_session", "memory_search", "memory_list",
+        "memory_delete", "memory_update",
+    })
+
+    async def store_grant_target(self, name: Optional[str], arguments: Optional[dict] = None) -> Optional[str]:
+        """Return the store a per-store grant may authorize this call for.
+
+        ``None`` means only the global grant will do: the call names no store
+        (or ``all``), the tool ignores ``store``, or the backend's get_by_hash
+        ignores ``store`` and so cannot
+        prove confinement (storage-layer enforcement is #1683). The SDK dispatch
+        gate and the /mcp shim both ask this, so the transports cannot disagree.
+        """
+        arguments = arguments or {}
+        store = arguments.get("store")
+        if store in (None, "all") or name not in self.STORE_CONFINED_TOOLS:
+            return None
+        storage = await self._ensure_storage_initialized()
+        if not getattr(storage, "get_by_hash_is_store_scoped", False):
+            return None
+        return store
+
+    async def tool_requires_write(self, name: Optional[str], arguments: Optional[dict] = None) -> bool:
+        """Return True if calling this tool requires the 'write' scope.
+
+        Mixed graph operations are classified by action, not just the tool
+        annotation (GHSA-2mw6-h564-86wv). Only known read actions are exempt;
+        entity extraction and unknown actions require write scope.
+
+        Otherwise derived per-call from `list_tools()`: a tool counts as write unless
+        its annotations explicitly set `readOnlyHint=True`. This matches the
+        MCP spec's default ("destructive=True, readOnly=False" unless declared
+        otherwise) and keeps the set in lockstep with the canonical tool list.
+
+        Conditional tools like `memory_consolidate` only appear in the list
+        once their gating state is satisfied, so this derives on each call
+        rather than caching a set locked in before the consolidator finished
+        initializing.
+
+        Fails closed: an unknown tool name, or a `list_tools()` that raises,
+        counts as requiring write scope.
+        """
+        if not name:
+            return False
+        if name == "memory_graph":
+            # Derived from the handler's action table so the two lists cannot
+            # drift apart (GHSA-2mw6-h564-86wv); extract_entities writes entity
+            # links and stays out of the read set.
+            from mcp_memory_service.server.handlers.graph import GRAPH_READ_ACTIONS
+            return not (arguments and arguments.get("action") in GRAPH_READ_ACTIONS)
+        try:
+            tools = await self.list_tools()
+        except Exception:
+            logger.exception("list_tools() raised during write-scope classification — failing closed")
+            return True
+        for tool in tools:
+            if tool.name == name:
+                return not (tool.annotations and getattr(tool.annotations, "readOnlyHint", False))
+        return True
+
     async def list_tools(self) -> List[types.Tool]:
         """Return the canonical MCP tool list from declarative registry."""
         logger.info("=== HANDLING LIST_TOOLS REQUEST ===")
@@ -1511,11 +1724,43 @@ class MemoryServer:
             logger.error("Error in list_tools: %s", _sanitize_log_value(e))
             return []
 
-    async def call_tool(self, name: str, arguments: dict | None) -> List[types.TextContent]:
-        """Dispatch tool call via routing table (replaces elif chain)."""
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict | None,
+        *,
+        caller_identity: str | None = None,
+    ) -> List[types.TextContent] | types.CallToolResult:
+        """Dispatch tool call via routing table (replaces elif chain).
+
+        ``caller_identity`` is the pre-resolved per-caller rate-limit
+        identity. The ``/mcp`` FastAPI shim passes it explicitly (it has no
+        SDK request context); the SDK transports leave it ``None`` so the
+        identity is resolved here from the per-request ASGI request.
+        """
         logger.info("=== HANDLING TOOL CALL: %s ===", _sanitize_log_value(name))
         if arguments is None:
             arguments = {}
+
+        # Per-caller sliding-window rate limiting (#1096). Unlimited by
+        # default; configured via MCP_RATE_LIMIT_* env vars. A limiter
+        # failure must not take down the dispatcher: fail open and keep
+        # the error log free of caller identities.
+        try:
+            decision = self._tool_rate_limiter.check(
+                self._rate_limit_caller_identity(caller_identity),
+                name,
+            )
+        except Exception:
+            logger.exception("MCP tool rate limiter failed; allowing request")
+        else:
+            if not decision.allowed:
+                if decision.should_log:
+                    logger.warning(
+                        "MCP tool rate limit exceeded for tool %s",
+                        _sanitize_log_value(name),
+                    )
+                return self._rate_limit_error(name, decision)
 
         # Refuse before the handler resolves, so a remote caller cannot reach a
         # filesystem tool by naming it directly even though tools/list hid it.
@@ -1527,6 +1772,28 @@ class MemoryServer:
             return [types.TextContent(type="text", text=json.dumps(
                 {"error": f"Tool not available over this transport: {name}"}
             ))]
+
+        # Per-store scope gate for the SDK transports (SSE, Streamable HTTP),
+        # which dispatch straight here. The FastAPI /mcp shim and stdio record no
+        # scope (``_caller_scope_str`` is None) and gate elsewhere / run
+        # unauthenticated, so this is a no-op for them. Enforces the full
+        # read:<store>/write:<store> grammar — not just global write as before
+        # (GHSA-2r68/9x7v) — so a store-restricted token cannot read or write
+        # another partition over the native transports. Raise rather than return
+        # content, so the SDK answers isError=True.
+        scope_str = self._caller_scope_str()
+        if scope_str is not None:
+            operation = "write" if await self.tool_requires_write(name, arguments) else "read"
+            target = await self.store_grant_target(name, arguments)
+            if not self._scope_grants(scope_str, operation, target):
+                logger.warning(
+                    "Refused %s tool for a scope lacking the store grant: %s",
+                    operation, _sanitize_log_value(name),
+                )
+                required = "'%s' (global)" % operation if target is None else "'%s:%s'" % (operation, target)
+                raise PermissionError(
+                    "insufficient_scope: tool '%s' requires %s access" % (name, required)
+                )
 
         # Resolve handler from routing table
         from mcp_memory_service.tools.routing import resolve_handler
@@ -1554,10 +1821,15 @@ class MemoryServer:
             return [types.TextContent(type="text", text=str(result))]
         except Exception as e:
             logger.error("Error in tool %s: %s", _sanitize_log_value(name), _sanitize_log_value(e), exc_info=True)
-            error_response = json.dumps({"error": str(e)})
-            return [types.TextContent(type="text", text=error_response)]
+            # Propagate instead of returning the error as text: the SDK maps an
+            # exception to isError=True, which is the only signal automation can
+            # trust. Returning TextContent made every failed tool look successful
+            # (#1601), so harvesters advanced their cursors over lost payloads.
+            raise
 
-    async def handle_call_tool(self, name: str, arguments: dict | None) -> List[types.TextContent]:
+    async def handle_call_tool(
+        self, name: str, arguments: dict | None
+    ) -> List[types.TextContent] | types.CallToolResult:
         """Public alias for call_tool (used by tests)."""
         return await self.call_tool(name, arguments)
 
@@ -1777,6 +2049,7 @@ class MemoryServer:
             dry_run=arguments.get("dry_run", True),
             project_path=str(project_path),
             use_llm=arguments.get("use_llm", False),
+            force_reharvest=arguments.get("force_reharvest", False),
         )
 
         memory_service = None
@@ -1809,8 +2082,13 @@ class MemoryServer:
         if config.dry_run:
             results = harvester.harvest(config)
         else:
-            # Pagination: resolve ALL sessions, filter by tracker, take config.sessions
-            if already_harvested and not config.session_ids:
+            # Pagination: resolve ALL sessions, filter by tracker, take config.sessions.
+            # R8: force_reharvest bypasses the tracker filter entirely. It still
+            # respects config.sessions — harvest_and_store resolves at most
+            # config.sessions (page size) newest sessions, it does not reprocess
+            # the whole history at once.
+            from .harvest.models import should_filter_tracker
+            if should_filter_tracker(already_harvested, config.session_ids, config.force_reharvest):
                 from .harvest.models import HarvestConfig as _HC
                 all_config = _HC(sessions=9999, project_path=config.project_path)
                 all_sessions = harvester._resolve_sessions(all_config)
@@ -1866,7 +2144,8 @@ class MemoryServer:
                             "tags": c.tags,
                         }
                         for c in r.candidates
-                    ]
+                    ],
+                    "coverage": r.coverage,  # Include coverage report
                 }
                 for r in results
             ]
@@ -1874,7 +2153,14 @@ class MemoryServer:
 
         # §9: auto_commit — bridge harvest candidates to commit_session_legacy
         auto_commit = arguments.get("auto_commit", False)
-        auto_commit_agent_id = arguments.get("agent_id", os.getenv("MCP_AGENT_ID", "unknown"))
+        # Single shared precedence (RFC #1100 + spec-agent-id-streamable R2):
+        # explicit arg > request header > MCP_AGENT_ID env > metadata, with the
+        # auto_commit-specific fallback 'unknown' when nothing resolves.
+        _auto_commit_resolution = resolve_agent_id(
+            explicit=arguments.get("agent_id"), default="unknown"
+        )
+        log_agent_id_resolution(_auto_commit_resolution, context="auto_commit")
+        auto_commit_agent_id = _auto_commit_resolution.agent_id
         if auto_commit and not config.dry_run and results:
             auto_commit_results = []
             for r in results:
@@ -2146,7 +2432,7 @@ class MemoryServer:
         await self._ensure_storage_initialized()
 
         session_id = arguments.get("session_id")
-        agent_id = arguments.get("agent_id")
+        agent_id = arguments.get("agent_id") or get_current_agent_id()
         task_summary = arguments.get("task_summary")
         outcome = arguments.get("outcome")
 
@@ -2170,6 +2456,7 @@ class MemoryServer:
                     "source": "observation",
                     "outcome": outcome,
                 },
+                agent_id=agent_id,
             )
             observations_created += 1
 
@@ -2196,6 +2483,7 @@ class MemoryServer:
                         "agent_id": agent_id,
                         "source": "observation",
                     },
+                    agent_id=agent_id,
                 )
                 observations_created += 1
 
@@ -2212,6 +2500,7 @@ class MemoryServer:
                         "agent_id": agent_id,
                         "source": "observation",
                     },
+                    agent_id=agent_id,
                 )
                 observations_created += 1
 
@@ -2280,7 +2569,7 @@ class MemoryServer:
                 unresolved = [c for c in conflicts if c.get("status") != "resolved"]
                 if unresolved:
                     logger.warning(
-                        f"Contradiction check: {len(unresolved)} unresolved conflict(s)"
+                        "Contradiction check: %s unresolved conflict(s)", len(unresolved)
                     )
         except Exception as e:
             logger.warning("Scheduled contradiction_check failed (non-fatal): %s", _sanitize_log_value(e))
@@ -2320,7 +2609,9 @@ class MemoryServer:
 
     async def _read_bootstrap_resource(self, agent_id: str) -> str:
         """Read bootstrap profile as resource content."""
-        result = await self.handle_get_bootstrap_profile({"agent_ids": [agent_id]})
+        result = await self.handle_get_bootstrap_profile(
+            {"agent_ids": [agent_id]}, reset_session_counters=False,
+        )
         if result and hasattr(result[0], 'text'):
             return result[0].text
         return ""
@@ -2362,6 +2653,7 @@ class MemoryServer:
                     "observation_type": "session_legacy",
                     "source": "observation",
                 },
+                agent_id=agent_id,
             )
         except Exception as e:
             logger.debug("Failed to increment session counter: %s", _sanitize_log_value(e))
@@ -2370,10 +2662,10 @@ class MemoryServer:
         """Get current session count for an agent."""
         counter_key = f"__session_counter_{agent_id}"
         try:
-            existing = await self.memory_service.retrieve_memories(
-                query=counter_key,
-                n_results=3,
-                memory_type="observation",
+            # Semantic retrieval records access metadata. Resource reads must
+            # leave the counter and its timestamps untouched.
+            existing = await self.memory_service.search_by_tag(
+                tags=["session-counter"],
             )
             if existing.get("memories"):
                 for mem in existing["memories"]:
@@ -2414,8 +2706,14 @@ class MemoryServer:
             logger.warning("Session counter reset for %s failed: %s",
                            _sanitize_log_value(agent_id), _sanitize_log_value(e))
 
-    async def handle_get_bootstrap_profile(self, arguments: dict) -> List[types.TextContent]:
-        """Generate a behavioral bootstrap profile for ephemeral agents."""
+    async def handle_get_bootstrap_profile(
+        self, arguments: dict, *, reset_session_counters: bool = True,
+    ) -> List[types.TextContent]:
+        """Generate a profile; only write-scoped tool calls consume the sentinel.
+
+        Resource reads disable resets through an internal keyword, never through
+        client-controlled tool arguments.
+        """
         await self._ensure_storage_initialized()
 
         # Opt-in: disabled by default to avoid token budget issues on tight clients
@@ -2440,7 +2738,8 @@ class MemoryServer:
                 count = await self._get_session_count(agent_id)
                 if count >= fresh_start_interval:
                     fresh_start_recommended = True
-                    await self._reset_session_counter(agent_id)
+                    if reset_session_counters:
+                        await self._reset_session_counter(agent_id)
 
             # Query avoid-rule mistake notes
             all_mistakes = await self.memory_service.list_memories(
@@ -2702,6 +3001,23 @@ class MemoryServer:
             **stats  # Include all other stats
         }
 
+    def _resolve_local_db_path(self) -> Optional[str]:
+        """Resolve the local database file backing the current storage.
+
+        Returns the file path, ``':memory:'`` for a SQLite store with no file,
+        or None when the backend has no local file at all (Milvus server,
+        Zilliz Cloud, Cloudflare). Callers must treat None as "unsupported"
+        rather than as an in-memory database — conflating the two is what made
+        these operations report success without writing anything.
+        """
+        for owner in (self.storage, getattr(self.storage, 'sqlite_storage', None)):
+            if owner is not None and hasattr(owner, 'db_path'):
+                return owner.db_path or ':memory:'
+
+        # Milvus Lite keeps everything in one local SQLite file.
+        lite_path = getattr(self.storage, 'lite_db_path', None)
+        return lite_path or None
+
     async def create_backup(self, description: str = None) -> Dict[str, Any]:
         """
         Create a database backup (test-compatible wrapper).
@@ -2733,11 +3049,16 @@ class MemoryServer:
 
         try:
             # Get database path from storage
-            db_path = None
-            if hasattr(self.storage, 'db_path'):
-                db_path = self.storage.db_path
-            elif hasattr(self.storage, 'sqlite_storage') and hasattr(self.storage.sqlite_storage, 'db_path'):
-                db_path = self.storage.sqlite_storage.db_path
+            db_path = self._resolve_local_db_path()
+
+            if db_path is None:
+                return {
+                    "success": False,
+                    "error": (
+                        "Backup is not available for this storage backend "
+                        "(no local database file)."
+                    ),
+                }
 
             # Handle in-memory databases (for tests)
             if not db_path or db_path == ':memory:':
@@ -2805,11 +3126,16 @@ class MemoryServer:
 
         try:
             # Get database path
-            db_path = None
-            if hasattr(self.storage, 'db_path'):
-                db_path = self.storage.db_path
-            elif hasattr(self.storage, 'sqlite_storage') and hasattr(self.storage.sqlite_storage, 'db_path'):
-                db_path = self.storage.sqlite_storage.db_path
+            db_path = self._resolve_local_db_path()
+
+            if db_path is None:
+                return {
+                    "success": False,
+                    "error": (
+                        "Database optimization is not available for this storage "
+                        "backend (no local database file)."
+                    ),
+                }
 
             # Handle in-memory databases (for tests)
             if not db_path or db_path == ':memory:':

@@ -47,12 +47,16 @@ except ImportError:
     DataType = None  # type: ignore
 
 from .milvus_expr import escape_expr_value
+from ..compat import _sanitize_log_value
 from ..models.ontology import is_symmetric_relationship, validate_relationship
 
 logger = logging.getLogger(__name__)
 
 # Milvus per-call result limit ceiling.
 _MILVUS_MAX_LIMIT = 16384
+
+# Hashes per delete_edges_for_memories() filter; each hash appears in it twice.
+_DELETE_EDGES_CHUNK = 200
 
 # Dimension for the dummy vector field required by Zilliz Cloud / remote Milvus.
 # Zilliz Cloud rejects collections without at least one vector field.
@@ -68,6 +72,34 @@ def _edge_id(source_hash: str, target_hash: str) -> str:
     SHA-256 content hashes would produce 129-char IDs (64 + ':' + 64).
     """
     return hashlib.sha256(f"{source_hash}:{target_hash}".encode()).hexdigest()
+
+
+# Relationship type used for memory -> entity edges. Deliberately not part of
+# the ontology in models/ontology.py: entity links are an internal index, not a
+# semantic relationship between two memories, so store_entity_link() writes
+# them directly rather than going through store_association()'s validation.
+# This mirrors GraphStorage, which writes has_entity rows with raw SQL.
+_ENTITY_REL_TYPE = "has_entity"
+
+# Prefix marking a target_hash as an entity key rather than a content hash.
+_ENTITY_KEY_PREFIX = "ent:"
+
+
+def _entity_key(entity_name: str) -> str:
+    """Derive a fixed-length target_hash for an entity name.
+
+    ``target_hash`` is VARCHAR(64), but entity names are free text and
+    routinely exceed that. GraphStorage can store the raw name because SQLite
+    has no column width; here the name is hashed into a 60-char key and the
+    surface form is preserved in the edge's ``metadata`` JSON (65535 chars),
+    which is what list_entities/get_entities_for_memory read back.
+
+    The ``ent:`` prefix keeps entity keys in a disjoint namespace from real
+    64-char content hashes, so an entity edge can never collide with a
+    memory-to-memory edge on the derived primary key.
+    """
+    digest = hashlib.sha256((entity_name or "").strip().lower().encode()).hexdigest()
+    return f"{_ENTITY_KEY_PREFIX}{digest[:56]}"
 
 
 class MilvusGraphStorage:
@@ -102,10 +134,11 @@ class MilvusGraphStorage:
 
     # -- Initialization ------------------------------------------------------
 
-    async def initialize(self) -> None:
-        """Connect to Milvus and ensure the association collection exists."""
+    async def initialize(self, create_if_missing: bool = True) -> None:
+        """Connect, optionally leaving an absent collection untouched for previews."""
         await asyncio.to_thread(self._connect_client)
-        await asyncio.to_thread(self._ensure_collection)
+        if create_if_missing:
+            await asyncio.to_thread(self._ensure_collection)
 
     def _connect_client(self) -> None:
         kwargs: Dict[str, Any] = {"uri": self.uri}
@@ -177,8 +210,10 @@ class MilvusGraphStorage:
         )
 
         index_params = self.client.prepare_index_params()
-        index_params.add_index(field_name="source_hash", index_type="Trie")
-        index_params.add_index(field_name="target_hash", index_type="Trie")
+        # INVERTED is the scalar index supported by Milvus Lite 3.x; Trie was
+        # removed there and rejects collection creation outright.
+        index_params.add_index(field_name="source_hash", index_type="INVERTED")
+        index_params.add_index(field_name="target_hash", index_type="INVERTED")
         index_params.add_index(
             field_name="_dummy_vec",
             index_type="AUTOINDEX",
@@ -209,6 +244,56 @@ class MilvusGraphStorage:
         async with self._lock:
             fn = getattr(self.client, method_name)
             return await asyncio.to_thread(fn, *args, **kwargs)
+
+    def _drain_query_rows(
+        self,
+        filter_expr: str,
+        output_fields: List[str],
+    ) -> List[Dict[str, Any]]:
+        """Drain every row matching ``filter_expr`` via QueryIterator."""
+        assert self.client is not None
+        fields = list(output_fields)
+        if "id" not in fields:
+            fields.append("id")
+        iterator = self.client.query_iterator(
+            collection_name=self.collection_name,
+            filter=filter_expr,
+            output_fields=fields,
+            batch_size=1000,
+        )
+        rows: List[Dict[str, Any]] = []
+        seen_ids: Set[str] = set()
+        try:
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                for row in batch:
+                    row_id = row.get("id")
+                    if row_id is not None:
+                        if row_id in seen_ids:
+                            continue
+                        seen_ids.add(row_id)
+                    rows.append(row)
+        finally:
+            try:
+                iterator.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return rows
+
+    async def _drain_edges(
+        self,
+        filter_expr: str,
+        output_fields: List[str],
+    ) -> List[Dict[str, Any]]:
+        """Run a full graph scan while holding the Milvus client lock."""
+        async with self._lock:
+            if self.client is None:
+                return []
+            return await asyncio.to_thread(
+                self._drain_query_rows, filter_expr, output_fields,
+            )
 
     # -- CRUD ----------------------------------------------------------------
 
@@ -242,7 +327,7 @@ class MilvusGraphStorage:
             return False
 
         if not validate_relationship(relationship_type):
-            logger.error("Invalid relationship type: %s", relationship_type)
+            logger.error("Invalid relationship type: %s", _sanitize_log_value(relationship_type))
             return False
 
         try:
@@ -297,7 +382,7 @@ class MilvusGraphStorage:
             return True
 
         except Exception as exc:
-            logger.error("Failed to store association: %s", exc)
+            logger.error("Failed to store association: %s", _sanitize_log_value(exc))
             return False
 
     # -- BFS traversal -------------------------------------------------------
@@ -327,20 +412,16 @@ class MilvusGraphStorage:
                 expr += f' and relationship_type in [{safe_rts}]'
 
         try:
-            results = await self._call_client(
-                "query",
-                collection_name=self.collection_name,
-                filter=expr,
-                output_fields=[
+            return await self._drain_edges(
+                expr,
+                [
                     "source_hash", "target_hash", "similarity",
                     "connection_types", "metadata", "relationship_type",
                     "created_at",
                 ],
-                limit=_MILVUS_MAX_LIMIT,
             )
-            return results or []
         except Exception as exc:
-            logger.error("Edge query failed (%s IN ...): %s", field, exc)
+            logger.error("Edge query failed (%s IN ...): %s", field, _sanitize_log_value(exc))
             return []
 
     async def _query_edges_both(
@@ -371,21 +452,43 @@ class MilvusGraphStorage:
             expr = f'({expr}) and {rt_filter}'
 
         try:
-            results = await self._call_client(
-                "query",
-                collection_name=self.collection_name,
-                filter=expr,
-                output_fields=[
+            return await self._drain_edges(
+                expr,
+                [
                     "source_hash", "target_hash", "similarity",
                     "connection_types", "metadata", "relationship_type",
                     "created_at",
                 ],
-                limit=_MILVUS_MAX_LIMIT,
             )
-            return results or []
         except Exception as exc:
-            logger.error("Edge query (both directions) failed: %s", exc)
+            logger.error("Edge query (both directions) failed: %s", _sanitize_log_value(exc))
             return []
+
+    @staticmethod
+    def _edge_valid_at_as_of(row: Dict[str, Any], as_of: float) -> bool:
+        """Issue #1724: point-in-time edge validity, mirroring the temporal
+        predicate in GraphStorage.find_connected. An edge is traversable at
+        as_of when its valid_from/valid_until window (stored in metadata by
+        store_temporal_association) contains as_of; edges without temporal
+        bounds always pass. Unparseable metadata fails open (pass)."""
+        meta = row.get("metadata") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                return True
+        if not isinstance(meta, dict):
+            return True
+        try:
+            vf = meta.get("valid_from")
+            vu = meta.get("valid_until")
+            if vf is not None and float(vf) > as_of:
+                return False
+            if vu is not None and float(vu) < as_of:
+                return False
+        except (TypeError, ValueError):
+            return True
+        return True
 
     async def _bfs(
         self,
@@ -394,6 +497,7 @@ class MilvusGraphStorage:
         direction: str = "both",
         relationship_types: Optional[List[str]] = None,
         stop_at: Optional[str] = None,
+        as_of: Optional[float] = None,
     ) -> Tuple[List[Tuple[str, int]], Optional[Dict[str, str]]]:
         """Application-layer BFS over the association collection.
 
@@ -402,6 +506,9 @@ class MilvusGraphStorage:
             and parents is a dict mapping each hash to its predecessor (used
             for path reconstruction when stop_at is set). If stop_at is None,
             parents is None.
+
+        Issue #1724: as_of filters edges by their temporal window
+        (valid_from/valid_until in metadata), mirroring GraphStorage.
         """
         visited: Set[str] = {start_hash}
         frontier: Set[str] = {start_hash}
@@ -415,6 +522,9 @@ class MilvusGraphStorage:
                 # Single query for both directions — halves network round-trips
                 rows = await self._query_edges_both(frontier, relationship_types)
                 for row in rows:
+                    # Issue #1724: skip edges outside the point-in-time window.
+                    if as_of is not None and not self._edge_valid_at_as_of(row, as_of):
+                        continue
                     source = row["source_hash"]
                     target = row["target_hash"]
                     # Determine which end is the new neighbor
@@ -432,6 +542,8 @@ class MilvusGraphStorage:
                 if direction == "outgoing":
                     rows = await self._query_edges("source_hash", frontier, relationship_types)
                     for row in rows:
+                        if as_of is not None and not self._edge_valid_at_as_of(row, as_of):
+                            continue
                         target = row["target_hash"]
                         if target not in visited:
                             visited.add(target)
@@ -442,6 +554,8 @@ class MilvusGraphStorage:
                 elif direction == "incoming":
                     rows = await self._query_edges("target_hash", frontier, relationship_types)
                     for row in rows:
+                        if as_of is not None and not self._edge_valid_at_as_of(row, as_of):
+                            continue
                         source = row["source_hash"]
                         if source not in visited:
                             visited.add(source)
@@ -467,8 +581,15 @@ class MilvusGraphStorage:
         max_hops: int = 2,
         relationship_type: Optional[str] = None,
         direction: str = "both",
+        as_of: Optional[float] = None,
     ) -> List[Tuple[str, int]]:
-        """Find all memories connected within N hops using BFS."""
+        """Find all memories connected within N hops using BFS.
+
+        Issue #1724: as_of is a point-in-time bound (Unix epoch). Edges whose
+        metadata carries valid_from/valid_until are only traversed when the
+        window contains as_of; untimed edges always pass. Mirrors
+        GraphStorage.find_connected.
+        """
         if not self._ensure_ready():
             return []
 
@@ -490,11 +611,12 @@ class MilvusGraphStorage:
                 max_hops,
                 direction=direction,
                 relationship_types=rt_list,
+                as_of=as_of,
             )
             result.sort(key=lambda x: (x[1], x[0]))
             return result
         except Exception as exc:
-            logger.error("Failed to find connected memories: %s", exc)
+            logger.error("Failed to find connected memories: %s", _sanitize_log_value(exc))
             return []
 
     async def shortest_path(
@@ -531,24 +653,24 @@ class MilvusGraphStorage:
                 return None
 
             # Reconstruct path from parents dict
-            path = [hash2]
+            hops = [hash2]
             current = hash2
             while current != hash1:
                 parent = parents.get(current)
                 if parent is None:
                     logger.debug("Path reconstruction failed")
                     return None
-                path.append(parent)
+                hops.append(parent)
                 current = parent
-            path.reverse()
+            hops.reverse()
 
             logger.debug(
-                "Found path of length %d: %s → %s", len(path), hash1, hash2,
+                "Found path of length %d: %s → %s", len(hops), hash1, hash2,
             )
-            return path
+            return hops
 
         except Exception as exc:
-            logger.error("Failed to find shortest path: %s", exc)
+            logger.error("Failed to find shortest path: %s", _sanitize_log_value(exc))
             return None
 
     async def get_subgraph(
@@ -628,7 +750,7 @@ class MilvusGraphStorage:
             return subgraph
 
         except Exception as exc:
-            logger.error("Failed to extract subgraph: %s", exc)
+            logger.error("Failed to extract subgraph: %s", _sanitize_log_value(exc))
             return {"nodes": [], "edges": []}
 
     async def get_association(
@@ -658,7 +780,7 @@ class MilvusGraphStorage:
                 filter=expr,
                 output_fields=[
                     "source_hash", "target_hash", "similarity",
-                    "connection_types", "metadata", "created_at",
+                    "connection_types", "relationship_type", "metadata", "created_at",
                 ],
                 limit=1,
             )
@@ -686,13 +808,51 @@ class MilvusGraphStorage:
                 "target_hash": row["target_hash"],
                 "similarity": row.get("similarity", 0.0),
                 "connection_types": ct,
+                "relationship_type": row.get("relationship_type", "related"),
                 "metadata": meta,
                 "created_at": row.get("created_at", 0.0),
             }
 
         except Exception as exc:
-            logger.error("Failed to retrieve association: %s", exc)
+            logger.error("Failed to retrieve association: %s", _sanitize_log_value(exc))
             return None
+    async def has_edge(
+        self,
+        source_hash: str,
+        target_hash: str,
+        relationship_type: str,
+    ) -> bool:
+        """Whether the exact directed, typed edge exists.
+
+        get_association() matches either direction and returns a single row
+        with no ordering, so it cannot tell whether the forward derived_from
+        link already exists when a reverse or differently-typed edge is also
+        present. This query is exact (direction + type), so callers that must
+        avoid rewriting an edge they already wrote use it.
+        """
+        if not self._ensure_ready() or not source_hash or not target_hash:
+            return False
+
+        try:
+            sh_esc = escape_expr_value(source_hash)
+            th_esc = escape_expr_value(target_hash)
+            rt_esc = escape_expr_value(relationship_type)
+            expr = (
+                f'(source_hash == "{sh_esc}" and target_hash == "{th_esc}") '
+                f'and relationship_type == "{rt_esc}"'
+            )
+            results = await self._call_client(
+                "query",
+                collection_name=self.collection_name,
+                filter=expr,
+                output_fields=["source_hash"],
+                limit=1,
+            )
+            return bool(results)
+        except Exception as exc:
+            logger.error("Failed to check association: %s", _sanitize_log_value(exc))
+            return False
+
 
     async def delete_association(
         self,
@@ -724,8 +884,58 @@ class MilvusGraphStorage:
             return True
 
         except Exception as exc:
-            logger.error("Failed to delete association: %s", exc)
+            logger.error("Failed to delete association: %s", _sanitize_log_value(exc))
             return False
+
+    async def delete_edges_for_memories(self, memory_hashes: List[str]) -> None:
+        """Delete every edge from or to ``memory_hashes``. Errors propagate."""
+        if not self._ensure_ready():
+            return
+
+        hashes = [h for h in memory_hashes if h]
+        for start in range(0, len(hashes), _DELETE_EDGES_CHUNK):
+            quoted = ", ".join(
+                f'"{escape_expr_value(h)}"'
+                for h in hashes[start:start + _DELETE_EDGES_CHUNK]
+            )
+            await self._call_client(
+                "delete",
+                collection_name=self.collection_name,
+                filter=f"source_hash in [{quoted}] or target_hash in [{quoted}]",
+            )
+
+    async def get_edge_snapshot(self) -> List[Dict[str, str]]:
+        """Read every edge identity and type without a per-query row cap."""
+        if not self._ensure_ready():
+            raise RuntimeError("Milvus graph storage is not initialized")
+        if not await self._call_client(
+            "has_collection", collection_name=self.collection_name
+        ):
+            return []
+        return await self._drain_edges(
+            "", ["source_hash", "target_hash", "relationship_type"]
+        )
+
+    async def delete_edges_by_relationship_types(
+        self, relationship_types: List[str]
+    ) -> int:
+        """Delete only the requested edge types. RPC failures propagate."""
+        if not relationship_types:
+            return 0
+        if not self._ensure_ready():
+            raise RuntimeError("Milvus graph storage is not initialized")
+        quoted = ", ".join(
+            f'"{escape_expr_value(value)}"' for value in relationship_types
+        )
+        result = await self._call_client(
+            "delete",
+            collection_name=self.collection_name,
+            filter=f"relationship_type in [{quoted}]",
+        )
+        # Milvus Lite / older servers return the deleted primary keys instead.
+        if isinstance(result, list):
+            return len(result)
+        return int(result.get("delete_count", 0))
 
     async def get_association_count(self, memory_hash: str) -> int:
         """Get count of direct associations for a memory."""
@@ -748,7 +958,7 @@ class MilvusGraphStorage:
             return len(results) if results else 0
 
         except Exception as exc:
-            logger.error("Failed to count associations: %s", exc)
+            logger.error("Failed to count associations: %s", _sanitize_log_value(exc))
             return 0
 
     async def get_relationship_types(self, memory_hash: str) -> Dict[str, int]:
@@ -780,8 +990,361 @@ class MilvusGraphStorage:
             return counts
 
         except Exception as exc:
-            logger.error("Failed to get relationship types: %s", exc)
+            logger.error("Failed to get relationship types: %s", _sanitize_log_value(exc))
             return {}
+
+    # -- Entity links --------------------------------------------------------
+
+    @staticmethod
+    def _entity_name_from_row(row: Dict[str, Any]) -> str:
+        """Read the entity surface form out of an edge's metadata JSON."""
+        raw = row.get("metadata")
+        if not raw:
+            return ""
+        try:
+            meta = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        return meta.get("entity_name", "") if isinstance(meta, dict) else ""
+
+    async def _query_entity_edges(
+        self,
+        extra_filter: Optional[str] = None,
+        output_fields: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query has_entity edges, optionally narrowed by ``extra_filter``."""
+        expr = f'relationship_type == "{_ENTITY_REL_TYPE}"'
+        if extra_filter:
+            expr = f'{expr} and {extra_filter}'
+        try:
+            return await self._drain_edges(
+                expr,
+                output_fields or [
+                    "source_hash", "target_hash", "metadata", "created_at",
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Entity edge query failed: %s", _sanitize_log_value(exc))
+            return []
+
+    async def store_entity_link(
+        self, memory_hash: str, entity_name: str, entity_type: str
+    ) -> bool:
+        """Store a memory -> entity edge with relationship_type='has_entity'.
+
+        Upserting on the derived primary key makes re-linking the same
+        (memory, entity) pair idempotent, matching GraphStorage's
+        ``INSERT OR IGNORE``.
+        """
+        if not self._ensure_ready():
+            return False
+
+        if not memory_hash or not entity_name:
+            return False
+
+        try:
+            target = _entity_key(entity_name)
+            row = {
+                "id": _edge_id(memory_hash, target),
+                "source_hash": memory_hash,
+                "target_hash": target,
+                "similarity": 1.0,
+                "connection_types": json.dumps(["entity"]),
+                "metadata": json.dumps(
+                    {"entity_type": entity_type, "entity_name": entity_name}
+                ),
+                "relationship_type": _ENTITY_REL_TYPE,
+                "created_at": datetime.now(timezone.utc).timestamp(),
+                "_dummy_vec": _DUMMY_VEC_VALUE,
+            }
+            await self._call_client(
+                "upsert",
+                collection_name=self.collection_name,
+                data=[row],
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to store entity link: %s", _sanitize_log_value(exc))
+            return False
+
+    async def list_entities(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """List all known entities with link count and last activity.
+
+        Milvus has no GROUP BY, so the has_entity edges are drained and
+        aggregated in Python — the same shape GraphStorage returns via SQL.
+        """
+        if not self._ensure_ready():
+            return []
+
+        rows = await self._query_entity_edges()
+        if not rows:
+            return []
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            key = row.get("target_hash", "")
+            if not key:
+                continue
+            created = float(row.get("created_at") or 0.0)
+            entry = grouped.get(key)
+            if entry is None:
+                grouped[key] = {
+                    "entity_name": self._entity_name_from_row(row) or key,
+                    "count": 1,
+                    "last_activity": created,
+                }
+            else:
+                entry["count"] += 1
+                if created > entry["last_activity"]:
+                    entry["last_activity"] = created
+
+        ordered = sorted(
+            grouped.values(), key=lambda e: e["count"], reverse=True,
+        )
+        return ordered[:limit]
+
+    async def find_memories_by_entity(
+        self, entity_name: str, limit: int = 20
+    ) -> List[str]:
+        """Find memory hashes linked to a given entity name, newest first."""
+        if not self._ensure_ready():
+            return []
+
+        if not entity_name:
+            return []
+
+        key = _entity_key(entity_name)
+        rows = await self._query_entity_edges(
+            extra_filter=f'target_hash == "{key}"',
+            output_fields=["source_hash", "created_at"],
+        )
+        rows.sort(key=lambda r: float(r.get("created_at") or 0.0), reverse=True)
+        return [r["source_hash"] for r in rows[:limit] if r.get("source_hash")]
+
+    async def get_entities_for_memory(self, memory_hash: str) -> List[str]:
+        """Get entity names linked to a memory hash."""
+        if not self._ensure_ready():
+            return []
+
+        if not memory_hash:
+            return []
+
+        h_esc = escape_expr_value(memory_hash)
+        rows = await self._query_entity_edges(
+            extra_filter=f'source_hash == "{h_esc}"',
+            output_fields=["metadata"],
+        )
+        names = [self._entity_name_from_row(r) for r in rows]
+        return [n for n in names if n]
+
+    async def get_entity_profile(self, entity_name: str) -> Dict[str, Any]:
+        """Get entity profile: memory count, entity types, last activity."""
+        if not self._ensure_ready():
+            return {}
+
+        if not entity_name:
+            return {}
+
+        key = _entity_key(entity_name)
+        rows = await self._query_entity_edges(
+            extra_filter=f'target_hash == "{key}"',
+            output_fields=["metadata", "created_at"],
+        )
+        if not rows:
+            return {}
+
+        types: Set[str] = set()
+        last_activity = 0.0
+        for row in rows:
+            created = float(row.get("created_at") or 0.0)
+            last_activity = max(last_activity, created)
+            raw = row.get("metadata")
+            if not raw:
+                continue
+            try:
+                meta = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(meta, dict) and meta.get("entity_type"):
+                types.add(meta["entity_type"])
+
+        return {
+            "entity_name": entity_name,
+            "memory_count": len(rows),
+            "entity_types": list(types),
+            "last_activity": last_activity,
+        }
+
+    # -- Reasoning helpers ---------------------------------------------------
+
+    async def transitive_closure(
+        self,
+        relationship_type: str,
+        max_hops: int = 2,
+    ) -> List[Tuple[str, str, int]]:
+        """Find transitive relationships of one type via application-layer BFS.
+
+        Returns ``(source, target, distance)`` for inferred pairs at distance
+        >= 2 that have no direct edge — the same contract as GraphStorage's
+        recursive CTE, which Milvus cannot express server-side.
+        """
+        if not self._ensure_ready():
+            return []
+
+        max_hops = min(max(max_hops, 2), 4)
+
+        edges = await self._drain_by_relationship(relationship_type)
+        if not edges:
+            return []
+
+        adjacency = self._build_adjacency(edges)
+        direct = {
+            (e["source_hash"], e["target_hash"])
+            for e in edges
+            if e.get("source_hash") and e.get("target_hash")
+        }
+
+        results: List[Tuple[str, str, int]] = []
+        for start in adjacency:
+            for target, depth in self._reachable_from(start, adjacency, max_hops):
+                if (start, target) not in direct:
+                    results.append((start, target, depth))
+
+        results.sort(key=lambda r: r[2])
+        return results
+
+    @staticmethod
+    def _build_adjacency(edges: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+        """Collapse edge rows into a source -> targets map."""
+        adjacency: Dict[str, Set[str]] = {}
+        for edge in edges:
+            src = edge.get("source_hash")
+            tgt = edge.get("target_hash")
+            if src and tgt:
+                adjacency.setdefault(src, set()).add(tgt)
+        return adjacency
+
+    @staticmethod
+    def _reachable_from(
+        start: str,
+        adjacency: Dict[str, Set[str]],
+        max_hops: int,
+    ) -> List[Tuple[str, int]]:
+        """BFS from ``start``, returning (node, first-reach depth) for depth >= 2."""
+        found: List[Tuple[str, int]] = []
+        frontier = {start}
+        visited = {start}
+        for depth in range(1, max_hops + 1):
+            nxt: Set[str] = set()
+            for node in frontier:
+                nxt |= adjacency.get(node, set())
+            nxt -= visited
+            if not nxt:
+                break
+            visited |= nxt
+            if depth >= 2:
+                found.extend((node, depth) for node in nxt)
+            frontier = nxt
+        return found
+
+    async def _drain_by_relationship(
+        self, relationship_type: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch every edge of a single relationship type."""
+        safe_rt = escape_expr_value(relationship_type)
+        try:
+            return await self._drain_edges(
+                f'relationship_type == "{safe_rt}"',
+                ["source_hash", "target_hash"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to drain edges for %s: %s",
+                _sanitize_log_value(relationship_type),
+                _sanitize_log_value(exc),
+            )
+            return []
+
+    async def common_neighbors(
+        self,
+        memory_hash: str,
+        min_shared: int = 1,
+    ) -> List[Tuple[str, int, int]]:
+        """Find memories sharing neighbours with ``memory_hash``.
+
+        Returns ``(candidate_hash, shared_count, source_degree)`` for the top
+        10 candidates, excluding the source itself and anything already
+        directly connected — matching GraphStorage's self-join query.
+        """
+        if not self._ensure_ready():
+            return []
+
+        if not memory_hash:
+            return []
+
+        # 1-hop: every direct neighbour, in either direction.
+        own_edges = await self._query_edges_both({memory_hash})
+        neighbors = self._neighbors_of(own_edges, memory_hash)
+
+        source_degree = len(neighbors)
+        neighbor_counts: Dict[str, int] = {}
+        for neighbor in neighbors:
+            neighbor_counts[neighbor] = neighbor_counts.get(neighbor, 0) + 1
+        neighbor_set = set(neighbor_counts)
+        if not neighbor_set:
+            return []
+
+        # 2-hop: neighbours of neighbours, counted with multiplicity so the
+        # shared_count matches the SQL COUNT(*) over the join.
+        second = await self._query_edges_both(neighbor_set)
+        counts = self._count_second_hop(second, neighbor_counts, memory_hash)
+
+        candidates = [
+            (h, c, source_degree)
+            for h, c in counts.items()
+            if h not in neighbor_set and c >= min_shared
+        ]
+        candidates.sort(key=lambda r: r[1], reverse=True)
+        return candidates[:10]
+
+    @staticmethod
+    def _neighbors_of(edges: List[Dict[str, Any]], memory_hash: str) -> List[str]:
+        """Direct neighbours of ``memory_hash``, one entry per edge row.
+
+        Multiplicity is preserved so the caller's degree matches the SQL
+        COUNT(*) over the same rows.
+        """
+        neighbors: List[str] = []
+        for edge in edges:
+            src = edge.get("source_hash")
+            tgt = edge.get("target_hash")
+            if src == memory_hash and tgt:
+                neighbors.append(tgt)
+            elif tgt == memory_hash and src:
+                neighbors.append(src)
+        return neighbors
+
+    @staticmethod
+    def _count_second_hop(
+        edges: List[Dict[str, Any]],
+        neighbor_counts: Dict[str, int],
+        memory_hash: str,
+    ) -> Dict[str, int]:
+        """Count SQL self-join matches for each 2-hop node.
+
+        Symmetric edges are stored in both directions, so each direct edge to a
+        shared neighbour contributes twice to the source's ``my_neighbors`` CTE
+        and each incident edge is counted once per such row. Multiplying by the
+        neighbour multiplicity preserves that SQL COUNT(*) semantics.
+        """
+        counts: Dict[str, int] = {}
+        for edge in edges:
+            src = edge.get("source_hash")
+            tgt = edge.get("target_hash")
+            for near, far in ((src, tgt), (tgt, src)):
+                if near in neighbor_counts and far and far != memory_hash:
+                    counts[far] = counts.get(far, 0) + neighbor_counts[near]
+        return counts
 
     async def close(self) -> None:
         """Close the Milvus client connection."""

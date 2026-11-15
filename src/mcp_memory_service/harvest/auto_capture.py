@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from ..compat import _sanitize_log_value
 from .extractor import PatternExtractor
 from .harvester import SessionHarvester
 from .models import HARVEST_TYPES, HarvestCandidate, HarvestConfig, harvest_config_from_env
@@ -22,6 +23,7 @@ class AutoCaptureResult:
     candidates: List[HarvestCandidate] = field(default_factory=list)
     stored: int = 0
     evolved: int = 0
+    skipped: int = 0  # Refused re-creates of deleted content (#1560)
     stored_hashes: List[str] = field(default_factory=list)
     parent_hash: Optional[str] = None
     dry_run: bool = True
@@ -33,6 +35,7 @@ class AutoCaptureResult:
             "found": len(self.candidates),
             "stored": self.stored,
             "evolved": self.evolved,
+            "skipped": self.skipped,
             "stored_hashes": self.stored_hashes,
             "by_type": _count_by_type(self.candidates),
             "candidates": [
@@ -99,7 +102,7 @@ class AutoCaptureService:
         self._harvester.memory_service = self.memory_service
 
         # Pre-create graph instance once for the entire loop
-        graph = _get_graph_instance()
+        graph = await _get_graph_instance_async()
 
         for candidate in candidates:
             try:
@@ -133,6 +136,8 @@ class AutoCaptureService:
                 )
 
                 if not (isinstance(resp, dict) and resp.get("success")):
+                    if isinstance(resp, dict) and resp.get("refused_recreate"):
+                        result.skipped += 1  # #1560: deleted on the server, not re-created
                     continue
 
                 child_hash = _hash_from_store_response(resp)
@@ -142,7 +147,7 @@ class AutoCaptureService:
                     if link_parent and parent_hash:
                         await _link_derived_from(parent_hash, child_hash, candidate.confidence, graph=graph)
             except Exception as exc:
-                logger.warning("Auto-capture store failed: %s", exc)
+                logger.warning("Auto-capture store failed: %s", _sanitize_log_value(str(exc)))
 
         return result
 
@@ -172,15 +177,18 @@ def _hash_from_store_response(resp: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _get_graph_instance():
-    """Create a GraphStorage instance if backend supports it, else None."""
-    try:
-        from ..config import SQLITE_VEC_PATH, STORAGE_BACKEND
-        from ..storage.graph import GraphStorage
+async def _get_graph_instance_async():
+    """Backend-aware graph storage for the configured backend, or None.
 
-        if STORAGE_BACKEND not in ("sqlite_vec", "hybrid"):
-            return None
-        return GraphStorage(SQLITE_VEC_PATH)
+    Replaces a sync helper that hard-coded ``STORAGE_BACKEND in
+    ("sqlite_vec", "hybrid")`` and returned None everywhere else, so
+    derived_from edges were silently skipped on Milvus even though
+    MilvusGraphStorage implements store_association. get_graph_storage() also
+    performs the async initialize() that Milvus requires and SQLite does not.
+    """
+    try:
+        from ..server.handlers.graph import get_graph_storage
+        return await get_graph_storage()
     except Exception:
         return None
 
@@ -189,7 +197,7 @@ async def _link_derived_from(parent_hash: str, child_hash: str, confidence: floa
     """Best-effort graph edge: child derived from parent."""
     try:
         if not graph:
-            graph = _get_graph_instance()
+            graph = await _get_graph_instance_async()
         if not graph:
             return
 
@@ -213,4 +221,4 @@ async def _link_derived_from(parent_hash: str, child_hash: str, confidence: floa
             metadata={"extraction": "auto_capture"},
         )
     except Exception as exc:
-        logger.debug("Auto-capture graph link skipped: %s", exc)
+        logger.debug("Auto-capture graph link skipped: %s", _sanitize_log_value(str(exc)))

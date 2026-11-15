@@ -9,9 +9,10 @@ all memory operations, eliminating the DRY violation and ensuring consistent beh
 import json
 import logging
 import math
+import os
 import re
 import sys
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Tuple, Union
 
 # Pydantic v2.12 requires typing_extensions.TypedDict on Python < 3.12
 # See: https://errors.pydantic.dev/2.12/u/typed-dict-version
@@ -31,23 +32,22 @@ from ..config import (
     ENABLE_AUTO_SPLIT,
     MCP_QUALITY_BOOST_ENABLED
 )
-from ..storage.base import MemoryStorage
+from ..storage.base import MemoryStorage, RecreateRefused, recreate_kwargs
+from ..storage.semantic_dedup import SemanticDedupResult
 from ..models.memory import Memory
+from ..models.ontology import coerce_memory_type
 from ..plugins import PluginContext, PluginRegistry
 from ..utils.content_splitter import split_content
 from ..utils.hashing import generate_content_hash
+from ..utils.agent_context import (
+    log_agent_id_resolution,
+    resolve_agent_id,
+)
 from ..quality.async_scorer import async_scorer
 
 logger = logging.getLogger(__name__)
 
-def _sanitize_log_value(value: str) -> str:
-    """Strip control characters from user-provided values before logging.
-
-    Prevents log injection via newlines, carriage returns, or other
-    control characters embedded in user input (CWE-117).
-    """
-    return value.replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
-
+from ..compat import _sanitize_log_value
 
 # Module-level constants for tag processing
 _MAX_JSON_LENGTH = 4096  # 4KB limit for tag JSON to prevent DoS
@@ -83,7 +83,7 @@ def normalize_tags(tags: Union[str, List[str], None]) -> List[str]:
         if stripped.startswith('['):
             # Prevent DoS via large/deeply nested JSON strings
             if len(stripped) > _MAX_JSON_LENGTH:
-                logger.warning(f"Tag JSON string exceeds {_MAX_JSON_LENGTH} bytes, treating as literal string")
+                logger.warning("Tag JSON string exceeds %s bytes, treating as literal string", _MAX_JSON_LENGTH)
                 tags = [stripped]
             else:
                 try:
@@ -137,7 +137,7 @@ def normalize_tags(tags: Union[str, List[str], None]) -> List[str]:
 
     # Limit total number of tags to prevent DoS
     if len(normalized) > _MAX_TAGS_PER_MEMORY:
-        logger.warning(f"Too many tags ({len(normalized)}), limiting to {_MAX_TAGS_PER_MEMORY}")
+        logger.warning("Too many tags (%s), limiting to %s", len(normalized), _MAX_TAGS_PER_MEMORY)
         normalized = normalized[:_MAX_TAGS_PER_MEMORY]
 
     return normalized
@@ -161,6 +161,9 @@ class StoreMemorySingleSuccess(TypedDict):
     """Return type for successful single memory storage."""
     success: bool
     memory: MemoryResult
+    # #1938: set when semantic dedup stored this memory in place of an older one.
+    dedup_outcome: NotRequired[str]
+    matched_hash: NotRequired[str]
 
 
 class StoreMemoryChunkedSuccess(TypedDict):
@@ -170,12 +173,79 @@ class StoreMemoryChunkedSuccess(TypedDict):
     total_chunks: int
     original_hash: str
     failed_chunks: NotRequired[int]  # Number of chunks that failed to store
+    # #1938: one entry per chunk whose semantic dedup decided something.
+    dedup_outcome: NotRequired[str]
+    matched_hash: NotRequired[str]
+    dedup_decisions: NotRequired[List[Dict[str, Any]]]
 
 
 class StoreMemoryFailure(TypedDict):
     """Return type for failed memory storage."""
     success: bool
     error: str
+    # #1560: present only when the write was refused because the content has a delete
+    # on record and the caller did not pass restore_deleted. Keys: event_id, hlc
+    # ([hlc_physical, hlc_logical, agent_id]), deleted_at (ISO-8601 UTC).
+    refused_recreate: NotRequired[Dict[str, Any]]
+    # #1938: ``deduplicated`` names the existing hash that caused the refusal.
+    dedup_outcome: NotRequired[str]
+    matched_hash: NotRequired[str]
+    dedup_decisions: NotRequired[List[Dict[str, Any]]]
+
+
+def _attach_dedup_outcome(response: dict, message) -> dict:
+    """Copy a semantic-dedup decision onto a store_memory response, when there is one."""
+    if isinstance(message, SemanticDedupResult):
+        response["dedup_outcome"] = message.outcome
+        response["matched_hash"] = message.matched_hash
+    return response
+
+
+def _chunk_dedup_decision(index: int, message) -> Optional[Dict[str, Any]]:
+    """One chunk's semantic-dedup decision, or None when dedup did not decide."""
+    if not isinstance(message, SemanticDedupResult):
+        return None
+    return {
+        "chunk_index": index,
+        "dedup_outcome": message.outcome,
+        "matched_hash": message.matched_hash,
+    }
+
+
+def _with_chunk_dedup(response: dict, decisions: List[Dict[str, Any]]) -> dict:
+    """Attach per-chunk dedup decisions. A single decision also fills the top-level fields."""
+    if not decisions:
+        return response
+    response["dedup_decisions"] = decisions
+    if len(decisions) == 1:
+        response["dedup_outcome"] = decisions[0]["dedup_outcome"]
+        response["matched_hash"] = decisions[0]["matched_hash"]
+    return response
+
+
+def _chunk_metadata(
+    metadata: Dict[str, Any], index: int, total: int, content_hash: str, chunk_hash: str
+) -> Dict[str, Any]:
+    """Metadata for one chunk of a split memory."""
+    chunk_metadata = dict(metadata, chunk_index=index, total_chunks=total, original_hash=content_hash)
+    # source_content_hash names the text a source_time belongs to (#1858). Each
+    # chunk carries the whole text's time, so it must name the chunk, or the
+    # time is read as describing other text.
+    if chunk_metadata.get("source_content_hash") == content_hash:
+        chunk_metadata["source_content_hash"] = chunk_hash
+    return chunk_metadata
+
+
+def _refused_recreate_failure(message: RecreateRefused) -> StoreMemoryFailure:
+    """Turn the storage layer's refusal into the entry points' answer (#1560)."""
+    return {
+        "success": False,
+        "error": (
+            f"Not stored: this content was deleted on {message.deleted_at}; "
+            f"pass restore_deleted=true to bring it back"
+        ),
+        "refused_recreate": message.as_dict(),
+    }
 
 
 # List Memories Return Types
@@ -295,6 +365,8 @@ class MemoryService:
         memory_type: Optional[str] = None,
         stale_days: Optional[int] = None,
         store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
+        include_superseded: bool = False,
     ) -> Union[ListMemoriesSuccess, ListMemoriesError]:
         """
         List memories with pagination and optional filtering.
@@ -311,6 +383,8 @@ class MemoryService:
             memory_type: Filter by memory type
             stale_days: Filter to memories not accessed in the last N days.
                 Uses COALESCE(last_accessed, created_at) for memories never read.
+            include_superseded: Also list memories replaced by a newer version.
+                Default False lists current versions only, like search (#1803).
 
         Returns:
             Dictionary with memories and pagination info
@@ -330,6 +404,8 @@ class MemoryService:
                 tag_match=tag_match,
                 stale_days=stale_days,
                 store=store,
+                agent_id=agent_id,
+                include_superseded=include_superseded,
             )
 
             # Get accurate total count for pagination
@@ -339,6 +415,8 @@ class MemoryService:
                 tag_match=tag_match,
                 stale_days=stale_days,
                 store=store,
+                agent_id=agent_id,
+                include_superseded=include_superseded,
             )
 
             # Format results for API response
@@ -378,7 +456,9 @@ class MemoryService:
         metadata: Optional[Dict[str, Any]] = None,
         client_hostname: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
         store: str = "default",
+        restore_deleted: bool = False,
     ) -> Union[StoreMemorySingleSuccess, StoreMemoryChunkedSuccess, StoreMemoryFailure]:
         """
         Store a new memory with validation and content processing.
@@ -398,11 +478,25 @@ class MemoryService:
             conversation_id: Optional conversation identifier. When supplied, semantic
                 deduplication is skipped so all turns of the same conversation
                 can be saved independently. Exact hash dedup is always preserved.
+            restore_deleted: #1560. This method is the external entry point (REST,
+                MCP tool, harvest, auto-capture), so by default it asks the storage
+                NOT to bring back content that has a delete on record
+                (``recreate=False``): a stale client re-sending what the server
+                deleted gets ``{"success": False, "error": ..., "refused_recreate":
+                {event_id, hlc, deleted_at}}`` and the tombstone stays. ``True``
+                purges the tombstone and stamps the create as a deliberate re-create
+                (ADR-0012 v2 ``recreate_of``). Direct ``storage.store()`` callers are
+                untouched: they keep ``recreate=None``, today's behaviour.
 
         Returns:
             Dictionary with operation result
         """
+        recreate = True if restore_deleted else False
         try:
+            # A new write is where an unknown type becomes `observation`; Memory()
+            # keeps whatever it is given so stored rows survive hydration.
+            memory_type = coerce_memory_type(memory_type)
+
             # Normalize tags from parameter (handles all formats)
             final_tags = normalize_tags(tags)
 
@@ -430,6 +524,19 @@ class MemoryService:
             if conversation_id:
                 final_metadata["conversation_id"] = conversation_id
 
+            # RFC #1100 + spec-agent-id-streamable: author identity. This is the
+            # SINGLE resolution point; no tool duplicates this logic. The header
+            # ATTRIBUTES authorship — it is not authentication (the ContextVar is
+            # populated by the streamable-http ASGI middleware from X-Agent-ID and
+            # grants no permission). Precedence lives in resolve_agent_id():
+            #   explicit arg > request header (ContextVar) > MCP_AGENT_ID env >
+            #   agent_id already present in the caller's metadata
+            #   (harvest/bootstrap/commit_session path) > unset (null = unknown).
+            resolution = resolve_agent_id(explicit=agent_id, metadata=final_metadata)
+            log_agent_id_resolution(resolution, context="store_memory")
+            if resolution.agent_id:
+                final_metadata["agent_id"] = resolution.agent_id
+
             # Generate content hash for deduplication
             content_hash = generate_content_hash(content)
 
@@ -445,13 +552,12 @@ class MemoryService:
                 )
                 stored_memories = []
                 failed_chunks = []
+                refused_chunks = []  # #1560: chunks that met a delete on record
+                dedup_decisions = []
 
                 for i, chunk in enumerate(chunks):
                     chunk_hash = generate_content_hash(chunk)
-                    chunk_metadata = final_metadata.copy()
-                    chunk_metadata["chunk_index"] = i
-                    chunk_metadata["total_chunks"] = len(chunks)
-                    chunk_metadata["original_hash"] = content_hash
+                    chunk_metadata = _chunk_metadata(final_metadata, i, len(chunks), content_hash, chunk_hash)
 
                     memory = Memory(
                         content=chunk,
@@ -461,7 +567,13 @@ class MemoryService:
                         metadata=chunk_metadata
                     )
 
-                    success, message = await self.storage.store(memory, skip_semantic_dedup=skip_dedup, store=store)
+                    success, message = await self.storage.store(
+                        memory, skip_semantic_dedup=skip_dedup, store=store,
+                        **recreate_kwargs(self.storage, recreate)
+                    )
+                    decision = _chunk_dedup_decision(i, message)
+                    if decision is not None:
+                        dedup_decisions.append(decision)
                     if success:
                         stored_memories.append(self._format_memory_response(memory))
                         # Queue chunk for AI quality scoring if enabled
@@ -469,29 +581,40 @@ class MemoryService:
                             try:
                                 await async_scorer.score_memory(memory, query="", storage=self.storage)
                             except Exception as e:
-                                logger.debug(f"Background quality scoring for chunk failed silently: {e}")
+                                logger.debug("Background quality scoring for chunk failed silently: %s", _sanitize_log_value(str(e)))
                     else:
                         failed_chunks.append({"index": i, "reason": message})
+                        if isinstance(message, RecreateRefused):
+                            refused_chunks.append({"index": i, **message.as_dict()})
 
                 # If NO chunks were stored, return failure
                 if not stored_memories:
-                    reasons = ", ".join(set(fc["reason"] for fc in failed_chunks))
-                    return {
+                    refusals = [fc["reason"] for fc in failed_chunks
+                                if isinstance(fc["reason"], RecreateRefused)]
+                    if len(refusals) == len(failed_chunks):
+                        # #1560: every chunk met a delete on record — one refusal, not
+                        # a generic failure, so REST can answer 409 for the whole write.
+                        return _refused_recreate_failure(refusals[0])
+                    reasons = ", ".join(set(str(fc["reason"]) for fc in failed_chunks))
+                    return _with_chunk_dedup({
                         "success": False,
                         "error": f"Failed to store all {len(chunks)} chunks: {reasons}"
-                    }
+                    }, dedup_decisions)
 
                 # If SOME chunks were stored, return partial success
                 for mem_dict in stored_memories:
                     await self._plugin_registry.fire('on_store', mem_dict)
 
-                return {
+                return _with_chunk_dedup({
                     "success": True,
                     "memories": stored_memories,
                     "total_chunks": len(chunks),
                     "original_hash": content_hash,
-                    "failed_chunks": len(failed_chunks)
-                }
+                    "failed_chunks": len(failed_chunks),
+                    # #1560: a partial write that skipped deleted chunks must say so — the
+                    # stored chunks alone would read as the whole content.
+                    "refused_chunks": refused_chunks,
+                }, dedup_decisions)
             else:
                 # Store as single memory
                 memory = Memory(
@@ -502,7 +625,36 @@ class MemoryService:
                     metadata=final_metadata
                 )
 
-                success, message = await self.storage.store(memory, skip_semantic_dedup=skip_dedup, store=store)
+                success, message = await self.storage.store(
+                    memory, skip_semantic_dedup=skip_dedup, store=store,
+                    **recreate_kwargs(self.storage, recreate)
+                )
+
+                # #1560: a refused re-create is not a duplicate — nothing to re-examine.
+                if not success and isinstance(message, RecreateRefused):
+                    return _refused_recreate_failure(message)
+
+                # Issue #1216 (1b): a value-swap ("X is A" then "X is B") is
+                # near-identical text to what it contradicts, so semantic dedup
+                # rejects it before any contradiction check runs and it is
+                # silently dropped. When on-store NLI is enabled, re-examine that
+                # rejection: if the new content CONTRADICTS the memory it collided
+                # with, it is not a duplicate — store it (bypassing dedup) and file
+                # it as a contradiction, instead of dropping it.
+                contradicted_hash = None
+                if not success:
+                    contradicted_hash = await self._contradiction_behind_duplicate(memory, message)
+                    if contradicted_hash:
+                        success, message = await self.storage.store(
+                            memory, skip_semantic_dedup=True, store=store,
+                            **recreate_kwargs(self.storage, recreate)
+                        )
+                        # #1560: semantic dedup runs before the delete-record check, so
+                        # the refusal can surface only on this retry.
+                        if not success and isinstance(message, RecreateRefused):
+                            return _refused_recreate_failure(message)
+                        if not success:
+                            contradicted_hash = None
 
                 if success:
                     # Queue for AI quality scoring if enabled
@@ -510,33 +662,41 @@ class MemoryService:
                         try:
                             await async_scorer.score_memory(memory, query="", storage=self.storage)
                         except Exception as e:
-                            logger.debug(f"Background quality scoring queued (or failed silently): {e}")
+                            logger.debug("Background quality scoring queued (or failed silently): %s", _sanitize_log_value(str(e)))
 
                     # Entity linking: extract entities and create shares_entity edges
                     await self._maybe_link_entities(memory)
 
                     await self._plugin_registry.fire('on_store', self._format_memory_response(memory))
 
-                    return {
+                    response = {
                         "success": True,
                         "memory": self._format_memory_response(memory)
                     }
+                    if contradicted_hash:
+                        filed_ok, filing = await self._file_contradiction(
+                            memory.content_hash, contradicted_hash
+                        )
+                        # Never report a filing that did not happen: a failed
+                        # quarantine leaves the memory stored *and* active.
+                        key = "filed_as_contradiction" if filed_ok else "contradiction_filing_failed"
+                        response[key] = filing
+                    return _attach_dedup_outcome(response, message)
                 else:
-                    return {
-                        "success": False,
-                        "error": message
-                    }
+                    return _attach_dedup_outcome(
+                        {"success": False, "error": message}, message
+                    )
 
         except ValueError as e:
             # Handle validation errors specifically
-            logger.warning(f"Validation error storing memory: {e}")
+            logger.warning("Validation error storing memory: %s", _sanitize_log_value(str(e)))
             return {
                 "success": False,
                 "error": f"Invalid memory data: {str(e)}"
             }
         except ConnectionError as e:
             # Handle storage connectivity issues
-            logger.error(f"Storage connection error: {e}")
+            logger.error("Storage connection error: %s", _sanitize_log_value(str(e)))
             return {
                 "success": False,
                 "error": f"Storage connection failed: {str(e)}"
@@ -548,6 +708,174 @@ class MemoryService:
                 "success": False,
                 "error": f"Failed to store memory: {str(e)}"
             }
+
+    async def evolve_memory(
+        self,
+        existing_hash: str,
+        content: str,
+        tags: Optional[List[str]] = None,
+        memory_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        reason: Optional[str] = None,
+    ) -> Tuple[bool, str, Optional[str]]:
+        """Versioned update that gets the same post-store steps as store_memory().
+
+        ``storage.update_memory_versioned()`` writes the new version straight
+        into storage, so a caller that uses it directly skips everything
+        store_memory() does after a write: caller metadata and agent identity,
+        AI quality scoring, entity linking and ``on_store`` plugins. This is
+        the service-level entry point for evolving a memory.
+
+        Returns:
+            ``(success, message, new_hash)``, as from update_memory_versioned().
+        """
+        if not hasattr(self.storage, "update_memory_versioned"):
+            return False, "Storage backend does not support versioned updates", None
+        # Storage inherits omitted tags/type from the old version; keep that
+        # version around so the re-read fallback below can do the same.
+        previous = None
+        if tags is None or memory_type is None:
+            previous = await self.storage.get_by_hash(existing_hash)
+        ok, msg, new_hash = await self.storage.update_memory_versioned(
+            existing_hash,
+            content,
+            new_tags=tags,
+            new_memory_type=memory_type,
+            reason=reason,
+        )
+        if not ok or not new_hash:
+            return ok, msg, new_hash
+
+        final_metadata = dict(metadata) if metadata else {}
+        for key in ("tags", "type"):
+            final_metadata.pop(key, None)
+        # Same RFC #1100 + spec-agent-id-streamable precedence as store_memory(),
+        # via the shared resolve_agent_id() helper. evolve_memory() has no explicit
+        # agent_id argument, so the chain is: request header (ContextVar) >
+        # MCP_AGENT_ID env > agent_id already in the caller's metadata.
+        resolution = resolve_agent_id(metadata=final_metadata)
+        log_agent_id_resolution(resolution, context="evolve_memory")
+        if resolution.agent_id:
+            final_metadata["agent_id"] = resolution.agent_id
+        # The new version is already committed from here on, so a failure below
+        # is reported and worked around rather than turned into a failed evolve.
+        if final_metadata:
+            meta_ok, meta_msg = await self.storage.update_memory_metadata(
+                new_hash, {"metadata": final_metadata}, preserve_timestamps=True
+            )
+            if not meta_ok:
+                logger.warning(
+                    "Evolved memory %s but could not write its metadata: %s",
+                    new_hash[:8], _sanitize_log_value(str(meta_msg)),
+                )
+                msg = f"{msg} (metadata update failed: {meta_msg})"
+
+        memory = await self.storage.get_by_hash(new_hash)
+        if memory is None:
+            # Re-read failed; score the version as written instead of skipping it.
+            memory = self._as_written(new_hash, content, tags, memory_type, final_metadata, previous)
+        await self._run_post_store_steps(memory)
+        return ok, msg, new_hash
+
+    @staticmethod
+    def _as_written(new_hash, content, tags, memory_type, metadata, previous) -> Memory:
+        """The evolved version as storage wrote it, for when it can't be re-read."""
+        if tags is None and previous is not None:
+            # Storage does not carry the conflict marker into a new version (#1840).
+            tags = [t for t in (previous.tags or []) if t != "conflict:unresolved"]
+        if memory_type is None and previous is not None:
+            memory_type = previous.memory_type
+        return Memory(
+            content=content,
+            content_hash=new_hash,
+            tags=list(tags or []),
+            memory_type=memory_type,
+            metadata=metadata,
+        )
+
+    async def _run_post_store_steps(self, memory: Memory) -> None:
+        """Quality scoring, entity linking and on_store plugins for a new memory."""
+        if MCP_QUALITY_BOOST_ENABLED:
+            try:
+                await async_scorer.score_memory(memory, query="", storage=self.storage)
+            except Exception as e:
+                logger.debug("Background quality scoring failed silently: %s", _sanitize_log_value(str(e)))
+        await self._maybe_link_entities(memory)
+        await self._plugin_registry.fire('on_store', self._format_memory_response(memory))
+
+    async def _contradiction_behind_duplicate(self, memory, reject_message):
+        """Return the hash of the near-duplicate ``memory`` contradicts, or None.
+
+        Issue #1216 (1b): only fires when on-store NLI is enabled, the rejection
+        was a *semantic* duplicate, and an NLI classifier labels the new content a
+        contradiction of the memory it collided with at or above the configurable
+        quarantine gate (MCP_QUARANTINE_NLI_THRESHOLD). Fully guarded — any failure
+        returns None, so the caller falls back to the original duplicate rejection
+        and default behaviour is unchanged when NLI-on-store is off.
+        """
+        if os.getenv("MCP_NLI_ON_STORE", "false").lower() != "true":
+            return None
+        try:
+            match = re.search(
+                r"semantically similar to ([a-f0-9]+)", str(reject_message), re.IGNORECASE
+            )
+            if not match:
+                return None
+            existing_hash = match.group(1)
+            existing = await self.storage.get_by_hash(existing_hash)
+            if not existing or not getattr(existing, "content", None):
+                return None
+            from ..reasoning.nli import NLIClassifier
+            from ..consolidation.quarantine import (
+                _quarantine_nli_threshold,
+                _warn_if_gate_unreachable,
+            )
+            classifier = NLIClassifier(backend="auto")
+            threshold = _quarantine_nli_threshold()
+            # Same reachability check as check_beliefs_on_store: with the
+            # default heuristic ceiling (0.55) under the default gate (0.7)
+            # this rescue can never fire, and that must not be silent here either.
+            _warn_if_gate_unreachable(classifier, threshold)
+            result = await classifier.classify(existing.content, memory.content)
+            if result.label == "contradiction" and result.confidence >= threshold:
+                return existing_hash
+        except Exception as e:
+            logger.debug(f"Contradiction-behind-duplicate check failed: {_sanitize_log_value(str(e))}")
+        return None
+
+    async def _file_contradiction(self, content_hash, contradicted_hash):
+        """Quarantine a rescued value-swap against the *memory* it contradicts.
+
+        Returns ``(ok, filing)``: ``filing`` always names the contradicted hash
+        and carries the quarantine result; ``ok`` is True only if the memory is
+        actually quarantined. ``quarantine_memory`` reports failure as
+        ``{"status": "error"}`` rather than raising, so the status is checked —
+        a failed quarantine leaves the dedup-bypassed memory stored and active,
+        and the caller must say so instead of reporting it filed (issue #1216).
+        The store that already succeeded is never unwound here.
+        """
+        filing = {"contradicts": contradicted_hash}
+        try:
+            from ..consolidation.quarantine import quarantine_memory
+            q = await quarantine_memory(
+                self.storage, content_hash, None,
+                reason=(
+                    f"Value differs from near-duplicate {contradicted_hash[:8]}; "
+                    f"filed as contradiction instead of dropped as duplicate (#1216)"
+                ),
+                contradicted_memory_hash=contradicted_hash,
+            )
+        except Exception as e:
+            q = {"status": "error", "message": str(e)}
+        filing["quarantine"] = q
+        if q.get("status") == "quarantined":
+            return True, filing
+        logger.warning(
+            f"Memory {content_hash[:8]} was stored past semantic dedup as a contradiction "
+            f"of {contradicted_hash[:8]} but could not be quarantined: "
+            f"{_sanitize_log_value(str(q.get('message', 'unknown error')))}"
+        )
+        return False, filing
 
     async def retrieve_memories(
         self,
@@ -569,12 +897,18 @@ class MemoryService:
             Dictionary with search results
         """
         try:
-            # Retrieve memories using semantic search
-            # Note: storage.retrieve() only supports query and n_results
-            # We'll filter by tags/type after retrieval if needed
+            # Retrieve memories using semantic search.
+            # Note: storage.retrieve() only supports query and n_results, so the
+            # tags/type filters below are applied AFTER retrieval. Fetching only
+            # ``n_results`` and then filtering throws away the whole result set
+            # whenever the matching rows are not in that first window — that is
+            # why ``mistake_note_search`` returned empty over a populated table.
+            fetch_n = n_results
+            if tags or memory_type:
+                fetch_n = max(n_results * 10, n_results + 50)
             memories = await self.storage.retrieve(
                 query=query,
-                n_results=n_results
+                n_results=fetch_n
             )
 
             # Apply optional post-filtering
@@ -596,6 +930,9 @@ class MemoryService:
 
                     filtered_memories.append(query_result)
 
+            # The extra rows fetched for filtering are not part of the answer.
+            filtered_memories = filtered_memories[:n_results]
+
             results = []
             for result in filtered_memories:
                 # Extract Memory object from MemoryQueryResult and add similarity score
@@ -608,7 +945,7 @@ class MemoryService:
                     try:
                         await async_scorer.score_memory(result.memory, query=query, storage=self.storage)
                     except Exception as e:
-                        logger.debug(f"Background quality scoring for retrieved memory failed silently: {e}")
+                        logger.debug("Background quality scoring for retrieved memory failed silently: %s", _sanitize_log_value(str(e)))
 
             results = await self.apply_retrieve_plugins(query, results)
 
@@ -619,7 +956,7 @@ class MemoryService:
             }
 
         except Exception as e:
-            logger.error(f"Error retrieving memories: {e}")
+            logger.error("Error retrieving memories: %s", _sanitize_log_value(str(e)))
             return {
                 "memories": [],
                 "query": query,
@@ -646,10 +983,15 @@ class MemoryService:
             tags = normalize_tags(tags)
 
             # Preserve the existing ANY search, including its result ordering.
+            # Current versions only, like memory_search (#1803).
             if match_all:
-                memories = await self.storage.search_by_tags(tags=tags, operation="AND")
+                memories = await self.storage.search_by_tags(
+                    tags=tags, operation="AND", include_superseded=False
+                )
             else:
-                memories = await self.storage.search_by_tag(tags=tags)
+                memories = await self.storage.search_by_tag(
+                    tags=tags, include_superseded=False
+                )
 
             # Format results
             results = []
@@ -667,7 +1009,7 @@ class MemoryService:
             }
 
         except Exception as e:
-            logger.error(f"Error searching by tags: {e}")
+            logger.error("Error searching by tags: %s", _sanitize_log_value(str(e)))
             return {
                 "memories": [],
                 "tags": tags if isinstance(tags, list) else [tags],
@@ -700,7 +1042,7 @@ class MemoryService:
                 }
 
         except Exception as e:
-            logger.error(f"Error getting memory by hash: {e}")
+            logger.error("Error getting memory by hash: %s", _sanitize_log_value(str(e)))
             return {
                 "found": False,
                 "content_hash": content_hash,
@@ -733,7 +1075,7 @@ class MemoryService:
                 }
 
         except Exception as e:
-            logger.error(f"Error deleting memory: {e}")
+            logger.error("Error deleting memory: %s", _sanitize_log_value(str(e)))
             return {
                 "success": False,
                 "content_hash": content_hash,
@@ -758,7 +1100,7 @@ class MemoryService:
             }
 
         except Exception as e:
-            logger.error(f"Health check failed: {e}")
+            logger.error("Health check failed: %s", _sanitize_log_value(str(e)))
             return {
                 "healthy": False,
                 "error": f"Health check failed: {str(e)}"
@@ -781,7 +1123,18 @@ class MemoryService:
             extractor = EntityExtractor(
                 domain_extractors=EntityExtractor.get_domain_extractors()
             )
-            entities = extractor.extract_entities(memory.content, memory.metadata)
+            # tags is a top-level Memory attribute, metadata is the custom-key
+            # dict — merge so the extractor's metadata-tag branch fires. Same
+            # fix as server/handlers/graph.py (#218); this write path was still
+            # discarding every tag before the extractor saw it.
+            extraction_metadata = dict(memory.metadata or {})
+            merged_tags = list(dict.fromkeys([
+                *extraction_metadata.get('tags', []), *(memory.tags or []),
+            ]))
+            if merged_tags:
+                extraction_metadata['tags'] = merged_tags
+
+            entities = extractor.extract_entities(memory.content, extraction_metadata)
             if not entities:
                 return
 
@@ -795,7 +1148,7 @@ class MemoryService:
             linker = EntityLinker()
             await linker.link_by_entities(memory.content_hash, entity_names, graph)
         except Exception as e:
-            logger.debug(f"Entity linking failed silently: {e}")
+            logger.debug("Entity linking failed silently: %s", _sanitize_log_value(str(e)))
 
     def _format_memory_response(self, memory: Memory) -> MemoryResult:
         """
@@ -816,7 +1169,8 @@ class MemoryService:
             "created_at": memory.created_at,
             "updated_at": memory.updated_at,
             "created_at_iso": memory.created_at_iso,
-            "updated_at_iso": memory.updated_at_iso
+            "updated_at_iso": memory.updated_at_iso,
+            "agent_id": memory.agent_id,  # Include agent_id as top-level field
         }
 
     # ─── Mistake Notes ────────────────────────────────────────────────
@@ -844,7 +1198,6 @@ class MemoryService:
         Returns:
             Dictionary with operation result
         """
-        import os
         from ..config import MCP_MISTAKE_NOTE_DEDUP_THRESHOLD
 
         # A mistake note's value is its remediation. Reject empty correct_action —

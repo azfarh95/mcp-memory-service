@@ -79,6 +79,7 @@ WITH RECURSIVE connected_memories(hash, distance, path) AS (
         cm.distance < ?  -- Limit recursion depth
         AND instr(cm.path, ',' || {selected_hash} || ',') = 0  -- Prevent cycles (exact match)
         {relationship_filter}
+        {temporal_filter}
 )
 SELECT DISTINCT hash, distance
 FROM connected_memories
@@ -146,7 +147,7 @@ class GraphStorage:
         self.db_path = db_path
         self._connection = None
         self._lock = asyncio.Lock()  # Instance-level lock for thread safety
-        logger.info(f"Initialized GraphStorage with database: {db_path}")
+        logger.info(f"Initialized GraphStorage with database: {_sanitize_log_value(db_path)}")
 
     async def _get_connection(self) -> sqlite3.Connection:
         """Get or create database connection with optimizations."""
@@ -214,12 +215,12 @@ class GraphStorage:
 
         # Validate similarity score bounds
         if not (0.0 <= similarity <= 1.0):
-            logger.error(f"Invalid similarity score {similarity}, must be in range [0.0, 1.0]")
+            logger.error(f"Invalid similarity score {_sanitize_log_value(similarity)}, must be in range [0.0, 1.0]")
             return False
 
         # Validate relationship type
         if not validate_relationship(relationship_type):
-            logger.error(f"Invalid relationship type: {relationship_type}")
+            logger.error(f"Invalid relationship type: {_sanitize_log_value(relationship_type)}")
             return False
 
         try:
@@ -260,7 +261,7 @@ class GraphStorage:
             return True
 
         except sqlite3.Error as e:
-            logger.error(f"Failed to store association: {e}")
+            logger.error(f"Failed to store association: {_sanitize_log_value(e)}")
             return False
 
     async def find_connected(
@@ -268,7 +269,8 @@ class GraphStorage:
         memory_hash: str,
         max_hops: int = 2,
         relationship_type: Optional[str] = None,
-        direction: str = "both"
+        direction: str = "both",
+        as_of: Optional[float] = None,
     ) -> List[Tuple[str, int]]:
         """
         Find all memories connected within N hops using recursive CTE.
@@ -281,6 +283,11 @@ class GraphStorage:
             max_hops: Maximum number of hops to traverse (default: 2)
             relationship_type: Optional filter for specific relationship type
             direction: Direction to traverse ("outgoing", "incoming", "both")
+            as_of: Optional point-in-time filter (Unix epoch, issue #1724).
+                Edges whose metadata carries valid_from/valid_until
+                (see reasoning.temporal.store_temporal_association) are only
+                traversed when valid at as_of; edges without temporal bounds
+                are always traversed.
 
         Returns:
             List of (memory_hash, distance) tuples, sorted by distance
@@ -294,7 +301,7 @@ class GraphStorage:
 
         # Validate direction parameter
         if direction not in ("outgoing", "incoming", "both"):
-            logger.error(f"Invalid direction '{direction}', must be 'outgoing', 'incoming', or 'both'")
+            logger.error(f"Invalid direction '{_sanitize_log_value(direction)}', must be 'outgoing', 'incoming', or 'both'")
             return []
 
         try:
@@ -313,6 +320,18 @@ class GraphStorage:
                 relationship_filter = "AND mg.relationship_type = ?"
                 params.append(relationship_type)
 
+            # Issue #1724: point-in-time traversal. Temporal edges carry
+            # valid_from/valid_until in metadata JSON; untimed edges pass.
+            temporal_filter = ""
+            if as_of is not None:
+                temporal_filter = (
+                    "AND (json_extract(mg.metadata, '$.valid_from') IS NULL "
+                    "OR json_extract(mg.metadata, '$.valid_from') <= ?) "
+                    "AND (json_extract(mg.metadata, '$.valid_until') IS NULL "
+                    "OR json_extract(mg.metadata, '$.valid_until') >= ?)"
+                )
+                params.extend([as_of, as_of])
+
             # Build join condition and selected hash based on direction
             if direction == "outgoing":
                 join_condition = "JOIN memory_graph mg ON cm.hash = mg.source_hash"
@@ -329,7 +348,8 @@ class GraphStorage:
             query = _QUERY_TEMPLATE_FIND_CONNECTED.format(
                 selected_hash=selected_hash,
                 join_condition=join_condition,
-                relationship_filter=relationship_filter
+                relationship_filter=relationship_filter,
+                temporal_filter=temporal_filter,
             )
 
             cursor = conn.cursor()
@@ -338,15 +358,60 @@ class GraphStorage:
                 results = cursor.fetchall()
 
                 connected = [(row['hash'], row['distance']) for row in results]
-                logger.debug(f"Found {len(connected)} connected memories within {max_hops} hops")
+                logger.debug("Found %d connected memories within %s hops", len(connected), _sanitize_log_value(max_hops))
 
                 return connected
             finally:
                 cursor.close()
 
         except sqlite3.Error as e:
-            logger.error(f"Failed to find connected memories: {e}")
+            logger.error(f"Failed to find connected memories: {_sanitize_log_value(e)}")
             return []
+
+    async def get_temporal_edges(
+        self,
+        memory_hash: str,
+        as_of: Optional[float] = None,
+    ) -> List["TemporalEdge"]:
+        """Return temporal edges incident to a memory, filtered by as_of.
+
+        Issue #1724: this wires up reasoning/temporal.py (previously dead
+        code). Edges are built from memory_graph rows — valid_from/valid_until
+        come from the metadata JSON written by
+        reasoning.temporal.store_temporal_association — and passed through
+        filter_temporal_edges.
+        """
+        from ..reasoning.temporal import TemporalEdge, filter_temporal_edges
+
+        edges: List[TemporalEdge] = []
+        try:
+            conn = await self._get_connection()
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT source_hash, target_hash, metadata FROM memory_graph "
+                    "WHERE source_hash = ? OR target_hash = ?",
+                    (memory_hash, memory_hash),
+                )
+                for row in cursor.fetchall():
+                    try:
+                        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        meta = {}
+                    edges.append(
+                        TemporalEdge(
+                            source=row["source_hash"],
+                            target=row["target_hash"],
+                            valid_from=meta.get("valid_from"),
+                            valid_until=meta.get("valid_until"),
+                        )
+                    )
+            finally:
+                cursor.close()
+        except sqlite3.Error as e:
+            logger.error(f"Failed to get temporal edges: {_sanitize_log_value(e)}")
+            return []
+        return filter_temporal_edges(edges, as_of)
 
     async def get_relationship_types(self, memory_hash: str) -> Dict[str, int]:
         """
@@ -379,14 +444,14 @@ class GraphStorage:
                 results = cursor.fetchall()
 
                 relationship_counts = {row['relationship_type']: row['count'] for row in results}
-                logger.debug(f"Found {len(relationship_counts)} relationship types for {memory_hash}")
+                logger.debug("Found %d relationship types for %s", len(relationship_counts), _sanitize_log_value(memory_hash))
 
                 return relationship_counts
             finally:
                 cursor.close()
 
         except sqlite3.Error as e:
-            logger.error(f"Failed to get relationship types: {e}")
+            logger.error(f"Failed to get relationship types: {_sanitize_log_value(e)}")
             return {}
 
     async def shortest_path(
@@ -451,16 +516,16 @@ class GraphStorage:
                 if result:
                     # Path format: ",hash1,,hash2,,hash3," - filter empty strings
                     path = [h for h in result['path'].split(',') if h]
-                    logger.debug(f"Found path of length {len(path)}: {hash1} → {hash2}")
+                    logger.debug(f"Found path of length {_sanitize_log_value(len(path))}: {_sanitize_log_value(hash1)} → {_sanitize_log_value(hash2)}")
                     return path
                 else:
-                    logger.debug(f"No path found between {hash1} and {hash2}")
+                    logger.debug(f"No path found between {_sanitize_log_value(hash1)} and {_sanitize_log_value(hash2)}")
                     return None
             finally:
                 cursor.close()
 
         except sqlite3.Error as e:
-            logger.error(f"Failed to find shortest path: {e}")
+            logger.error(f"Failed to find shortest path: {_sanitize_log_value(e)}")
             return None
 
     async def get_subgraph(
@@ -517,8 +582,9 @@ class GraphStorage:
             # Check SQLite parameter limit (999 max, we use 2*len(nodes) + maybe 1 for relationship_type)
             if len(nodes) > 499:
                 logger.warning(
-                    f"Subgraph too large ({len(nodes)} nodes > 499 limit). "
-                    f"Truncating to prevent SQLite parameter overflow."
+                    "Subgraph too large (%d nodes > 499 limit). "
+                    "Truncating to prevent SQLite parameter overflow.",
+                    len(nodes),
                 )
                 # Keep center node + first 498 connected nodes
                 nodes = {memory_hash}
@@ -592,13 +658,13 @@ class GraphStorage:
                     "edges": edges
                 }
 
-                logger.debug(f"Extracted subgraph: {len(nodes)} nodes, {len(edges)} edges")
+                logger.debug("Extracted subgraph: %d nodes, %d edges", len(nodes), len(edges))
                 return subgraph
             finally:
                 cursor.close()
 
         except sqlite3.Error as e:
-            logger.error(f"Failed to extract subgraph: {e}")
+            logger.error(f"Failed to extract subgraph: {_sanitize_log_value(e)}")
             return {"nodes": [], "edges": []}
 
     async def get_association(
@@ -639,6 +705,7 @@ class GraphStorage:
                 target_hash,
                 similarity,
                 connection_types,
+                relationship_type,
                 metadata,
                 created_at
             FROM memory_graph
@@ -657,6 +724,7 @@ class GraphStorage:
                     "target_hash": result['target_hash'],
                     "similarity": result['similarity'],
                     "connection_types": json.loads(result['connection_types']),
+                    "relationship_type": result['relationship_type'],
                     "metadata": json.loads(result['metadata']) if result['metadata'] else {},
                     "created_at": result['created_at']
                 }
@@ -665,8 +733,41 @@ class GraphStorage:
                 return None
 
         except sqlite3.Error as e:
-            logger.error(f"Failed to retrieve association: {e}")
+            logger.error(f"Failed to retrieve association: {_sanitize_log_value(e)}")
             return None
+    async def has_edge(
+        self,
+        source_hash: str,
+        target_hash: str,
+        relationship_type: str,
+    ) -> bool:
+        """Whether the exact directed, typed edge exists.
+
+        get_association() matches either direction and returns a single row
+        with no ordering, so it cannot tell whether the forward derived_from
+        link already exists when a reverse or differently-typed edge is also
+        present. Callers that must avoid rewriting an edge they already wrote
+        need this exact query.
+        """
+        if not source_hash or not target_hash:
+            return False
+
+        try:
+            conn = await self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT 1 FROM memory_graph
+                    WHERE source_hash = ? AND target_hash = ? AND relationship_type = ?
+                    LIMIT 1""",
+                (source_hash, target_hash, relationship_type),
+            )
+            return cursor.fetchone() is not None
+        except (sqlite3.Error, OSError) as e:
+            logger.error(f"Failed to check association: {_sanitize_log_value(e)}")
+            return False
+
+
+
 
     async def delete_association(
         self,
@@ -704,15 +805,50 @@ class GraphStorage:
 
                 deleted_count = cursor.rowcount
                 if deleted_count > 0:
-                    logger.debug(f"Deleted association: {source_hash} ↔ {target_hash}")
+                    logger.debug(f"Deleted association: {_sanitize_log_value(source_hash)} ↔ {_sanitize_log_value(target_hash)}")
                     return True
                 else:
-                    logger.warning(f"No association found to delete: {source_hash} ↔ {target_hash}")
+                    logger.warning(f"No association found to delete: {_sanitize_log_value(source_hash)} ↔ {_sanitize_log_value(target_hash)}")
                     return False
 
         except sqlite3.Error as e:
-            logger.error(f"Failed to delete association: {e}")
+            logger.error(f"Failed to delete association: {_sanitize_log_value(e)}")
             return False
+
+    async def get_edge_snapshot(self) -> List[Dict[str, str]]:
+        """Read every edge identity and type. Errors propagate to maintenance."""
+        conn = await self._get_connection()
+        async with self._lock:
+            cursor = conn.execute(
+                "SELECT source_hash, target_hash, relationship_type FROM memory_graph"
+            )
+            try:
+                return [dict(row) for row in cursor.fetchall()]
+            finally:
+                cursor.close()
+
+    async def delete_edges_by_relationship_types(
+        self, relationship_types: List[str]
+    ) -> int:
+        """Delete only the requested edge types, returning the number of rows.
+
+        Empty input is a no-op. Database errors propagate rather than presenting
+        a failed deletion as an empty graph.
+        """
+        if not relationship_types:
+            return 0
+        conn = await self._get_connection()
+        placeholders = ",".join("?" for _ in relationship_types)
+        async with self._lock:
+            with conn:
+                cursor = conn.execute(
+                    f"DELETE FROM memory_graph WHERE relationship_type IN ({placeholders})",
+                    relationship_types,
+                )
+                try:
+                    return cursor.rowcount
+                finally:
+                    cursor.close()
 
     async def get_association_count(self, memory_hash: str) -> int:
         """
@@ -741,7 +877,7 @@ class GraphStorage:
             return result['count'] if result else 0
 
         except sqlite3.Error as e:
-            logger.error(f"Failed to count associations: {e}")
+            logger.error(f"Failed to count associations: {_sanitize_log_value(e)}")
             return 0
 
     async def store_entity_link(self, memory_hash: str, entity_name: str, entity_type: str) -> bool:
@@ -761,7 +897,7 @@ class GraphStorage:
                 conn.commit()
             return True
         except sqlite3.Error as e:
-            logger.error(f"Failed to store entity link: {e}")
+            logger.error(f"Failed to store entity link: {_sanitize_log_value(e)}")
             return False
 
     async def list_entities(self, limit: int = 50) -> List[Dict[str, Any]]:
@@ -780,7 +916,7 @@ class GraphStorage:
             finally:
                 cursor.close()
         except sqlite3.Error as e:
-            logger.error(f"Failed to list entities: {e}")
+            logger.error(f"Failed to list entities: {_sanitize_log_value(e)}")
             return []
 
     async def find_memories_by_entity(self, entity_name: str, limit: int = 20) -> List[str]:
@@ -800,7 +936,7 @@ class GraphStorage:
             finally:
                 cursor.close()
         except sqlite3.Error as e:
-            logger.error(f"Failed to find memories by entity: {e}")
+            logger.error(f"Failed to find memories by entity: {_sanitize_log_value(e)}")
             return []
 
     async def get_entities_for_memory(self, memory_hash: str) -> List[str]:
@@ -859,7 +995,7 @@ class GraphStorage:
             finally:
                 cursor.close()
         except sqlite3.Error as e:
-            logger.error(f"Failed to get entity profile: {e}")
+            logger.error(f"Failed to get entity profile: {_sanitize_log_value(e)}")
             return {}
 
     async def close(self):
@@ -929,7 +1065,7 @@ class GraphStorage:
             finally:
                 cursor.close()
         except sqlite3.Error as e:
-            logger.error(f"Failed transitive closure query: {e}")
+            logger.error(f"Failed transitive closure query: {_sanitize_log_value(e)}")
             return []
 
     async def common_neighbors(
@@ -986,5 +1122,5 @@ class GraphStorage:
             finally:
                 cursor.close()
         except sqlite3.Error as e:
-            logger.error(f"Failed common neighbors query: {e}")
+            logger.error(f"Failed common neighbors query: {_sanitize_log_value(e)}")
             return []

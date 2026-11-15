@@ -16,7 +16,7 @@ class QueryStorage(RetrieveMixin):
         self.conn = conn
         self.embedding_model = object()
 
-    def _generate_embedding(self, query, input_type="document"):
+    def _generate_embedding(self, query):
         return [0.0, 0.0]
 
     async def _execute_with_retry(self, operation):
@@ -43,7 +43,9 @@ def storage():
         CREATE TABLE memories (
             id INTEGER PRIMARY KEY, content_hash TEXT, content TEXT, tags TEXT,
             memory_type TEXT, metadata TEXT, created_at REAL, updated_at REAL,
-            created_at_iso TEXT, updated_at_iso TEXT, deleted_at REAL, superseded_by TEXT
+            created_at_iso TEXT, updated_at_iso TEXT, deleted_at REAL, superseded_by TEXT,
+            superseded_at REAL,
+            embedding_pending INTEGER NOT NULL DEFAULT 0
         )
     """)
     conn.execute("CREATE VIRTUAL TABLE memory_embeddings USING vec0(content_embedding float[2], store text)")
@@ -54,7 +56,9 @@ def storage():
 def add_memory(storage, row_id, distance, *, created_at=1500, deleted_at=None, tags="keep", superseded_by=None):
     """Seed known distances so expected ranking does not depend on model output."""
     storage.conn.execute(
-        "INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO memories (id, content_hash, content, tags, memory_type, metadata, "
+        "created_at, updated_at, created_at_iso, updated_at_iso, deleted_at, superseded_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (row_id, str(row_id), f"Memory {row_id}", tags, "note", "{}", created_at, created_at,
          None, None, deleted_at, superseded_by),
     )

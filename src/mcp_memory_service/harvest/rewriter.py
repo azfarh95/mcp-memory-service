@@ -9,10 +9,97 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ..compat import _sanitize_log_value
+from ..config.locale import get_active_locales
 
 logger = logging.getLogger(__name__)
 
 VALID_TYPES = {"decision", "bug", "convention", "learning", "context"}
+
+
+def build_openai_compatible_payload(model: str, messages: list, max_tokens: int, temperature: float) -> dict:
+    """Build a chat-completions payload compatible with GPT-5 reasoning models."""
+    payload = {"model": model, "stream": False, "messages": messages}
+    if model.startswith("gpt-5"):
+        payload["max_completion_tokens"] = max_tokens + 800
+    else:
+        payload["temperature"] = temperature
+        payload["max_tokens"] = max_tokens
+    return payload
+
+# Models sometimes echo the literal placeholder word "TYPE" or "<type>" from the prompt
+# instead of substituting the real type, e.g. "TYPE: convention — <text>" or "<type>: text".
+# This strips that leaked wrapper and recovers the real type + content.
+# Narrow by design: only fires on literal "TYPE:" or "<type>:" prefix (colon required) or
+# the bare words "TYPE"/"<type>" alone — never on legitimate content that merely starts
+# with the word "type" (e.g. "Type hints in Python ...").
+_LEAKED_TYPE_RE = re.compile(
+    r'^(?:TYPE|<type>)\s*:\s*(\w+)?\s*(?:[-—:]\s*)?(.*)$',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _unleak_type(content: str, fallback_type: str):
+    """Strip a leaked ``TYPE: <realtype> <sep> text`` or ``<type>: <realtype> <sep> text`` wrapper.
+
+    Returns ``(content, memory_type)``. When the content is just a label with
+    no substance (``TYPE: bug``, ``TYPE``, ``<type>``, ``<type>: bug``), returns 
+    ``(None, _)`` so the caller drops the degenerate candidate instead of storing noise. 
+    
+    Legitimate content that happens to start with the word "type" (no colon) is left 
+    untouched, and clean content is never dropped for being short — only a *confirmed*
+    leaked wrapper that unwraps to a bare label or empty text is dropped.
+    
+    Key fixes for P1 bugs:
+    - P1-a: Only strip the captured word if it's a VALID type; if prose, keep full text
+    - P1-b: Don't drop short content if it has valid type and meaningful text  
+    - P1-c: Handle both TYPE: and <type>: prefixes
+    """
+    stripped = content.strip()
+    
+    # Handle bare labels without colons
+    if stripped.upper() == "TYPE" or stripped.lower() == "<type>":
+        return None, fallback_type
+        
+    m = _LEAKED_TYPE_RE.match(stripped)
+    if not m:
+        # Clean content (no TYPE:/`<type>:` leak) — return as-is, no length gate.
+        return stripped, fallback_type
+        
+    leaked_type = (m.group(1) or "").lower()
+    rest = m.group(2).strip()
+    
+    # P1-a fix: Only use leaked_type if it's actually valid; otherwise treat as prose
+    if leaked_type in VALID_TYPES:
+        # Valid type found - use it and the remaining content
+        if not rest:
+            # P1-b consideration: Valid type but no content after separators (e.g., "TYPE: bug")
+            return None, fallback_type
+        return rest, leaked_type
+    else:
+        # P1-a fix: No valid type found, treat everything after TYPE:/`<type>:` as prose content
+        # Need to reconstruct the original content after the wrapper, preserving separators
+        # Find where the actual content starts after TYPE:/`<type>:`
+        prefix_pattern = re.compile(r'^(?:TYPE|<type>)\s*:\s*', re.IGNORECASE)
+        match_end = prefix_pattern.match(stripped).end()
+        full_content = stripped[match_end:].strip()
+        
+        # P1-b fix: Don't apply length threshold to prose - if there's meaningful text, keep it
+        if not full_content:
+            # Truly empty after unwrapping (e.g., "TYPE:" with nothing after)
+            return None, fallback_type
+        
+        # P1-d fix: Single unknown word should be dropped (label), multi-word should be kept (prose)
+        # P1-d: an invalid "type" that is a single token is a bare unknown label
+        # (e.g. "TYPE: frobnicate"), not an insight — drop it. Multi-word content
+        # is genuine prose and is kept. Trade-off (intentional): a legitimate
+        # single-token insight after an invalid type (e.g. "TYPE: git-push-force")
+        # is sacrificed; such tokens are overwhelmingly labels, and dropping one
+        # rare command beats storing label noise. Do not "fix" this without data.
+        words = full_content.split()
+        if len(words) == 1:
+            return None, fallback_type
+
+        return full_content, fallback_type
 
 
 @dataclass
@@ -99,7 +186,7 @@ Additional rules:
 - If no clear insight exists, respond with exactly: SKIP
 - IMPORTANT: Respond in the SAME LANGUAGE as the input text{locale_instruction}
 
-Format: TYPE: content
+Format: <type>: content   (replace <type> with one of the valid types below — do NOT write the word "TYPE")
 Valid types: decision, bug, convention, learning, context
 
 Examples:
@@ -133,13 +220,14 @@ EXTRACT if you find ANY of these inside the text:
 
 Respond in the SAME LANGUAGE as each input text.
 
-Format — one line per memory, numbered:
-1. TYPE: insight
+Format — one line per memory, numbered. Replace <type> with one of the valid types (do NOT write the literal word "TYPE"):
+1. <type>: insight
 2. SKIP
-3. TYPE: insight
+3. <type>: insight
 ...
 
 Valid types: decision, bug, convention, learning, context
+Example: "1. convention: Nunca usar strReplace em arquivos append-only."
 
 {memories}"""
 
@@ -153,10 +241,28 @@ class RewriteResult:
     model: Optional[str] = None
 
 
+class _Skipped:
+    """Batch slot the LLM answered with SKIP: rejected on purpose, not lost (#1560).
+
+    Falsy, so callers that test ``if result:`` treat it exactly like ``None``;
+    only the harvester's ``rewrite_dropped`` count tells the two apart.
+    """
+    __slots__ = ()
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "SKIPPED"
+
+
+SKIPPED = _Skipped()
+
+
 class HarvestRewriter:
     """Rewrites harvest candidates into standalone insights using an LLM.
 
-    Respects HARVEST_LOCALE for multilingual output — responds in the same
+    Respects MCP_LOCALE (or HARVEST_LOCALE) for multilingual output — responds in the same
     language as the input text.
     """
 
@@ -181,7 +287,7 @@ class HarvestRewriter:
         self._provider = os.environ.get("HARVEST_LLM_PROVIDER", "groq")
         self._model = os.environ.get("HARVEST_LLM_MODEL", "llama-3.3-70b-versatile")
         self._api_key = os.environ.get("GROQ_API_KEY", "")
-        self._locale = os.environ.get("HARVEST_LOCALE", "en")
+        self._locale = ",".join(get_active_locales())
         self._locale_instruction = self._build_locale_instruction()
 
     @property
@@ -195,7 +301,7 @@ class HarvestRewriter:
         return any(is_usable_provider(p) for p in self._providers) or bool(self._api_key)
 
     def _build_locale_instruction(self) -> str:
-        """Build locale instruction from HARVEST_LOCALE env var."""
+        """Build locale instruction from the active locales (MCP_LOCALE / HARVEST_LOCALE)."""
         locales = [l.strip() for l in self._locale.split(",")]
         instructions = []
         for loc in locales:
@@ -306,6 +412,7 @@ class HarvestRewriter:
             if idx < 0 or idx >= len(items):
                 continue
             if content.upper().startswith("SKIP"):
+                results[idx] = SKIPPED
                 continue
             # Parse TYPE: content
             type_match = re.match(r'^(\w+):\s*(.+)$', content, re.DOTALL)
@@ -313,11 +420,18 @@ class HarvestRewriter:
                 parsed_type = type_match.group(1).lower()
                 insight = type_match.group(2).strip()
                 if parsed_type in VALID_TYPES:
-                    results[idx] = self._stamp(RewriteResult(content=insight, memory_type=parsed_type), provider, model)
+                    insight, mem_type = _unleak_type(insight, parsed_type)
+                    if insight:
+                        results[idx] = self._stamp(RewriteResult(content=insight, memory_type=mem_type), provider, model)
                 else:
-                    results[idx] = self._stamp(RewriteResult(content=content, memory_type=items[idx]['memory_type']), provider, model)
+                    # parsed_type not valid (e.g. leaked "TYPE") — unleak the whole content
+                    insight, mem_type = _unleak_type(content, items[idx]['memory_type'])
+                    if insight:
+                        results[idx] = self._stamp(RewriteResult(content=insight, memory_type=mem_type), provider, model)
             else:
-                results[idx] = self._stamp(RewriteResult(content=content, memory_type=items[idx]['memory_type']), provider, model)
+                insight, mem_type = _unleak_type(content, items[idx]['memory_type'])
+                if insight:
+                    results[idx] = self._stamp(RewriteResult(content=insight, memory_type=mem_type), provider, model)
 
         return results
 
@@ -345,12 +459,21 @@ class HarvestRewriter:
             parsed_type = match.group(1).lower()
             content = match.group(2).strip()
             if parsed_type in VALID_TYPES:
-                return self._stamp(RewriteResult(content=content, memory_type=parsed_type), provider, model)
-            # Unknown type — use content with suggested_type
-            return self._stamp(RewriteResult(content=response, memory_type=suggested_type), provider, model)
+                content, mem_type = _unleak_type(content, parsed_type)
+                if not content:
+                    return None
+                return self._stamp(RewriteResult(content=content, memory_type=mem_type), provider, model)
+            # Unknown/leaked type prefix (e.g. "TYPE") — unleak the full response
+            content, mem_type = _unleak_type(response, suggested_type)
+            if not content:
+                return None
+            return self._stamp(RewriteResult(content=content, memory_type=mem_type), provider, model)
 
         # No type prefix — use full response with suggested_type
-        return self._stamp(RewriteResult(content=response, memory_type=suggested_type), provider, model)
+        content, mem_type = _unleak_type(response, suggested_type)
+        if not content:
+            return None
+        return self._stamp(RewriteResult(content=content, memory_type=mem_type), provider, model)
 
     async def _call_llm(self, prompt: str, timeout: float) -> tuple[str, Optional[str], Optional[str]]:
         """Call LLM with provider fallback chain.
@@ -405,12 +528,9 @@ class HarvestRewriter:
             resp = await client.post(
                 f"{base_url}/chat/completions",
                 headers=headers,
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "max_tokens": 200,
-                },
+                json=build_openai_compatible_payload(
+                    model, [{"role": "user", "content": prompt}], 200, 0.3
+                ),
             )
             if resp.status_code == 429:
                 raise Exception(f"Rate limit exceeded: {resp.text[:100]}")

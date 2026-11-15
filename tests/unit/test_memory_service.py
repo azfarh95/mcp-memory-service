@@ -98,7 +98,9 @@ async def test_list_memories_basic_pagination(memory_service, mock_storage, samp
         tags=None,
         tag_match='any',
         stale_days=None,
-        store='default'
+        store='default',
+        agent_id=None,
+        include_superseded=False,
     )
 
 
@@ -364,11 +366,12 @@ async def test_retrieve_memories_with_filters(memory_service, mock_storage, samp
         memory_type="note"
     )
 
-    # After fix: storage.retrieve() only accepts query and n_results
-    # Filtering is done by MemoryService after retrieval
+    # storage.retrieve() only accepts query and n_results, so filtering happens in
+    # MemoryService after retrieval. When a filter is present the fetch is widened
+    # (max(n*10, n+50)) so matches outside the first `n_results` window are not lost.
     mock_storage.retrieve.assert_called_once_with(
         query="test",
-        n_results=5
+        n_results=55
     )
 
 
@@ -398,7 +401,7 @@ async def test_search_by_tag_single_tag(memory_service, mock_storage, sample_mem
     assert result["count"] == 2
 
     mock_storage.search_by_tag.assert_called_once_with(
-        tags=["test"]
+        tags=["test"], include_superseded=False
     )
 
 
@@ -422,7 +425,7 @@ async def test_search_by_tag_match_all(memory_service, mock_storage, sample_memo
 
     assert result["match_type"] == "ALL"
     mock_storage.search_by_tags.assert_called_once_with(
-        tags=["tag1", "tag2"], operation="AND"
+        tags=["tag1", "tag2"], operation="AND", include_superseded=False
     )
 
 
@@ -940,7 +943,9 @@ async def test_normalize_tags_with_search_by_tag(memory_service, mock_storage, s
     result = await memory_service.search_by_tag(tags="Python")
 
     # Verify tag was normalized before passing to storage
-    mock_storage.search_by_tag.assert_called_once_with(tags=["python"])
+    mock_storage.search_by_tag.assert_called_once_with(
+        tags=["python"], include_superseded=False
+    )
 
     # Search with multiple mixed-case tags
     mock_storage.reset_mock()

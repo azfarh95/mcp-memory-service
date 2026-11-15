@@ -63,19 +63,13 @@ class Memory:
             updated_at_iso=self.updated_at_iso
         )
 
-        # Validate memory_type using ontology
-        if self.memory_type is not None:
-            if not MemoryTypeOntology.validate_memory_type(self.memory_type):
-                logger.warning(
-                    f"Invalid memory_type '{_sanitize_log_value(self.memory_type)}'. "
-                    f"Valid types: {', '.join(MemoryTypeOntology.get_all_types()[:5])}... "
-                    f"Defaulting to 'observation'."
-                )
-                self.memory_type = "observation"  # Default to base type
-            else:
-                # Store the canonical form so `Decision` and `decision` are one
-                # type on disk and type filters match either spelling (#176).
-                self.memory_type = canonicalize_memory_type(self.memory_type)
+        # Canonicalize known types so `Decision` and `decision` are one type on
+        # disk and type filters match either spelling (#176). Unknown types are
+        # kept as-is: this constructor also hydrates stored rows, and a node that
+        # lacks a custom type must not turn it into `observation` and write that
+        # back on the next update. New writes coerce via coerce_memory_type().
+        if self.memory_type is not None and MemoryTypeOntology.validate_memory_type(self.memory_type):
+            self.memory_type = canonicalize_memory_type(self.memory_type)
 
         # Default tag when no tags provided
         if not self.tags:
@@ -89,14 +83,17 @@ class Memory:
                 namespace, value = TagTaxonomy.parse_tag(tag)
                 if namespace is not None:  # Has namespace
                     # Direct check using exposed VALID_NAMESPACES (avoids re-parsing)
-                    if namespace not in TagTaxonomy.VALID_NAMESPACES:
+                    if not TagTaxonomy.is_valid_namespace(namespace):
                         invalid_tags.append(tag)
 
             if invalid_tags:
-                logger.info(
-                    f"Tags with invalid namespaces: {', '.join(invalid_tags)}. "
-                    f"Valid namespaces: sys:, q:, proj:, topic:, t:, user:. "
-                    f"Legacy tags (no namespace) are still supported."
+                # DEBUG: __post_init__ runs on every load, so INFO repeated this per read
+                logger.debug(
+                    "Tags with invalid namespaces: %s. "
+                    "Valid namespaces: %s (add more via MCP_CUSTOM_TAG_NAMESPACES). "
+                    "Legacy tags (no namespace) are still supported.",
+                    _sanitize_log_value(', '.join(invalid_tags)),
+                    ', '.join(sorted(TagTaxonomy.VALID_NAMESPACES)),
                 )
 
     def _sync_timestamps(self, created_at=None, created_at_iso=None, updated_at=None, updated_at_iso=None):
@@ -137,7 +134,7 @@ class Memory:
                         return calendar.timegm(dt.timetuple())
                     except (ValueError, TypeError):
                         # If all parsing fails, return current timestamp
-                        logging.warning(f"Failed to parse timestamp '{iso_str}', using current time")
+                        logger.warning("Failed to parse timestamp '%s', using current time", _sanitize_log_value(iso_str))
                         return datetime.now().timestamp()
 
         def float_to_iso(ts: float) -> str:
@@ -155,12 +152,12 @@ class Memory:
                     # DEBUG rather than INFO: rows stored with local-TZ ISO strings
                     # (pre-UTC-normalization) trigger this on every read — was flooding
                     # the log and masking real errors. See issue #750.
-                    logger.debug(f"Timezone mismatch detected (diff: {time_diff}s), preferring float timestamp")
+                    logger.debug("Timezone mismatch detected (diff: %ss), preferring float timestamp", time_diff)
                     # Use the float timestamp as authoritative and regenerate ISO
                     self.created_at = created_at
                     self.created_at_iso = float_to_iso(created_at)
                 elif time_diff >= 86400:  # More than 24 hours difference suggests data corruption
-                    logger.warning(f"Large timestamp difference detected ({time_diff}s), using current time")
+                    logger.warning("Large timestamp difference detected (%ss), using current time", time_diff)
                     self.created_at = now
                     self.created_at_iso = float_to_iso(now)
                 else:
@@ -168,7 +165,7 @@ class Memory:
                     self.created_at = created_at
                     self.created_at_iso = created_at_iso
             except Exception as e:
-                logger.warning(f"Error parsing timestamps: {e}, using float timestamp")
+                logger.warning("Error parsing timestamps: %s, using float timestamp", _sanitize_log_value(e))
                 self.created_at = created_at if created_at is not None else now
                 self.created_at_iso = float_to_iso(self.created_at)
         elif created_at is not None:
@@ -179,7 +176,7 @@ class Memory:
                 self.created_at = iso_to_float(created_at_iso)
                 self.created_at_iso = created_at_iso
             except ValueError as e:
-                logger.warning(f"Invalid created_at_iso: {e}")
+                logger.warning("Invalid created_at_iso: %s", _sanitize_log_value(e))
                 self.created_at = now
                 self.created_at_iso = float_to_iso(now)
         else:
@@ -194,12 +191,12 @@ class Memory:
                 time_diff = abs(updated_at - iso_ts)
                 # Allow up to 1 second difference for rounding, but reject obvious timezone mismatches
                 if time_diff > 1.0 and time_diff < 86400:  # Between 1 second and 24 hours suggests timezone issue
-                    logger.debug(f"Timezone mismatch detected in updated_at (diff: {time_diff}s), preferring float timestamp")
+                    logger.debug("Timezone mismatch detected in updated_at (diff: %ss), preferring float timestamp", time_diff)
                     # Use the float timestamp as authoritative and regenerate ISO
                     self.updated_at = updated_at
                     self.updated_at_iso = float_to_iso(updated_at)
                 elif time_diff >= 86400:  # More than 24 hours difference suggests data corruption
-                    logger.warning(f"Large timestamp difference detected in updated_at ({time_diff}s), using current time")
+                    logger.warning("Large timestamp difference detected in updated_at (%ss), using current time", time_diff)
                     self.updated_at = now
                     self.updated_at_iso = float_to_iso(now)
                 else:
@@ -207,7 +204,7 @@ class Memory:
                     self.updated_at = updated_at
                     self.updated_at_iso = updated_at_iso
             except Exception as e:
-                logger.warning(f"Error parsing updated timestamps: {e}, using float timestamp")
+                logger.warning("Error parsing updated timestamps: %s, using float timestamp", _sanitize_log_value(e))
                 self.updated_at = updated_at if updated_at is not None else now
                 self.updated_at_iso = float_to_iso(self.updated_at)
         elif updated_at is not None:
@@ -218,7 +215,7 @@ class Memory:
                 self.updated_at = iso_to_float(updated_at_iso)
                 self.updated_at_iso = updated_at_iso
             except ValueError as e:
-                logger.warning(f"Invalid updated_at_iso: {e}")
+                logger.warning("Invalid updated_at_iso: %s", _sanitize_log_value(e))
                 self.updated_at = now
                 self.updated_at_iso = float_to_iso(now)
         else:
@@ -253,6 +250,21 @@ class Memory:
     def last_accessed_at(self) -> Optional[float]:
         """Get timestamp of last access (Unix timestamp)."""
         return self.metadata.get('last_accessed_at')
+
+    # RFC #1100 - Author identity (multi-agent). Lives in metadata: no schema
+    # change, backward compatible (None = unknown authoring agent).
+    @property
+    def agent_id(self) -> Optional[str]:
+        """Get the authoring agent id (None = unknown)."""
+        return self.metadata.get('agent_id')
+
+    @agent_id.setter
+    def agent_id(self, value: Optional[str]):
+        """Set the authoring agent id; setting None removes it (stays unknown)."""
+        if value:
+            self.metadata['agent_id'] = value
+        else:
+            self.metadata.pop('agent_id', None)
 
     # SHODH Unified API Spec - Source & Trust fields
     @property
@@ -442,12 +454,18 @@ class MemoryQueryResult:
     memory: Memory
     relevance_score: float
     debug_info: Dict[str, Any] = field(default_factory=dict)
-    
+    # Issue #1724: supersession lineage, populated by backends that track it
+    # (sqlite_vec / hybrid). superseded_at is the exact replacement moment for
+    # rows superseded after migration 021; for older rows it is approximated
+    # with the successor's created_at (see RetrieveMixin.retrieve).
+    superseded_by: Optional[str] = None
+    superseded_at: Optional[float] = None
+
     @property
     def similarity_score(self) -> float:
         """Alias for relevance_score for backward compatibility."""
         return self.relevance_score
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation."""
         return {

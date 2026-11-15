@@ -55,10 +55,7 @@ def _as_tag_list(value: object) -> List[str]:
     return list(value)
 
 
-def _sanitize_log_value(value: object) -> str:
-    """Sanitize a user-provided value for safe inclusion in log messages."""
-    return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
-
+from ...compat import _sanitize_log_value
 
 async def handle_memory_quality(server, arguments: dict) -> List[types.TextContent]:
     """Unified handler for quality management operations."""
@@ -68,7 +65,9 @@ async def handle_memory_quality(server, arguments: dict) -> List[types.TextConte
         return [types.TextContent(type="text", text="Error: action parameter is required")]
 
     # Validate action
-    valid_actions = ["rate", "get", "analyze", "maintain", "maintain_status"]
+    valid_actions = [
+        "rate", "get", "analyze", "maintain", "maintain_status", "rebuild_entities"
+    ]
     if action not in valid_actions:
         return [types.TextContent(
             type="text",
@@ -76,6 +75,11 @@ async def handle_memory_quality(server, arguments: dict) -> List[types.TextConte
         )]
 
     try:
+        if action == "rebuild_entities":
+            # Keep optional maintenance backends out of ordinary quality calls.
+            from .entity_rebuild import handle_rebuild_entities  # inline import
+            return await handle_rebuild_entities(server, arguments)
+
         # Route to appropriate handler based on action
         if action == "rate":
             # Rate a memory
@@ -158,16 +162,21 @@ async def handle_rate_memory(server, arguments: dict) -> List[types.TextContent]
         memory.metadata['user_feedback'] = feedback
         memory.metadata['user_rating_timestamp'] = time.time()
 
-        # Recalculate quality score with user rating weighted higher
-        # User rating: 0.6 weight, AI/implicit: 0.4 weight
-        user_score = (rating + 1) / 2.0  # Convert -1,0,1 to 0.0,0.5,1.0
+        # Quality model split (#1312): keep computed_quality (machine) separate from
+        # user_rating (human). Preserve any existing computed_quality (seed it from the
+        # current quality_score the first time, so a pre-split memory keeps its machine
+        # value), then materialize the effective quality_score from both origins.
+        from ...quality.config import effective_quality
+        computed = memory.metadata.get('computed_quality')
+        if computed is None:
+            computed = memory.metadata.get('quality_score', 0.5)
+            memory.metadata['computed_quality'] = computed
         existing_score = memory.metadata.get('quality_score', 0.5)
-
-        # Combine scores
-        new_quality_score = 0.6 * user_score + 0.4 * existing_score
+        new_quality_score = effective_quality(computed=computed, user_rating=rating)
         memory.metadata['quality_score'] = new_quality_score
 
-        # Track historical ratings
+        # Track historical ratings (capped; rating_history is not codec-compressed
+        # and can push metadata past the 9.5KB Cloudflare sync limit — #1312).
         rating_history = memory.metadata.get('rating_history', [])
         rating_history.append({
             'rating': rating,
@@ -182,6 +191,7 @@ async def handle_rate_memory(server, arguments: dict) -> List[types.TextContent]
         try:
             quality_updates = {
                 'quality_score': memory.metadata['quality_score'],
+                'computed_quality': memory.metadata['computed_quality'],
                 'user_rating': memory.metadata['user_rating'],
                 'user_feedback': memory.metadata['user_feedback'],
                 'user_rating_timestamp': memory.metadata['user_rating_timestamp'],
@@ -479,6 +489,15 @@ async def handle_maintain(server, arguments: dict) -> List[types.TextContent]:
         report["errors"].append(f"conflicts: {e}")
         report["steps"]["conflicts"] = {"error": str(e)}
 
+    # Step 2b: clear conflict:unresolved tags whose conflict is gone (#1840). After
+    # auto-resolve, and guarded on its own so a failure keeps the totals above.
+    try:
+        stale_tags = await storage.reconcile_conflict_tags(dry_run=dry_run)
+    except Exception as e:
+        report["errors"].append(f"conflict_tags: {e}")
+        stale_tags = {"error": str(e)}
+    report["steps"].setdefault("conflicts", {})["stale_tags"] = stale_tags
+
     # Step 3: Stale memory detection
     try:
         stale_count = await storage.count_all_memories(stale_days=config["stale_days"])
@@ -619,7 +638,9 @@ async def handle_maintain(server, arguments: dict) -> List[types.TextContent]:
                     "types": {t: sum(1 for i in insights if i.insight_type == t) for t in ("pattern", "trend", "gap")},
                 }
             else:
-                stored = await store_insights(insights, storage)
+                from .graph import get_graph_storage
+                insight_graph = await get_graph_storage()
+                stored = await store_insights(insights, storage, graph=insight_graph)
                 report["steps"]["insights"] = {
                     "generated": len(insights),
                     "stored": len(stored),
@@ -635,7 +656,11 @@ async def handle_maintain(server, arguments: dict) -> List[types.TextContent]:
     from mcp_memory_service.consolidation.contradictions import detect_contradictions, CONTRADICTION_ENABLED
     if CONTRADICTION_ENABLED:
         try:
-            contradiction_result = await detect_contradictions(storage, dry_run=dry_run)
+            from .graph import get_graph_storage
+            contradiction_graph = await get_graph_storage() if not dry_run else None
+            contradiction_result = await detect_contradictions(
+                storage, dry_run=dry_run, graph=contradiction_graph
+            )
             report["steps"]["contradictions"] = contradiction_result
         except Exception as e:
             report["steps"]["contradictions"] = {"error": str(e)}

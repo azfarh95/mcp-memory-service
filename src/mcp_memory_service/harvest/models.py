@@ -22,6 +22,12 @@ class HarvestCandidate:
     # Provenance (RFC-harvest-provenance Phase 1)
     harvest_method: str = "heuristic"  # "llm" | "heuristic"
     harvest_model: Optional[str] = None  # "<provider>/<model>" when method == "llm"
+    # Epoch of the transcript message the candidate came from (#1858). None when
+    # the transcript carries no usable timestamp.
+    source_time: Optional[float] = None
+    # Set by SessionHarvester._try_evolve when the closest memory was said later:
+    # the candidate is stored next to it, past semantic dedup (#1858).
+    older_than_match: bool = False
 
 
 @dataclass
@@ -33,6 +39,11 @@ class HarvestResult:
     found: int
     by_type: Dict[str, int]
     stored: int = 0  # Only set when dry_run=False
+    skipped: int = 0  # Candidates the server refused to re-create because they were deleted (#1560)
+    # Candidates the LLM rewrite returned nothing for (call failed, line omitted or
+    # unparseable). They are not in `candidates`/`found`; a later run can retry them (#1560).
+    rewrite_dropped: int = 0
+    coverage: Optional[Dict] = None  # Coverage report aggregated across the run
 
 
 @dataclass
@@ -45,6 +56,9 @@ class HarvestConfig:
     dry_run: bool = True
     project_path: Optional[str] = None  # Override project dir
     use_llm: bool = False  # Phase 2: LLM-based classification
+    # RFC-provenance R8: bypass the harvest-tracker filter and re-harvest
+    # already-tracked sessions (e.g. after a prior run stored nothing).
+    force_reharvest: bool = False
     # P4: Harvest evolution — evolve existing memories instead of duplicating
     similarity_threshold: float = 0.85  # Cosine similarity to trigger evolution
     min_confidence_to_evolve: float = 0.3  # Skip evolution for very stale memories
@@ -76,3 +90,14 @@ def harvest_config_from_env(**overrides) -> HarvestConfig:
                 )
     defaults.update(overrides)
     return HarvestConfig(**defaults)
+
+
+def should_filter_tracker(already_harvested, session_ids, force_reharvest) -> bool:
+    """Whether handle_harvest should filter out already-tracked sessions.
+
+    The tracker filter applies only when there is a tracker to honor
+    (``already_harvested`` non-empty), no explicit ``session_ids`` were given
+    (those bypass the tracker), and ``force_reharvest`` is off (RFC-provenance
+    R8 — force_reharvest re-processes already-tracked sessions).
+    """
+    return bool(already_harvested) and not session_ids and not force_reharvest

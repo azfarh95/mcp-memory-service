@@ -41,15 +41,13 @@ from .types import (
 from .client import get_storage_async, get_consolidator, get_scheduler
 from .sync_wrapper import sync_wrapper
 from ..models.memory import Memory
+from ..models.ontology import coerce_memory_type
 from ..utils.hashing import generate_content_hash
 
 logger = logging.getLogger(__name__)
 
 
-def _sanitize_log_value(value: object) -> str:
-    """Sanitize a user-provided value for safe inclusion in log messages."""
-    return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
-
+from ..compat import _sanitize_log_value
 
 @sync_wrapper
 async def search(
@@ -78,10 +76,10 @@ async def search(
     Example:
         >>> from mcp_memory_service.api import search
         >>> results = search("recent architecture changes", limit=3)
-        >>> print(results)
+        >>> print(results)  # debug: intentional example output
         SearchResult(found=3, shown=3)
         >>> for m in results.memories:
-        ...     print(f"{m.hash}: {m.preview[:50]}...")
+        ...     print(f"{m.hash}: {m.preview[:50]}...")  # debug: intentional example output
         abc12345: Implemented OAuth 2.1 authentication for...
         def67890: Refactored storage backend to support...
         ghi11121: Added hybrid mode for Cloudflare sync...
@@ -97,7 +95,7 @@ async def search(
     if limit < 1:
         raise ValueError("Limit must be at least 1")
     if limit > 100:
-        logger.warning(f"Large limit ({limit}) may impact performance")
+        logger.warning("Large limit (%s) may impact performance", limit)
 
     # Get storage instance
     storage = await get_storage_async()
@@ -162,7 +160,7 @@ async def store(
         ...     "Implemented OAuth 2.1 authentication",
         ...     tags=["authentication", "security", "feature"]
         ... )
-        >>> print(f"Stored: {hash}")
+        >>> print(f"Stored: {hash}")  # debug: intentional example output
         Stored: abc12345
 
     Performance:
@@ -190,7 +188,7 @@ async def store(
         content=content,
         content_hash=content_hash,
         tags=tag_list,
-        memory_type=memory_type,
+        memory_type=coerce_memory_type(memory_type),
         metadata={}
     )
 
@@ -224,9 +222,9 @@ async def health() -> CompactHealthInfo:
     Example:
         >>> from mcp_memory_service.api import health
         >>> info = health()
-        >>> print(f"Status: {info.status}")
+        >>> print(f"Status: {info.status}")  # debug: intentional example output
         Status: healthy
-        >>> print(f"Backend: {info.backend}, Count: {info.count}")
+        >>> print(f"Backend: {info.backend}, Count: {info.count}")  # debug: intentional example output
         Backend: sqlite_vec, Count: 1247
 
     Performance:
@@ -262,7 +260,7 @@ async def health() -> CompactHealthInfo:
         )
 
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        logger.error("Health check failed: %s", _sanitize_log_value(e))
         return CompactHealthInfo(
             status="error",
             count=0,
@@ -299,7 +297,7 @@ async def _consolidate_async(time_horizon: str) -> CompactConsolidationResult:
         start_time = time.time()
 
         # Run consolidation
-        logger.info(f"Running {_sanitize_log_value(time_horizon)} consolidation...")
+        logger.info("Running %s consolidation...", _sanitize_log_value(time_horizon))
         result = await consolidator.consolidate(time_horizon)
 
         # Calculate duration
@@ -312,7 +310,11 @@ async def _consolidate_async(time_horizon: str) -> CompactConsolidationResult:
         status = 'completed' if not result.errors else 'completed_with_errors'
 
         logger.info(
-        f"🎉 Consolidation completed successfully! Processed: {processed}, Compressed: {compressed}, Forgotten: {forgotten} (Total time: {duration:.1f}s)"
+            "🎉 Consolidation completed successfully! Processed: %s, Compressed: %s, Forgotten: %s (Total time: %.1fs)",
+            processed,
+            compressed,
+            forgotten,
+            duration,
         )
 
         return CompactConsolidationResult(
@@ -325,7 +327,7 @@ async def _consolidate_async(time_horizon: str) -> CompactConsolidationResult:
         )
 
     except Exception as e:
-        logger.error(f"Consolidation failed: {e}")
+        logger.error("Consolidation failed: %s", _sanitize_log_value(e))
         return CompactConsolidationResult(
             status="failed",
             horizon=time_horizon,
@@ -358,9 +360,9 @@ async def consolidate(time_horizon: str = "weekly") -> CompactConsolidationResul
     Example:
         >>> from mcp_memory_service.api import consolidate
         >>> result = consolidate('weekly')
-        >>> print(result)
+        >>> print(result)  # debug: intentional example output
         Consolidation(completed, weekly, 2418 processed)
-        >>> print(f"Compressed: {result.compressed}, Forgotten: {result.forgotten}")
+        >>> print(f"Compressed: {result.compressed}, Forgotten: {result.forgotten}")  # debug: intentional example output
         Compressed: 156, Forgotten: 43
 
     Performance:
@@ -440,7 +442,7 @@ async def _scheduler_status_async() -> CompactSchedulerStatus:
             )
 
     except Exception as e:
-        logger.error(f"Failed to get scheduler status: {e}")
+        logger.error("Failed to get scheduler status: %s", _sanitize_log_value(e))
         return CompactSchedulerStatus(
             running=False,
             next_daily=None,
@@ -474,11 +476,11 @@ async def delete_by_tag(tags: Union[str, List[str]], allow_production: bool = Fa
     Example:
         >>> from mcp_memory_service.api import delete_by_tag
         >>> result = delete_by_tag("__test__")
-        >>> print(f"Deleted {result['deleted']} memories")
+        >>> print(f"Deleted {result['deleted']} memories")  # debug: intentional example output
         Deleted 15 memories
         >>> # Delete by multiple tags
         >>> result = delete_by_tag(["temporary", "outdated"])
-        >>> print(result['message'])
+        >>> print(result['message'])  # debug: intentional example output
         Deleted 23 memories with specified tags
 
     Performance:
@@ -502,7 +504,7 @@ async def delete_by_tag(tags: Union[str, List[str]], allow_production: bool = Fa
     # SAFETY CHECK: Prevent accidental production deletion
     if not allow_production:
         from mcp_memory_service.config import DATABASE_PATH
-        import tempfile
+        import tempfile  # inline import: keep optional dependencies lazy
 
         db_path = str(DATABASE_PATH)
         temp_prefix = tempfile.gettempdir()
@@ -551,12 +553,12 @@ async def scheduler_status() -> CompactSchedulerStatus:
     Example:
         >>> from mcp_memory_service.api import scheduler_status
         >>> status = scheduler_status()
-        >>> print(status)
+        >>> print(status)  # debug: intentional example output
         Scheduler(running, executed=42, failed=0)
         >>> if status.next_daily:
         ...     from datetime import datetime
         ...     next_run = datetime.fromtimestamp(status.next_daily)
-        ...     print(f"Next daily: {next_run}")
+        ...     print(f"Next daily: {next_run}")  # debug: intentional example output
 
     Performance:
         - Execution time: <5ms (reads cached state)

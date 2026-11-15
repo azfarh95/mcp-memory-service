@@ -110,17 +110,33 @@ Docker job derives its image tags from `github.ref_name`, so a manual dispatch f
 
 ## Version Bump Procedure
 
-Always bumped together, in one commit:
+First, collect the changelog fragments:
+
+```bash
+python3 scripts/release/collect_changelog.py    # --dry-run to preview
+```
+
+Every PR that touched `src/` left one in `changelog.d/` (enforced by the
+`changelog-entry` CI job, #1273). The script merges them into `[Unreleased]` under the
+right section and deletes them. Skipping it means shipping a release whose changelog is
+missing everything since the last one — the state that made v11.13.0's changelog a
+reconstruction job.
+
+Then the version files, always bumped together, in one commit:
 
 1. `src/mcp_memory_service/_version.py` (`__version__ = "X.Y.Z"`) — this is the canonical source
 2. `pyproject.toml` (line ~7: `version = "X.Y.Z"`)
-3. `README.md` (Latest Release section)
-4. `CHANGELOG.md` — retitle `[Unreleased]` to `[X.Y.Z]` with the date, and leave a new
+3. `CHANGELOG.md` — retitle `[Unreleased]` to `[X.Y.Z]` with the date, and leave a new
    empty `## [Unreleased]` heading above it. The entries move under the version; the
    heading stays, because the next PR adds its entry there.
-5. `uv lock` to update the dependency lock file
+4. `uv lock` to update the dependency lock file
 
-Of those five, **only `_version.py` and `pyproject.toml` are covered by a CI gate.**
+`README.md` is no longer on this list. It carried a "Latest Release" section and an
+inline v11 changelog that had to be hand-edited on every release; both were removed when
+the README was cut down, and it now links CHANGELOG.md instead. Do not reintroduce a
+version string there.
+
+Of those four, **only `_version.py` and `pyproject.toml` are covered by a CI gate.**
 
 `CLAUDE.md` used to carry a "Current Version" line and was the one that actually got
 forgotten: v11.8.2 shipped without it, nothing failed, and main announced the previous
@@ -190,12 +206,21 @@ As of 2026-09-15 it carries two rules:
   `src.` imports #1238 had just removed. Until then the ruleset required no status
   check at all.
 
-The required context is `Analyze Python Code` (`codeql.yml`) specifically because it is
-the only job that runs on every pull request. Everything in `ci.yml` sits behind
-`paths-ignore` for `docs/**`, root `*.md`, `.github/**/*.md`, `LICENSE`, `NOTICE` and
-`.gitignore`, so on a documentation-only PR that workflow never starts — and a required
-check that never reports blocks the PR permanently. Before requiring any `ci.yml` job,
-that has to be solved.
+`Analyze Python Code` (`codeql.yml`) was for a long time the only required context,
+because it was the only job that ran on every pull request. `ci.yml` sat behind
+`paths-ignore`, so on a documentation-only PR it never started, and a required check
+that never reports blocks the PR permanently. Auto-merge consequently waited for CodeQL
+alone: #1416 merged while `Tests with ML Extras` was still running.
+
+`ci.yml` now starts on every pull request. Its `changes` job runs `is_docs_only()` from
+`scripts/pr/pre_pr_check.sh`, read from the base commit so a PR cannot redefine it, over the PR diff, and the test jobs skip when it reports
+docs-only. A job skipped through `if:` reports success to a required check, so
+`Tests + Coverage` and `Tests with ML Extras (transformers paths)` can be required. The
+milvus matrix cannot: skipped, it reports under its unexpanded name
+(`Tests with the milvus extra (${{ matrix.leg }})`), so `(pinned)` never arrives on a
+docs-only PR. The ML-extras tests run as a two-shard matrix for the same reason behind
+a plain job, `ml-extras-result`, which carries the required name and goes green only
+when both shards passed or skipped as docs-only. Push keeps `paths-ignore`.
 
 Strict also has a documented precondition: it takes effect only while at least one
 status check is required. Setting the flag with an empty check list changes nothing.
@@ -230,7 +255,8 @@ The rest of the discipline:
 
 What manual releases have actually cost:
 
-- Forgotten `README.md` update
+- Forgotten `README.md` update (the README no longer carries a version — this class of
+  failure is gone, not fixed by discipline)
 - Incomplete release notes
 - Publish pipeline never verified after the tag push
 - Version mismatch between files

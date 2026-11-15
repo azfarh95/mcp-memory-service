@@ -71,7 +71,7 @@ Answer questions in Issues or help other users.
 
 ### Prerequisites
 
-- Python 3.10 or higher
+- Python 3.11 or higher
 - Git
 - Platform-specific requirements:
   - **macOS**: Homebrew Python recommended for SQLite extension support
@@ -94,10 +94,12 @@ Answer questions in Issues or help other users.
    ```
    This will automatically detect your platform and install appropriate dependencies.
 
-4. **Verify installation**:
+4. **Verify your development installation**:
    ```bash
-   python scripts/verify_environment.py
+   python scripts/validation/check_dev_setup.py
    ```
+   This checks that the package is installed in editable mode and that its version
+   matches the source checkout.
 
 5. **Run the service**:
    ```bash
@@ -123,6 +125,86 @@ docker-compose -f docker-compose.http.yml up -d  # For HTTP API mode
 
 ## Development Process
 
+### Before You Start: Claim the Issue
+
+Check for existing work before you write any code. It is your job to make sure you are
+not duplicating someone else's effort:
+
+- Search open **and** closed issues and PRs for the same problem. A fix may already be
+  in review, merged, or rejected with a reason.
+- If you want to work on an existing issue, leave a comment on it saying you are taking
+  it on, and wait for confirmation before you start (see the automatic option below).
+  Issues that already
+  have someone working on them, per a comment or an open PR, are taken.
+- If there is no issue yet for a non-trivial change, open one first so the approach
+  can be agreed before you invest time in it.
+- If you stop working on an issue you claimed, say so on the issue so someone else can
+  pick it up.
+
+A PR for an issue someone else has already claimed, or one that duplicates an open
+PR, will usually be closed.
+
+#### How unclaimed PRs and stale claims are decided
+
+Maintainers decide these cases by the table below, based on the state of the issue
+when the PR is reviewed. The same situation gets the same answer, whoever is involved.
+
+| Situation at review time | Decision |
+|---|---|
+| The issue is assigned to someone else, or someone else claimed it earlier | The unclaimed PR is closed |
+| The issue is free: no assignee, no earlier claim, no other open PR | The PR author is assigned, gets a pointer to this section, and the PR is reviewed normally |
+| The issue is free and several unclaimed PRs exist | The earliest PR that passes review gets the issue; the others are closed |
+| A claim is 3 days old with no PR, no draft and no update on the issue | A maintainer asks once on the issue |
+| No answer 2 days after that question | The claim expires, the assignment is removed, and the issue is free again |
+| A PR changes `src/` without an issue | Small and clearly scoped: `skip-issue`. Otherwise it waits until an issue is opened and agreed |
+
+A claim is a commitment to start, not a reservation. If you need more time, say so
+on the issue; an update resets the clock.
+
+#### Automatic claims for prepared issues
+
+An issue labelled `auto-assign` has already had its scope approved by a maintainer.
+That can be a good first issue, a bug with `help wanted`, or anything else with a
+settled scope. Comment `/claim` on a line of its own to request
+assignment to yourself. Wait for the assignment and the confirmation comment
+before starting. That automatic confirmation counts as maintainer approval for
+the scope described in the issue; it does not approve a broader change or a merge.
+
+The earliest eligible claim wins. Existing assignees are preserved, and later
+claimants receive a reply that the issue is taken. Your `/claim` can confirm your
+own earlier prose claim if no other contributor claimed it in between. An earlier
+prose claim by someone else, an edited claim, a withdrawal, an earlier removed
+assignment or an open PR requires manual confirmation instead. Do not edit an old
+comment to claim an issue. The
+command is ignored inside quotes and code examples; `/claim @someone` cannot
+assign another person. Collaborators can use the same command.
+
+If you claim such an issue in ordinary prose, a bot replies once and names the
+command; the prose alone does not assign you. For all other issues, wait for a
+maintainer to assign you. If you stop working on an issue,
+leave a comment; a maintainer will handle reassignment.
+
+Maintainers: add `auto-assign` only after the issue has a settled scope and
+acceptance criteria. Remove it to disable automatic claims. In Discord, link
+the GitHub issue and tell contributors to comment `/claim` there; claims stay
+on GitHub. Do not enable automatic claims on tasks that still need a design
+discussion. Automated-agent disclosure requirements below still apply.
+
+CI checks the maintainer's confirmation. The author must be a current assignee of
+every issue a pull request closes (`Fixes #N`); a comment alone does not count.
+Otherwise, the `Claim Check` workflow labels the PR `unclaimed` and links back
+here. Comment on the issue and wait for confirmation before starting; once you
+are assigned manually or through the automatic flow above, the check runs again
+and passes. Removing an
+assignment also refreshes the check against the current assignees.
+
+A pull request that changes `src/` without linking any issue is labelled
+`no-issue` the same way. Link the issue, or open one. A maintainer can mark a small
+or otherwise approved contribution `skip-issue`: this bypasses both checks and
+clears stale `unclaimed` and `no-issue` labels. Removing the exception restores
+the normal checks. Owners, members, collaborators and bots remain exempt. The
+claim check stays informational, not a required merge check.
+
 ### 1. Create a Feature Branch
 
 ```bash
@@ -145,6 +227,28 @@ Use descriptive branch names:
 - Add/update tests as needed
 - Update documentation if applicable
 - Keep commits focused and atomic
+- Add a changelog fragment if you changed anything under `src/`
+
+#### Changelog fragments
+
+A change under `src/` needs a one-line entry in a file of its own:
+
+```
+changelog.d/<number>.<category>.md
+```
+
+`<number>` is your PR or issue number, `<category>` is `added`, `fixed`, `removed` or
+`internal` — pick the exact word from the list, common abbreviations such as `fix`
+or `feat` are rejected by CI. As a rule of thumb: bugs → `fixed`, new behaviour →
+`added`, deletions → `removed`, everything without user-visible effect (CI,
+tooling, docs, dependency bumps, performance/refactor) → `internal`. The file holds
+a single markdown list item describing the change — the symptom and what it does
+now, not the patch. `changelog.d/README.md` has the format and an example, and the
+`Changelog fragment for src/ changes` CI job checks it.
+
+It is a separate file per pull request on purpose: entries used to go straight into
+`CHANGELOG.md`, where every open branch edited the same lines and conflicted. Yours will
+never conflict with anyone else's. They are merged into `CHANGELOG.md` at release time.
 
 ### 3. Test Your Changes
 
@@ -257,6 +361,11 @@ except StorageError as e:
   git stash -- src/ && .venv/bin/pytest tests/<your file> -q; git stash pop   # must fail
   .venv/bin/pytest tests/<your file> -q                                        # must pass
   ```
+  The check installs `pymilvus` and Milvus Lite when a changed test imports
+  `pymilvus`, but no other optional extra. A test that skips itself without one
+  (`pytest.importorskip("sentence_transformers")`, for example) gets a failure
+  naming the missing module; paste your local runs and a maintainer sets
+  `skip-prove-fix`.
 - Drive the real code path. Use the sqlite-vec storage through the `temp_db_path`
   fixture, the real tool registry, the real handler. Mock only network and
   external services (Cloudflare, Groq, Gemini). A mock of the function under test
@@ -360,15 +469,38 @@ When adding features or making significant changes:
    - [ ] Tests pass locally (`bash scripts/pr/pre_pr_check.sh`)
    - [ ] Code follows style guidelines
    - [ ] Documentation updated
-   - [ ] CHANGELOG.md updated
+   - [ ] Changelog fragment added under `changelog.d/` if `src/` changed
    - [ ] No sensitive data exposed
+   - [ ] I checked that no other open PR covers this change and, if there is a related issue, commented on it before starting (see [Before You Start](#before-you-start-claim-the-issue))
+   - [ ] All review threads (including Greptile's) are answered and resolved
    - [ ] **If adding/modifying MCP tools**: tool is added to `valid_actions` in `server/handlers/graph.py` (if applicable) and write-scope enforcement is correct (see [Security-Sensitive Changes](#security-sensitive-changes))
    - [ ] **I am a human contributor**, or I have disclosed that this PR was generated by an automated agent (see [Autonomous Agents & AI-Generated PRs](#autonomous-agents--ai-generated-prs))
 
 ### Review Process
 
 - PRs require at least one review
-- Address review feedback promptly
+- Every PR is reviewed automatically by [Greptile](https://www.greptile.com/). Its
+  findings arrive as inline review comments, not as a failing check, so a PR can
+  show green checks and still be blocked.
+- **All review threads must be resolved before a PR can be merged.** The branch
+  protection on `main` enforces this. For each thread, Greptile's or a maintainer's,
+  either push a fix or reply explaining why no change is needed, then resolve it.
+  Do not resolve a thread silently without a fix or a reply. Replies to false
+  positives also help Greptile learn the repository's conventions.
+- If you work with a coding agent, Greptile's
+  [greploop skill](https://github.com/greptileai/skills/blob/main/greploop/SKILL.md)
+  automates the review-fix-resolve cycle. Two deviations apply here: reply to every
+  thread before resolving it, false positives included (the skill resolves those
+  silently), and stop once all threads are resolved and the checks are green. A 5/5
+  confidence score is not required. Commits still follow the conventional format
+  above; do not stage with `git add -A`.
+- Address review feedback promptly. When a review thread has waited 48 hours on
+  you, a bot posts one reminder on the PR. If your threads are still unanswered three
+  days after that reminder, the PR is labelled `maintainer-takeover`, and a
+  maintainer may finish it (on your branch when "Allow edits by maintainers" is on,
+  otherwise in a new PR that credits you) or close it. Your commits keep your
+  authorship. A reply in the thread, even one that only asks for more time, keeps
+  the PR yours.
 - Keep discussions focused and constructive
 - Be patient - reviews may take a few days
 
@@ -487,6 +619,7 @@ For feature requests, describe:
 - **GitHub Issues**: Bug reports, feature requests, and general questions
 - **GitHub Pull Requests**: Code contributions and reviews
 - **GitHub Security Advisories**: Confidential vulnerability reports only
+- **Discord**: [MCP Memory Service server](https://discord.gg/zrsNMEzmCj) for announcements (releases, good first issues, new Discussions) and informal chat. Claims, decisions and reviews stay on GitHub.
 
 ### For AI Agents
 

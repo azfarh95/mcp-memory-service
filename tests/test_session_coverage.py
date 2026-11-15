@@ -176,12 +176,12 @@ async def test_evolve_stamps_method_tag():
     svc = MagicMock()
     captured = {}
 
-    async def _update(existing_hash, content, new_tags=None, new_memory_type=None, reason=None):
-        captured["tags"] = new_tags
+    async def _evolve(existing_hash, content, tags=None, memory_type=None, metadata=None, reason=None):
+        captured["tags"] = tags
         return True, "ok", "newhash"
 
     svc.storage = MagicMock()
-    svc.storage.update_memory_versioned = AsyncMock(side_effect=_update)
+    svc.evolve_memory = AsyncMock(side_effect=_evolve)
     # similar match above threshold → evolve path
     sim = MagicMock()
     sim.relevance_score = 0.95
@@ -194,7 +194,7 @@ async def test_evolve_stamps_method_tag():
                             harvest_method="llm", harvest_model="deepseek/deepseek-chat")
     cfg = HarvestConfig(sessions=1, similarity_threshold=0.85)
 
-    evolved = await harvester._try_evolve(cand, cfg)
+    evolved, _new_hash = await harvester._try_evolve(cand, cfg)
     assert evolved is True
     assert captured["tags"] is not None
     assert "harvest:method:llm" in captured["tags"], f"R9: evolve missing method tag: {captured['tags']}"

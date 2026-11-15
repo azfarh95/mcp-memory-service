@@ -15,6 +15,7 @@ Features:
 """
 
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -44,6 +45,7 @@ sys.path.insert(0, str(src_dir))
 # This module is kept for future compatibility
 try:
     from mcp.server.fastmcp import FastMCP, Context
+    from mcp.server.fastmcp.exceptions import ToolError
 except ImportError:
     logger_temp = logging.getLogger(__name__)
     logger_temp.warning("FastMCP not available in mcp library - mcp_server module cannot be used")
@@ -58,10 +60,12 @@ except ImportError:
     
     FastMCP = _DummyFastMCP  # type: ignore
     Context = None  # type: ignore
+    ToolError = RuntimeError  # type: ignore
 
 from mcp.types import ToolAnnotations
 
 # Import existing memory service components
+from .compat import _sanitize_log_value
 from .config import (
     STORAGE_BACKEND,
     EMBEDDING_MODEL_NAME,
@@ -73,6 +77,7 @@ from .storage.base import MemoryStorage
 from .services.memory_service import MemoryService
 from .services.graph_service import GraphService
 from .storage.graph import GraphStorage
+from .utils.tool_rate_limit import ToolRateLimiter, resolve_caller_identity
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)  # Default to INFO level
@@ -131,17 +136,17 @@ def _get_or_create_memory_service(storage: MemoryStorage) -> MemoryService:
     if storage_id in _MEMORY_SERVICE_CACHE:
         memory_service = _MEMORY_SERVICE_CACHE[storage_id]
         _CACHE_STATS["service_hits"] += 1
-        logger.info(f"✅ MemoryService Cache HIT - Reusing service instance (storage_id: {storage_id})")
+        logger.info("✅ MemoryService Cache HIT - Reusing service instance (storage_id: %s)", storage_id)
     else:
         _CACHE_STATS["service_misses"] += 1
-        logger.info(f"❌ MemoryService Cache MISS - Creating new service instance...")
+        logger.info("❌ MemoryService Cache MISS - Creating new service instance...")
 
         # Initialize memory service with shared business logic
         memory_service = MemoryService(storage)
 
         # Cache the memory service instance
         _MEMORY_SERVICE_CACHE[storage_id] = memory_service
-        logger.info(f"💾 Cached MemoryService instance (storage_id: {storage_id})")
+        logger.info("💾 Cached MemoryService instance (storage_id: %s)", storage_id)
 
     return memory_service
 
@@ -159,12 +164,17 @@ def _log_cache_performance(start_time: float) -> None:
     ) * 100
 
     logger.info(
-        f"📊 Cache Stats - "
-        f"Hit Rate: {cache_hit_rate:.1f}% | "
-        f"Storage: {_CACHE_STATS['storage_hits']}H/{_CACHE_STATS['storage_misses']}M | "
-        f"Service: {_CACHE_STATS['service_hits']}H/{_CACHE_STATS['service_misses']}M | "
-        f"Total Time: {total_time:.1f}ms | "
-        f"Cache Size: {len(_STORAGE_CACHE)} storage + {len(_MEMORY_SERVICE_CACHE)} services"
+        "📊 Cache Stats - "
+        "Hit Rate: %.1f%% | "
+        "Storage: %sH/%sM | "
+        "Service: %sH/%sM | "
+        "Total Time: %.1fms | "
+        "Cache Size: %s storage + %s services",
+        cache_hit_rate,
+        _CACHE_STATS['storage_hits'], _CACHE_STATS['storage_misses'],
+        _CACHE_STATS['service_hits'], _CACHE_STATS['service_misses'],
+        total_time,
+        len(_STORAGE_CACHE), len(_MEMORY_SERVICE_CACHE),
     )
 
 @dataclass
@@ -195,7 +205,7 @@ async def mcp_server_lifespan(server: FastMCP) -> AsyncIterator[MCPServerContext
     _CACHE_STATS["total_calls"] += 1
     start_time = time.time()
 
-    logger.info(f"🔄 MCP Server Call #{_CACHE_STATS['total_calls']} - Checking global cache...")
+    logger.info("🔄 MCP Server Call #%s - Checking global cache...", _CACHE_STATS['total_calls'])
 
     # Acquire lock for thread-safe cache access
     cache_lock = _get_cache_lock()
@@ -207,10 +217,10 @@ async def mcp_server_lifespan(server: FastMCP) -> AsyncIterator[MCPServerContext
         if cache_key in _STORAGE_CACHE:
             storage = _STORAGE_CACHE[cache_key]
             _CACHE_STATS["storage_hits"] += 1
-            logger.info(f"✅ Storage Cache HIT - Reusing {STORAGE_BACKEND} instance (key: {cache_key})")
+            logger.info("✅ Storage Cache HIT - Reusing %s instance (key: %s)", _sanitize_log_value(STORAGE_BACKEND), _sanitize_log_value(cache_key))
         else:
             _CACHE_STATS["storage_misses"] += 1
-            logger.info(f"❌ Storage Cache MISS - Initializing {STORAGE_BACKEND} instance...")
+            logger.info("❌ Storage Cache MISS - Initializing %s instance...", _sanitize_log_value(STORAGE_BACKEND))
 
             # Initialize storage backend using shared factory
             from .storage.factory import create_storage_instance
@@ -220,7 +230,7 @@ async def mcp_server_lifespan(server: FastMCP) -> AsyncIterator[MCPServerContext
             _STORAGE_CACHE[cache_key] = storage
             init_time = (time.time() - start_time) * 1000  # Convert to ms
             _CACHE_STATS["initialization_times"].append(init_time)
-            logger.info(f"💾 Cached storage instance (key: {cache_key}, init_time: {init_time:.1f}ms)")
+            logger.info("💾 Cached storage instance (key: %s, init_time: %.1fms)", _sanitize_log_value(cache_key), init_time)
 
         # Check memory service cache and log performance
         memory_service = _get_or_create_memory_service(storage)
@@ -238,9 +248,9 @@ async def mcp_server_lifespan(server: FastMCP) -> AsyncIterator[MCPServerContext
                     # Offload blocking SQLite I/O to a separate thread
                     graph_storage = await asyncio.to_thread(GraphStorage, SQLITE_VEC_PATH)
                     _GRAPH_STORAGE_CACHE[SQLITE_VEC_PATH] = graph_storage
-                    logger.info("GraphStorage initialized and cached for %s backend", STORAGE_BACKEND)
+                    logger.info("GraphStorage initialized and cached for %s backend", _sanitize_log_value(STORAGE_BACKEND))
                 except Exception as e:
-                    logger.warning("GraphStorage initialization failed (graph tools disabled): %s", e)
+                    logger.warning("GraphStorage initialization failed (graph tools disabled): %s", _sanitize_log_value(e))
                     graph_storage = None
 
             if graph_storage is not None:
@@ -271,7 +281,7 @@ async def mcp_server_lifespan(server: FastMCP) -> AsyncIterator[MCPServerContext
                     _GRAPH_STORAGE_CACHE[milvus_graph_cache_key] = graph_storage
                     logger.info("MilvusGraphStorage initialized and cached for milvus backend")
                 except Exception as e:
-                    logger.warning("MilvusGraphStorage initialization failed (graph tools disabled): %s", e)
+                    logger.warning("MilvusGraphStorage initialization failed (graph tools disabled): %s", _sanitize_log_value(e))
                     graph_storage = None
 
             if graph_storage is not None:
@@ -284,7 +294,7 @@ async def mcp_server_lifespan(server: FastMCP) -> AsyncIterator[MCPServerContext
                     _GRAPH_SERVICE_CACHE[gs_id] = graph_service
                     logger.info("💾 Cached GraphService instance (milvus)")
     else:
-        logger.info("Graph tools not available for %s backend (expected)", STORAGE_BACKEND)
+        logger.info("Graph tools not available for %s backend (expected)", _sanitize_log_value(STORAGE_BACKEND))
 
     if graph_service is None:
         graph_service = GraphService(None)
@@ -299,7 +309,7 @@ async def mcp_server_lifespan(server: FastMCP) -> AsyncIterator[MCPServerContext
         # IMPORTANT: Do NOT close cached storage instances here!
         # They are intentionally kept alive across stateless HTTP calls for performance.
         # Cleanup only happens on process shutdown (handled by FastMCP framework).
-        logger.info(f"✅ MCP Server Call #{_CACHE_STATS['total_calls']} complete - Cached instances preserved")
+        logger.info("✅ MCP Server Call #%s complete - Cached instances preserved", _CACHE_STATS['total_calls'])
 
 # Create FastMCP server instance
 try:
@@ -323,6 +333,8 @@ class StoreMemorySuccess(TypedDict):
     success: bool
     message: str
     content_hash: str
+    dedup_outcome: NotRequired[str]
+    matched_hash: NotRequired[str]
 
 class StoreMemorySplitSuccess(TypedDict):
     """Return type for successful chunked memory storage."""
@@ -330,6 +342,9 @@ class StoreMemorySplitSuccess(TypedDict):
     message: str
     chunks_created: int
     chunk_hashes: List[str]
+    dedup_outcome: NotRequired[str]
+    matched_hash: NotRequired[str]
+    dedup_decisions: NotRequired[List[Dict[str, Any]]]
 
 class StoreMemoryFailure(TypedDict):
     """Return type for failed memory storage."""
@@ -337,6 +352,87 @@ class StoreMemoryFailure(TypedDict):
     message: str
     chunks_created: NotRequired[int]
     chunk_hashes: NotRequired[List[str]]
+    dedup_outcome: NotRequired[str]
+    matched_hash: NotRequired[str]
+    dedup_decisions: NotRequired[List[Dict[str, Any]]]
+
+
+def _dedup_tool_fields(result: dict) -> Dict[str, Any]:
+    """Semantic-dedup fields the MemoryService already decided, if any."""
+    fields: Dict[str, Any] = {}
+    if result.get("dedup_outcome"):
+        fields["dedup_outcome"] = result["dedup_outcome"]
+        if result.get("matched_hash"):
+            fields["matched_hash"] = result["matched_hash"]
+    if result.get("dedup_decisions"):
+        fields["dedup_decisions"] = result["dedup_decisions"]
+    return fields
+
+# =============================================================================
+# PER-CALLER RATE LIMITING (#1606)
+# =============================================================================
+# The @mcp.tool functions below call MemoryService directly and never go
+# through MemoryServer.call_tool, so they run the same limiter check
+# themselves. Unlimited by default; configured with MCP_RATE_LIMIT_PER_MINUTE
+# and per-tool MCP_RATE_LIMIT_<tool> overrides, keyed by this server's tool
+# names (e.g. MCP_RATE_LIMIT_store_memory).
+
+_tool_rate_limiter = ToolRateLimiter()
+
+
+def _rate_limit_caller_identity(ctx: Context) -> str:
+    """Resolve the rate-limit identity for the current tool call.
+
+    Mirrors ``MemoryServer._rate_limit_caller_identity``: the ``X-Agent-ID``
+    header, then the socket peer IP, then one per-process bucket when there
+    is no HTTP request (stdio). Never reads tool arguments: ``agent_id`` on
+    ``retrieve_memory``/``list_memories`` is an author filter, not the caller.
+    """
+
+    try:
+        request = ctx.request_context.request
+    except (LookupError, AttributeError, ValueError):
+        request = None
+    if request is None:
+        return resolve_caller_identity(None, None)
+    header = request.headers.get("X-Agent-ID")
+    client = request.client
+    host = client.host if client is not None else None
+    return resolve_caller_identity(header, host)
+
+
+def _check_rate_limit(ctx: Context, tool_name: str) -> None:
+    """Raise ``ToolError`` when the caller is over its limit for this tool.
+
+    Fails open, as ``MemoryServer.call_tool`` does: a limiter failure is
+    logged and the call goes ahead. FastMCP turns the raised ``ToolError``
+    into a tool result with ``isError: true``.
+    """
+
+    try:
+        decision = _tool_rate_limiter.check(_rate_limit_caller_identity(ctx), tool_name)
+    except Exception:
+        logger.exception("MCP tool rate limiter failed; allowing request")
+        return
+    if decision.allowed:
+        return
+    if decision.should_log:
+        logger.warning(
+            "MCP tool rate limit exceeded for tool %s",
+            _sanitize_log_value(tool_name),
+        )
+    payload = {
+        "error": {
+            "code": -32029,
+            "type": "rate_limit_exceeded",
+            "message": "MCP tool rate limit exceeded",
+            "tool": tool_name,
+            "limit_per_minute": decision.limit_per_minute,
+            "retry_after_seconds": decision.retry_after_seconds,
+        }
+    }
+    raise ToolError(json.dumps(payload))
+
 
 # =============================================================================
 # CORE MEMORY OPERATIONS
@@ -354,7 +450,8 @@ async def store_memory(
     tags: Union[str, List[str], None] = None,
     memory_type: str = "note",
     metadata: Optional[Dict[str, Any]] = None,
-    client_hostname: Optional[str] = None
+    client_hostname: Optional[str] = None,
+    restore_deleted: bool = False
 ) -> Union[StoreMemorySuccess, StoreMemorySplitSuccess, StoreMemoryFailure]:
     """Store new information in persistent memory with semantic search capabilities and optional categorization.
 
@@ -383,6 +480,12 @@ TAG FORMATS (all supported):
 - Single: "single-tag"
 - Both tags parameter AND metadata.tags are merged automatically
 
+DELETED CONTENT (restore_deleted):
+- Content that was deleted on this server is NOT silently re-created: the tool answers
+  success=false with "Not stored: this content was deleted on <date>; pass
+  restore_deleted=true to bring it back". That is a refusal, not an error.
+- Pass restore_deleted=true only when the user deliberately wants the deleted memory back.
+
 RETURNS:
 - success: Boolean indicating storage status
 - message: Status message
@@ -407,21 +510,27 @@ Examples:
     }
 }
     """
+    _check_rate_limit(ctx, "store_memory")
     # Delegate to shared MemoryService business logic
     memory_service = ctx.request_context.lifespan_context.memory_service
+    # RFC mcp-hostname-stamping: resolve server host when the client omits it and
+    # MCP_MEMORY_INCLUDE_HOSTNAME is on (same helper as the routed MCP handler).
+    from .server.handlers.memory import _resolve_hostname
     result = await memory_service.store_memory(
         content=content,
         tags=tags,
         memory_type=memory_type,
         metadata=metadata,
-        client_hostname=client_hostname
+        client_hostname=_resolve_hostname(client_hostname),
+        restore_deleted=restore_deleted,
     )
 
     # Transform MemoryService response to MCP tool format
     if not result.get("success"):
         return StoreMemoryFailure(
             success=False,
-            message=result.get("error", "Failed to store memory")
+            message=result.get("error", "Failed to store memory"),
+            **_dedup_tool_fields(result),
         )
 
     # Handle chunked response (multiple memories)
@@ -431,7 +540,8 @@ Examples:
             success=True,
             message=f"Successfully stored {len(result['memories'])} memory chunks",
             chunks_created=result["total_chunks"],
-            chunk_hashes=chunk_hashes
+            chunk_hashes=chunk_hashes,
+            **_dedup_tool_fields(result),
         )
 
     # Handle single memory response
@@ -439,7 +549,8 @@ Examples:
     return StoreMemorySuccess(
         success=True,
         message="Memory stored successfully",
-        content_hash=memory_data["content_hash"]
+        content_hash=memory_data["content_hash"],
+        **_dedup_tool_fields(result),
     )
 
 @mcp.tool(
@@ -500,6 +611,7 @@ Examples:
     "n_results": 3
 }
     """
+    _check_rate_limit(ctx, "retrieve_memory")
     # Delegate to shared MemoryService business logic
     memory_service = ctx.request_context.lifespan_context.memory_service
     return await memory_service.retrieve_memories(
@@ -563,6 +675,7 @@ Examples:
     "tags": ["api-documentation"]
 }
     """
+    _check_rate_limit(ctx, "search_by_tag")
     # Delegate to shared MemoryService business logic
     memory_service = ctx.request_context.lifespan_context.memory_service
     return await memory_service.search_by_tag(
@@ -620,6 +733,7 @@ retrieve_memory(query: "outdated API documentation")
     "content_hash": "a1b2c3d4e5f6..."
 }
     """
+    _check_rate_limit(ctx, "delete_memory")
     # Delegate to shared MemoryService business logic
     memory_service = ctx.request_context.lifespan_context.memory_service
     return await memory_service.delete_memory(content_hash)
@@ -671,6 +785,7 @@ Common use cases:
 - User: "Is the memory service working?" → check_database_health()
 - User: "What backend are we using?" → check_database_health()
     """
+    _check_rate_limit(ctx, "check_database_health")
     # Delegate to shared MemoryService business logic
     memory_service = ctx.request_context.lifespan_context.memory_service
     return await memory_service.health_check()
@@ -739,6 +854,7 @@ Examples:
     "memory_type": "decision"
 }
     """
+    _check_rate_limit(ctx, "list_memories")
     # Delegate to shared MemoryService business logic
     memory_service = ctx.request_context.lifespan_context.memory_service
     return await memory_service.list_memories(
@@ -789,6 +905,7 @@ Examples:
 {"action": "path", "hash1": "abc123...", "hash2": "def456..."}
 {"action": "subgraph", "hash": "abc123...", "radius": 3}
     """
+    _check_rate_limit(ctx, "memory_graph")
     graph_service = ctx.request_context.lifespan_context.graph_service
 
     if action == "connected":
@@ -840,6 +957,7 @@ async def get_cache_stats(ctx: Context) -> Dict[str, Any]:
         - performance: Initialization time statistics (avg/min/max)
         - backend_info: Current storage backend configuration
     """
+    _check_rate_limit(ctx, "get_cache_stats")
     global _CACHE_STATS, _STORAGE_CACHE, _MEMORY_SERVICE_CACHE
 
     # Import shared stats calculation utility
@@ -875,6 +993,27 @@ async def get_cache_stats(ctx: Context) -> Dict[str, Any]:
 # MAIN ENTRY POINT
 # =============================================================================
 
+def _assert_loopback_bind(host: str, port: int) -> None:
+    """Refuse to serve this entry point anywhere but loopback.
+
+    FastMCP is built here with no auth and no token verifier, so neither
+    MCP_API_KEY nor OAuth protects it. The bind guard the other transports use
+    (`_assert_bind_is_authenticated`) lets a network bind through once a key is
+    set, which would be wrong here: the key would be configured and never
+    checked. Loopback is the only safe bind (GHSA-26rx-6fvr-qjqg).
+    """
+    from .utils.startup_orchestrator import _is_loopback_host  # inline import: only main() needs it
+    if _is_loopback_host(host):
+        return
+    raise RuntimeError(
+        f"Refusing to start mcp-memory-server on {host}:{port}. This entry point has no "
+        "authentication, and MCP_API_KEY and OAuth do not apply to it. Bind it to "
+        "127.0.0.1. For network clients run 'memory server --streamable-http' with "
+        "MCP_SSE_HOST (or --sse-host) set to the bind address, plus MCP_API_KEY or "
+        "OAuth; that transport reads MCP_SSE_HOST, not MCP_HTTP_HOST."
+    )
+
+
 def main():
     """Main entry point for the FastAPI MCP server (StreamableHTTP transport).
 
@@ -887,12 +1026,17 @@ def main():
     or:
         python -m mcp_memory_service.server
 
-    This `mcp-memory-server` entry point starts an HTTP server on a port and is
-    intended for remote/HTTP-based MCP clients only.
+    This `mcp-memory-server` entry point starts an HTTP server for HTTP-based MCP
+    clients on the same machine. It has no authentication, so it refuses any
+    non-loopback bind (GHSA-26rx-6fvr-qjqg). Network clients belong on
+    `memory server --streamable-http` with MCP_SSE_HOST and MCP_API_KEY or OAuth.
     """
+    # Check what uvicorn will actually bind, before telling anyone we start.
+    _assert_loopback_bind(mcp.settings.host, mcp.settings.port)
+
     # Emit a prominent warning so users who accidentally invoke this via stdio
     # see a clear message rather than a silent misconfiguration.
-    print(
+    print(  # debug: intentional user-facing stderr notice, not leftover debug output
         "\n"
         "WARNING: mcp-memory-server uses StreamableHTTP transport, NOT stdio.\n"
         "  If you are configuring a stdio MCP client (Claude Code, Claude Desktop),\n"
@@ -901,8 +1045,8 @@ def main():
         file=sys.stderr
     )
 
-    logger.info(f"Starting MCP Memory Service FastAPI server on {HTTP_HOST}:{HTTP_PORT}")
-    logger.info(f"Storage backend: {STORAGE_BACKEND}")
+    logger.info("Starting MCP Memory Service FastAPI server on %s:%s", _sanitize_log_value(HTTP_HOST), HTTP_PORT)
+    logger.info("Storage backend: %s", _sanitize_log_value(STORAGE_BACKEND))
 
     # Run server with streamable HTTP transport
     mcp.run("streamable-http")

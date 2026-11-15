@@ -82,13 +82,50 @@ else
     LLM_BACKEND="local ($RESOLVED_MODEL)"
 fi
 
-# analyze <prompt> - one model call, empty output on failure so callers stay simple.
+# A failed call used to print nothing, and every check read nothing as clean, so
+# an unreachable or overloaded model passed the gate. Failures are counted here
+# and turn a clean run into SKIPPED (see the summary).
+LLM_FAILURES=$(mktemp)
+trap 'rm -f "$LLM_FAILURES"' EXIT
+# Replies are cached by model and prompt; the prompt holds the whole file, so a
+# rerun on unchanged files makes no model call. Lives in the shared git dir, so
+# all worktrees of a checkout use it.
+# ponytail: never pruned; entries are a few hundred bytes. Prune by age if it grows.
+CACHE_DIR=""
+if git_dir=$(git rev-parse --git-common-dir 2>/dev/null); then
+    CACHE_DIR="$git_dir/quality-gate-cache"
+fi
+
+# analyze <prompt> - one model call; prints the reply, or nothing on failure.
 analyze() {
-    if [ "$LLM_BACKEND" = "gemini" ]; then
-        gemini "$1" 2>&1 || echo ""
-    else
-        printf '%s' "$1" | python3 "$LLM_HELPER" 2>/dev/null || echo ""
+    local key="" reply=""
+    if [ -n "$CACHE_DIR" ]; then
+        # The reviewer is backend + endpoint + model: "local (<model>)" or "gemini",
+        # plus the URL, since one model name can be served by different endpoints.
+        key=$(printf '%s\n%s\n%s' "$LLM_BACKEND" "${MCP_QUALITY_LLM_URL:-}" "$1" \
+            | git hash-object --stdin)
+        # -s, not -f: an empty entry is not an answer.
+        if [ -s "$CACHE_DIR/$key" ]; then
+            cat "$CACHE_DIR/$key"
+            return
+        fi
     fi
+    if [ "$LLM_BACKEND" = "gemini" ]; then
+        reply=$(gemini "$1" 2>/dev/null) || reply=""
+    else
+        reply=$(printf '%s' "$1" | python3 "$LLM_HELPER") || reply=""
+    fi
+    if [ -z "$reply" ]; then
+        echo "failed" >> "$LLM_FAILURES"
+        return
+    fi
+    # Write aside and rename: a gate in another worktree must never read a
+    # half-written entry, and an interrupted write must not leave one behind.
+    if [ -n "$key" ] && mkdir -p "$CACHE_DIR"; then
+        printf '%s\n' "$reply" > "$CACHE_DIR/$key.tmp.$$" \
+            && mv -f "$CACHE_DIR/$key.tmp.$$" "$CACHE_DIR/$key"
+    fi
+    printf '%s\n' "$reply"
 }
 
 if [ "$MODE" = "staged" ]; then
@@ -214,15 +251,22 @@ code_files=$(echo "$changed_files" | grep -c '\.py$' || true)
 # that adds real behavior still needs a test -- see lib/is_cleanup_only.py.
 if [ "$MODE" = "staged" ]; then
     py_diff=$(git diff --cached -- '*.py')
+    full_diff=$(git diff --cached)
 else
     py_diff=$(gh pr diff $PR_NUMBER)
+    full_diff=$(gh pr diff "$PR_NUMBER")
 fi
 cleanup_only=false
 if [ -n "$py_diff" ] && printf '%s' "$py_diff" | python3 "$SCRIPT_DIR/lib/is_cleanup_only.py"; then
     cleanup_only=true
 fi
 
-if [ $code_files -gt 0 ] && [ $test_files -eq 0 ] && [ "$cleanup_only" = false ]; then
+release_bump=false
+if [ -n "$py_diff" ] && printf '%s' "$full_diff" | python3 "$SCRIPT_DIR/lib/is_release_bump.py"; then
+    release_bump=true
+fi
+
+if [ $code_files -gt 0 ] && [ $test_files -eq 0 ] && [ "$cleanup_only" = false ] && [ "$release_bump" = false ]; then
     warnings+=("No test files added/modified despite $code_files code file(s) changed")
     if [ $exit_code -eq 0 ]; then
         exit_code=1
@@ -233,10 +277,14 @@ echo "Test files changed: $test_files"
 if [ $code_files -gt 0 ] && [ "$cleanup_only" = true ]; then
     echo "Cleanup-only change (no added behavior) - test requirement not applied"
 fi
+if [ $code_files -gt 0 ] && [ "$release_bump" = true ]; then
+    echo "Release version bump - test requirement not applied"
+fi
 echo ""
 
 # Check 4: Breaking changes
 echo "=== Check 4: Breaking Changes ==="
+breaking_summary="none detected"
 api_paths=(src/mcp_memory_service/tools src/mcp_memory_service/web/api)
 
 if [ "$MODE" = "staged" ]; then
@@ -265,9 +313,31 @@ Changes:
 $(echo "$api_changes" | head -200)")
 
     if echo "$breaking_result" | grep -q "^BREAKING_CHANGE_DETECTED:"; then
-        warnings+=("Potential breaking changes detected: $breaking_result")
-        if [ $exit_code -eq 0 ]; then
-            exit_code=1
+        # A deliberate breaking change, such as removing a field that an advisory says
+        # leaks data, can be acknowledged (#1311). The finding is still printed, but it
+        # does not block. For a PR, a "Breaking-Change-Acknowledged: <reason>" line in
+        # the PR body or a commit message covers the diff checked here, which is the
+        # whole PR. A staged diff belongs to no commit yet, so an older commit's line
+        # could not say which change it meant: a staged run takes the reason from
+        # BREAKING_CHANGE_ACKNOWLEDGED instead. See lib/breaking_change_ack.py.
+        if [ "$MODE" = "staged" ]; then
+            ack_text=""
+            if [ -n "${BREAKING_CHANGE_ACKNOWLEDGED:-}" ]; then
+                ack_text="Breaking-Change-Acknowledged: $BREAKING_CHANGE_ACKNOWLEDGED"
+            fi
+        else
+            ack_text=$(gh pr view "$PR_NUMBER" --json body,commits \
+                --jq '.body, (.commits[] | .messageHeadline, .messageBody)' 2>/dev/null || echo "")
+        fi
+        if ack_reason=$(printf '%s' "$ack_text" | python3 "$SCRIPT_DIR/lib/breaking_change_ack.py"); then
+            echo "Breaking change acknowledged ($ack_reason), not blocking:"
+            echo "$breaking_result"
+            breaking_summary="acknowledged ($ack_reason)"
+        else
+            warnings+=("Potential breaking changes detected: $breaking_result")
+            if [ $exit_code -eq 0 ]; then
+                exit_code=1
+            fi
         fi
     fi
 else
@@ -309,6 +379,15 @@ fi
 echo "=== Quality Gate Summary ==="
 echo ""
 
+llm_failed=$(wc -l < "$LLM_FAILURES" | tr -d ' ')
+if [ "$llm_failed" -gt 0 ] && [ $exit_code -eq 0 ]; then
+    echo "WARNING: $llm_failed model call(s) got no usable reply (error above, or no reply"
+    echo "   within MCP_QUALITY_LLM_TIMEOUT=${MCP_QUALITY_LLM_TIMEOUT:-600}s)."
+    echo "   Skipped, NOT passed: complexity and security were not fully evaluated."
+    echo "   Rerun when the endpoint is less busy; answered calls are cached."
+    exit $EXIT_SKIPPED
+fi
+
 if [ $exit_code -eq 0 ]; then
     echo "ALL CHECKS PASSED"
     echo ""
@@ -316,7 +395,7 @@ if [ $exit_code -eq 0 ]; then
     echo "- Code complexity: OK"
     echo "- Security scan: OK"
     echo "- Test coverage: OK"
-    echo "- Breaking changes: none detected"
+    echo "- Breaking changes: $breaking_summary"
     # Only claim pyscn passed when it actually ran; --with-pyscn without the tool
     # installed used to print OK for an analysis that never happened.
     if [ "$pyscn_ran" = true ]; then
@@ -339,7 +418,7 @@ All automated checks completed successfully:
 - Code complexity: OK
 - Security scan: OK
 - Test coverage: OK
-- Breaking changes: none detected${pyscn_note}"
+- Breaking changes: ${breaking_summary}${pyscn_note}"
     fi
 
 elif [ $exit_code -eq 2 ]; then

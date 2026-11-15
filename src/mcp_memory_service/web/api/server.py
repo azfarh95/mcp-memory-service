@@ -24,6 +24,8 @@ import time
 import asyncio
 import logging
 import platform
+import importlib.util
+import shutil
 import subprocess
 from typing import Optional, List, Tuple
 from datetime import datetime, timezone
@@ -35,6 +37,8 @@ try:
     from ... import __version__
 except (ImportError, AttributeError):
     __version__ = "0.0.0.dev0"
+
+from ...compat import _sanitize_log_value
 
 # OAuth authentication imports
 from ..oauth.middleware import require_read_access, require_admin_access, AuthenticationResult
@@ -57,11 +61,12 @@ class ServerStatusResponse(BaseModel):
     version: str
     uptime_seconds: float
     uptime_formatted: str
-    pid: int
-    platform: str
-    platform_version: str
-    python_version: str
     timestamp: str
+    # Host details: admin scope only (GHSA-hm53-3f6c-cm5h), None otherwise.
+    pid: Optional[int] = None
+    platform: Optional[str] = None
+    platform_version: Optional[str] = None
+    python_version: Optional[str] = None
 
 
 class VersionCheckResponse(BaseModel):
@@ -173,9 +178,38 @@ def _run_git_command(args: List[str], timeout: int = GIT_TIMEOUT_SECONDS) -> Tup
     return _run_command(['git'] + args, timeout, "Git")
 
 
+def _find_uv() -> Optional[str]:
+    """The uv that launched this server (``uv run`` exports it as ``UV``), else uv on PATH."""
+    uv_path = os.environ.get("UV")
+    if uv_path and os.path.isfile(uv_path):
+        return uv_path
+    return shutil.which("uv")
+
+
+def _pip_command(args: List[str]) -> Optional[Tuple[List[str], str]]:
+    """
+    Return ``(command, tool_name)`` that runs ``pip <args>`` for the running interpreter.
+
+    Prefers ``python -m pip``. Environments created by ``uv venv`` ship without
+    pip, so fall back to ``uv pip``, pinned to ``sys.executable`` (uv would
+    otherwise pick whichever environment it finds). Returns None when neither
+    is available.
+    """
+    if importlib.util.find_spec("pip") is not None:
+        return [sys.executable, '-m', 'pip'] + list(args), "Pip"
+    uv_path = _find_uv()
+    if uv_path:
+        return [uv_path, 'pip'] + list(args[:1]) + ['--python', sys.executable] + list(args[1:]), "uv"
+    return None
+
+
 def _run_pip_command(args: List[str], timeout: int = PIP_TIMEOUT_SECONDS) -> Tuple[str, bool]:
-    """Run a pip command and return output."""
-    return _run_command([sys.executable, '-m', 'pip'] + args, timeout, "Pip")
+    """Run a pip (or ``uv pip``) command for the running interpreter and return output."""
+    resolved = _pip_command(args)
+    if resolved is None:
+        return "Neither pip nor uv was found for the running Python interpreter.", False
+    command, tool_name = resolved
+    return _run_command(command, timeout, tool_name)
 
 
 def _format_uptime(seconds: float) -> str:
@@ -190,31 +224,47 @@ def _format_uptime(seconds: float) -> str:
         return f"{seconds/86400:.1f} days"
 
 
+def _get_restart_args() -> List[str]:
+    """
+    Return command arguments for restarting the server process.
+
+    Rebuilds the command from sys.orig_argv (Python 3.10+) to preserve the
+    original invocation (e.g. `python -m uvicorn ...` and interpreter options),
+    falling back to sys.argv when orig_argv is missing.
+    """
+    orig_argv = getattr(sys, "orig_argv", None)
+    if orig_argv:
+        return [sys.executable] + list(orig_argv[1:])
+    return [sys.executable] + list(sys.argv)
+
+
 async def _restart_server_delayed():
     """Restart the server after a delay to allow HTTP response to complete."""
     await asyncio.sleep(RESTART_DELAY_SECONDS)
 
     logger.warning("AUDIT: Server process restart initiated")
 
+    args = _get_restart_args()
+
     try:
         if sys.platform == 'win32':
             # Windows: Start a new process, then exit
             subprocess.Popen(
-                [sys.executable] + sys.argv,
+                args,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
             )
         else:
             # Linux/Mac: Replace process with execv
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            os.execv(sys.executable, args)
 
         # Exit current process (Windows only reaches here)
         sys.exit(0)
     except PermissionError:
         logger.error("Failed to restart server: insufficient permissions")
     except FileNotFoundError:
-        logger.error(f"Failed to restart server: executable not found: {sys.executable}")
+        logger.error("Failed to restart server: executable not found: %s", _sanitize_log_value(sys.executable))
     except Exception as e:
-        logger.error(f"Failed to restart server: {type(e).__name__} - {e}")
+        logger.error("Failed to restart server: %s - %s", _sanitize_log_value(type(e).__name__), _sanitize_log_value(e))
         sys.exit(1)
 
 
@@ -226,20 +276,27 @@ async def get_server_status(
     """
     Get server status information.
 
-    Returns current version, uptime, process ID, platform details, and Python version.
-    Requires read access.
+    Returns current version and uptime. Requires read access. Process ID,
+    platform, kernel and Python version are host fingerprinting data and are
+    returned to admin callers only (GHSA-hm53-3f6c-cm5h), matching the policy
+    of /api/health/detailed (GHSA-73hc-m4hx-79pj).
     """
     uptime = time.time() - _startup_time
+    host = {}
+    if user.has_scope("admin"):
+        host = dict(
+            pid=os.getpid(),
+            platform=platform.system(),
+            platform_version=platform.version(),
+            python_version=platform.python_version(),
+        )
 
     return ServerStatusResponse(
         version=__version__,
         uptime_seconds=uptime,
         uptime_formatted=_format_uptime(uptime),
-        pid=os.getpid(),
-        platform=platform.system(),
-        platform_version=platform.version(),
-        python_version=platform.python_version(),
-        timestamp=datetime.now(timezone.utc).isoformat()
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        **host,
     )
 
 
@@ -408,11 +465,23 @@ async def update_server(
                 ),
             )
 
+    # Resolve the installer before touching the checkout, so a pip-less env
+    # without uv fails cleanly instead of leaving a pulled-but-not-installed tree.
+    if _pip_command(['install']) is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Neither pip nor uv was found for the running Python interpreter. "
+                "The checkout was NOT changed (git pull was not run). "
+                "Install pip or uv in this environment and retry."
+            ),
+        )
+
     # Step 1: Git pull
     git_output, git_success = _run_git_command(['pull', 'origin', 'main'])
 
     if not git_success:
-        logger.error(f"AUDIT: Server update aborted — git pull failed: {git_output}")
+        logger.error("AUDIT: Server update aborted — git pull failed: %s", _sanitize_log_value(git_output))
         raise HTTPException(
             status_code=500,
             detail=f"Git pull failed: {git_output}",
@@ -422,7 +491,7 @@ async def update_server(
     pip_output, pip_success = _run_pip_command(['install', '-e', '.'])
 
     if not pip_success:
-        logger.error(f"AUDIT: Server update aborted — pip install failed: {pip_output}")
+        logger.error("AUDIT: Server update aborted — pip install failed: %s", _sanitize_log_value(pip_output))
         raise HTTPException(
             status_code=500,
             detail=f"Pip install failed (git pull already succeeded — repository is at the new revision but dependencies are not installed): {pip_output}",

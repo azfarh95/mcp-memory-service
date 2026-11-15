@@ -9,53 +9,50 @@ import traceback
 import asyncio
 from collections import Counter
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Sequence, Set, Tuple
 
 try:
     from sqlite_vec import serialize_float32
 except ImportError:
+    # Optional at import time only: initialize() calls _check_dependencies(),
+    # which raises when sqlite-vec is missing, so serialize_float32 is never
+    # reached unbound.
     pass
 
 from ...models.memory import Memory, MemoryQueryResult
+from ..read_policy import should_raise_read_error
 
 logger = logging.getLogger(__name__)
+
+# SQLite caps host parameters per statement (SQLITE_MAX_VARIABLE_NUMBER, historically 999).
+# The other IN-clause call sites in this package chunk at the same width.
+_IN_CLAUSE_CHUNK = 999
 
 # Module-level constants
 _SQLITE_VEC_MAX_KNN_K = 4096
 _MAX_TAG_SEARCH_CANDIDATES = _SQLITE_VEC_MAX_KNN_K
 _MAX_TAGS_FOR_SEARCH = 100
 
-# Bounds concurrent embedding work handed to worker threads. Local encode is
-# GIL-bound and Voyage is rate-limited, so a cap helps rather than hurts.
-# Attached TO the loop rather than held in a module dict: a Semaphore caches a
-# strong ref to its loop on first use, so a WeakKeyDictionary keyed by loop would
-# hold value -> loop -> key and never collect (review round 5). Lifetime now
-# follows the loop exactly.
-_EMBED_SEMAPHORE_LIMIT = 4
-_FALLBACK_EMBED_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
+from ...compat import _sanitize_log_value
 
-def _embed_semaphore() -> asyncio.Semaphore:
-    loop = asyncio.get_running_loop()
-    sem = getattr(loop, "_memory_embed_semaphore", None)
-    if sem is None:
-        sem = asyncio.Semaphore(_EMBED_SEMAPHORE_LIMIT)
-        try:
-            loop._memory_embed_semaphore = sem
-        except AttributeError:
-            # A loop implementation without a __dict__ (e.g. uvloop). Fall back to
-            # a module-level single semaphore: correct on the single-loop servers
-            # this service runs, and never raises inside retrieve's except (which
-            # would degrade every search to a silent []).
-            global _FALLBACK_EMBED_SEMAPHORE
-            if _FALLBACK_EMBED_SEMAPHORE is None:
-                _FALLBACK_EMBED_SEMAPHORE = sem
-            sem = _FALLBACK_EMBED_SEMAPHORE
-    return sem
+def _empty_graph_visualization(limit: int, min_connections: int) -> Dict[str, Any]:
+    """Empty graph payload including the "meta" key the API response requires.
 
-
-def _sanitize_log_value(value: object) -> str:
-    return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
+    The /api/analytics/graph-visualization response model has meta as a
+    required field, so an error path returning only nodes/edges surfaces as a
+    500 rather than an empty graph.
+    """
+    return {
+        "nodes": [],
+        "edges": [],
+        "meta": {
+            "total_nodes": 0,
+            "total_edges": 0,
+            "min_connections": min_connections,
+            "limit": limit,
+        },
+    }
 
 
 def _escape_like(value: str) -> str:
@@ -65,8 +62,15 @@ def _escape_like(value: str) -> str:
 class RetrieveMixin:
     """Mixin providing memory retrieval and search operations."""
 
-    async def retrieve(self, query: str, n_results: int = 5, tags: Optional[List[str]] = None, min_confidence: float = 0.0, include_superseded: bool = False, start_time: Optional[float] = None, end_time: Optional[float] = None, store: Optional[str] = 'default') -> List[MemoryQueryResult]:
-        """Retrieve memories using semantic search."""
+    async def retrieve(self, query: str, n_results: int = 5, tags: Optional[List[str]] = None, min_confidence: float = 0.0, include_superseded: bool = False, start_time: Optional[float] = None, end_time: Optional[float] = None, store: Optional[str] = 'default', as_of: Optional[float] = None) -> List[MemoryQueryResult]:
+        """Retrieve memories using semantic search.
+
+        as_of (epoch seconds, issue #1724): point-in-time query with
+        knowledge-time semantics — return memories with created_at <= as_of
+        that had not yet been superseded at as_of. Rows superseded before
+        migration 021 have no superseded_at; their replacement moment is
+        approximated with the successor's created_at.
+        """
         try:
             if not self.conn:
                 logger.error("Database not initialized")
@@ -74,23 +78,11 @@ class RetrieveMixin:
 
             if not self.embedding_model:
                 logger.warning("No embedding model available, cannot perform semantic search")
-                # Record the cause: callers distinguish "no matches" from "embedder
-                # unavailable" only by this signal (review round 2, 2026-11-15).
                 self._record_embedding_failure("No embedding model available")
                 return []
 
             try:
-                # Off the event loop: the Voyage adapter does blocking HTTP with
-                # retries, so calling it inline would stall every other coroutine
-                # for the whole backoff (review round 2, 2026-11-15). Deliberately
-                # NOT self._run_in_thread — that holds _conn_lock, which network
-                # I/O must never hold. The semaphore bounds thread fan-out: encode
-                # is GIL-bound on the local model, so unlimited workers only add
-                # contention (review round 3).
-                async with _embed_semaphore():
-                    query_embedding = await asyncio.to_thread(
-                        self._generate_embedding, query, "query"
-                    )
+                query_embedding = self._generate_embedding(query, input_type="query")
             except Exception as e:
                 logger.error("Failed to generate query embedding: %s", _sanitize_log_value(e))
                 return []
@@ -117,6 +109,7 @@ class RetrieveMixin:
 
             def search_memories():
                 tag_conditions = ""
+                tag_params: list = []
                 params = [serialize_float32(query_embedding), k_value]
 
                 # Add store filter to vec0 query
@@ -133,9 +126,9 @@ class RetrieveMixin:
                             continue
                         stripped = tag.strip()
                         tag_clauses.append(
-                            "(',' || REPLACE(m.tags, ' ', '') || ',') LIKE ? ESCAPE '\\'"
+                            "(',' || m.tags || ',') LIKE ? ESCAPE '\\'"
                         )
-                        params.append(f"%,{_escape_like(stripped.replace(' ', ''))},%")
+                        tag_params.append(f"%,{_escape_like(stripped)},%")
 
                     if not tag_clauses:
                         logger.warning("Tag filter provided but contained no valid tags. Returning empty results.")
@@ -143,20 +136,50 @@ class RetrieveMixin:
 
                     tag_conditions = " AND (" + " OR ".join(tag_clauses) + ")"
 
-                superseded_filter = "" if include_superseded else " AND (m.superseded_by IS NULL OR m.superseded_by = '')"
+                # Issue #1724: point-in-time predicate. A memory is visible at
+                # as_of when it already existed (created_at <= as_of) and its
+                # supersede — if any — happened strictly after as_of. The
+                # supersede moment is superseded_at when known (migration 021),
+                # otherwise approximated by the successor's created_at. When
+                # as_of is given it subsumes the plain superseded_filter: rows
+                # superseded after as_of were still current then.
+                as_of_params: list = []
+                as_of_filter = ""
+                if as_of is not None:
+                    as_of_filter = (
+                        " AND m.created_at <= ?"
+                        " AND (m.superseded_by IS NULL OR m.superseded_by = ''"
+                        " OR COALESCE(m.superseded_at,"
+                        " (SELECT s.created_at FROM memories s WHERE s.content_hash = m.superseded_by AND s.deleted_at IS NULL)) > ?)"
+                    )
+                    as_of_params = [as_of, as_of]
+
+                superseded_filter = ""
+                if as_of is None and not include_superseded:
+                    superseded_filter = " AND (m.superseded_by IS NULL OR m.superseded_by = '')"
 
                 time_conditions = ""
+                time_params: list = []
                 if start_time is not None:
                     time_conditions += " AND m.created_at >= ?"
-                    params.append(start_time)
+                    time_params.append(start_time)
                 if end_time is not None:
                     time_conditions += " AND m.created_at <= ?"
-                    params.append(end_time)
+                    time_params.append(end_time)
+
+                # Params must follow the placeholder order in the SQL below:
+                # MATCH, k, store, as_of..., tags..., time...
+                params.extend(as_of_params)
+                params.extend(tag_params)
+                params.extend(time_params)
 
                 sql = f'''
                     SELECT m.content_hash, m.content, m.tags, m.memory_type, m.metadata,
                            m.created_at, m.updated_at, m.created_at_iso, m.updated_at_iso,
-                           e.distance
+                           e.distance, m.superseded_by, m.superseded_at,
+                           COALESCE(m.superseded_at,
+                                    (SELECT s.created_at FROM memories s WHERE s.content_hash = m.superseded_by AND s.deleted_at IS NULL)
+                           ) AS eff_superseded_at
                     FROM memories m
                     INNER JOIN (
                         SELECT rowid, distance
@@ -164,7 +187,7 @@ class RetrieveMixin:
                         WHERE content_embedding MATCH ? AND k = ?{store_condition}
                           AND rowid IN (
                               SELECT m.id FROM memories m
-                              WHERE m.deleted_at IS NULL{superseded_filter}{tag_conditions}{time_conditions}
+                              WHERE m.deleted_at IS NULL AND (m.embedding_pending IS NULL OR m.embedding_pending = 0){superseded_filter}{as_of_filter}{tag_conditions}{time_conditions}
                           )
                     ) e ON m.id = e.rowid
                     ORDER BY e.distance
@@ -187,7 +210,13 @@ class RetrieveMixin:
             for row in search_results:
                 try:
                     content_hash, content, tags_str, memory_type, metadata_str = row[:5]
-                    created_at, updated_at, created_at_iso, updated_at_iso, distance = row[5:]
+                    created_at, updated_at, created_at_iso, updated_at_iso, distance = row[5:10]
+                    # Issue #1724: supersession lineage for status flags. The
+                    # effective replacement moment is exact for rows superseded
+                    # after migration 021, approximated via the successor's
+                    # created_at for older rows.
+                    superseded_by, _superseded_at_raw, eff_superseded_at = row[10:13]
+                    superseded_by = superseded_by or None
 
                     tags_list = [tag.strip() for tag in tags_str.split(",") if tag.strip()] if tags_str else []
                     metadata = self._safe_json_loads(metadata_str, "memory_metadata")
@@ -216,6 +245,8 @@ class RetrieveMixin:
                     results.append(MemoryQueryResult(
                         memory=memory,
                         relevance_score=relevance_score,
+                        superseded_by=superseded_by,
+                        superseded_at=eff_superseded_at,
                         debug_info={
                             "distance": distance,
                             "backend": "sqlite-vec",
@@ -240,7 +271,8 @@ class RetrieveMixin:
                 ][:n_results]
                 logger.debug("min_confidence=%s filtered %s stale memories", _sanitize_log_value(min_confidence), before - len(results))
 
-            logger.info(f"Retrieved {len(results)} memories for query: {_sanitize_log_value(query)}")
+            # DEBUG: the query is the user's prompt text, and this runs on every recall
+            logger.debug(f"Retrieved {len(results)} memories for query: {_sanitize_log_value(query)}")
             return results
 
         except Exception as e:
@@ -248,8 +280,12 @@ class RetrieveMixin:
             logger.error(traceback.format_exc())
             return []
 
-    async def search_by_tag(self, tags: List[str], time_start: Optional[float] = None) -> List[Memory]:
-        """Search memories by tags with optional time filtering."""
+    async def search_by_tag(self, tags: List[str], time_start: Optional[float] = None, include_superseded: bool = True) -> List[Memory]:
+        """Search memories by tags with optional time filtering.
+
+        include_superseded=False hides rows replaced by a newer version, as
+        retrieve() does (#1803); default True keeps them for internal callers.
+        """
         try:
             if not self.conn:
                 logger.error("Database not initialized")
@@ -259,10 +295,12 @@ class RetrieveMixin:
                 return []
 
             stripped_tags = [tag.strip() for tag in tags]
-            tag_conditions = " OR ".join(["(',' || REPLACE(tags, ' ', '') || ',') LIKE ? ESCAPE '\\'" for _ in stripped_tags])
+            tag_conditions = " OR ".join(["(',' || tags || ',') LIKE ? ESCAPE '\\'" for _ in stripped_tags])
             tag_params = [f"%,{_escape_like(tag)},%" for tag in stripped_tags]
 
-            where_clause = f"WHERE ({tag_conditions}) AND deleted_at IS NULL"
+            where_clause = f"WHERE ({tag_conditions}) AND deleted_at IS NULL AND (embedding_pending IS NULL OR embedding_pending = 0)"
+            if not include_superseded:
+                where_clause += " AND (superseded_by IS NULL OR superseded_by = '')"
             if time_start is not None:
                 where_clause += " AND created_at >= ?"
                 tag_params.append(time_start)
@@ -319,9 +357,19 @@ class RetrieveMixin:
         tags: List[str],
         operation: str = "AND",
         time_start: Optional[float] = None,
-        time_end: Optional[float] = None
+        time_end: Optional[float] = None,
+        include_pending: bool = False,
+        include_superseded: bool = True,
     ) -> List[Memory]:
-        """Search memories by tags with AND/OR operation and optional time filtering."""
+        """Search memories by tags with AND/OR operation and optional time filtering.
+
+        include_pending=True keeps embedding_pending rows — used by hybrid DELETE paths that
+        collect hashes to queue for the secondary backend (a pending row deleted on the primary
+        must still be queued for deletion remotely, or other devices keep the copy — Greptile P1).
+        Default False excludes pending (this is a SEARCH surface for users).
+        include_superseded=False hides rows replaced by a newer version (#1803);
+        default True keeps them for the delete and maintenance callers.
+        """
         try:
             if not self.conn:
                 logger.error("Database not initialized")
@@ -337,11 +385,14 @@ class RetrieveMixin:
 
             stripped_tags = [tag.strip() for tag in tags]
             comparator = " AND " if normalized_operation == "AND" else " OR "
-            tag_conditions = comparator.join(["(',' || REPLACE(tags, ' ', '') || ',') LIKE ? ESCAPE '\\'" for _ in stripped_tags])
+            tag_conditions = comparator.join(["(',' || tags || ',') LIKE ? ESCAPE '\\'" for _ in stripped_tags])
             tag_params = [f"%,{_escape_like(tag)},%" for tag in stripped_tags]
 
             where_conditions = [f"({tag_conditions})"] if tag_conditions else []
-            where_conditions.append("deleted_at IS NULL")
+            pending_pred = "" if include_pending else " AND (embedding_pending IS NULL OR embedding_pending = 0)"
+            where_conditions.append(f"deleted_at IS NULL{pending_pred}")
+            if not include_superseded:
+                where_conditions.append("(superseded_by IS NULL OR superseded_by = '')")
             if time_start is not None:
                 where_conditions.append("created_at >= ?")
                 tag_params.append(time_start)
@@ -408,7 +459,7 @@ class RetrieveMixin:
                 return []
 
             stripped_tags = [tag.strip() for tag in tags]
-            tag_conditions = " OR ".join(["(',' || REPLACE(tags, ' ', '') || ',') LIKE ? ESCAPE '\\'" for _ in stripped_tags])
+            tag_conditions = " OR ".join(["(',' || tags || ',') LIKE ? ESCAPE '\\'" for _ in stripped_tags])
             tag_params = [f"%,{_escape_like(tag)},%" for tag in stripped_tags]
 
             query = f"""
@@ -416,7 +467,7 @@ class RetrieveMixin:
                        created_at, updated_at, created_at_iso, updated_at_iso
                 FROM memories
                 WHERE ({tag_conditions})
-                AND deleted_at IS NULL
+                AND deleted_at IS NULL AND (embedding_pending IS NULL OR embedding_pending = 0)
                 ORDER BY created_at DESC
             """
 
@@ -467,18 +518,33 @@ class RetrieveMixin:
             logger.error(traceback.format_exc())
             return []
 
-    async def get_by_hash(self, content_hash: str) -> Optional[Memory]:
-        """Get a memory by its content hash."""
+    async def get_by_hash(self, content_hash: str, store: Optional[str] = None) -> Optional[Memory]:
+        """Get a memory by its content hash.
+
+        When ``store`` is provided the lookup is scoped to that partition, so a
+        hash belonging to another store is reported as missing. ``None`` keeps
+        the historical unscoped lookup.
+        """
         try:
             if not self.conn:
                 return None
 
             def _get_by_hash():
-                cursor = self.conn.execute('''
+                # Direct lookup by exact hash is NOT a discovery/search surface, so it does
+                # NOT apply the embedding_pending guardrail (§8.3 excludes pending from
+                # SEARCH, not from a caller that already knows the hash). Internal sync/
+                # metadata-repair paths rely on this seeing pending rows; filtering here made
+                # them treat a pending memory as missing and skip the repair (Greptile P1).
+                sql = '''
                     SELECT content_hash, content, tags, memory_type, metadata,
                            created_at, updated_at, created_at_iso, updated_at_iso
                     FROM memories WHERE content_hash = ? AND deleted_at IS NULL
-                ''', (content_hash,))
+                '''
+                lookup_params = [content_hash]
+                if store is not None:
+                    sql += " AND store = ?"
+                    lookup_params.append(store)
+                cursor = self.conn.execute(sql, tuple(lookup_params))
                 return cursor.fetchone()
 
             row = await self._execute_with_retry(_get_by_hash)
@@ -529,21 +595,43 @@ class RetrieveMixin:
             logger.error("Failed to get all content hashes: %s", _sanitize_log_value(e))
             return set()
 
-    async def get_by_exact_content(self, content: str) -> List[Memory]:
-        """Retrieve memories by exact content match."""
+    async def list_content_hashes_page(self, after_id: int = 0, limit: int = 1000, include_deleted: bool = False) -> "List[Tuple[int, str]]":
+        """Cursor-paginated (id ASC, id > after_id) list of (id, content_hash)."""
+        try:
+            if not self.conn:
+                return []
+            def _page():
+                if include_deleted:
+                    sql = 'SELECT id, content_hash FROM memories WHERE id > ? ORDER BY id ASC LIMIT ?'
+                else:
+                    sql = 'SELECT id, content_hash FROM memories WHERE deleted_at IS NULL AND id > ? ORDER BY id ASC LIMIT ?'
+                return self.conn.execute(sql, (after_id, limit)).fetchall()
+            rows = await self._execute_with_retry(_page)
+            return [(row[0], row[1]) for row in rows]
+        except Exception as e:
+            logger.error('list_content_hashes_page failed: %s', _sanitize_log_value(e))
+            raise
+
+    async def get_by_exact_content(self, content: str, store: Optional[str] = None) -> List[Memory]:
+        """Retrieve memories by exact content match. Scoped to store partition when given (#1466)."""
         try:
             if not self.conn:
                 return []
 
             def _get_by_exact_content():
-                cursor = self.conn.execute('''
+                sql = '''
                     SELECT content, tags, memory_type, metadata, content_hash,
                            created_at, created_at_iso, updated_at, updated_at_iso
                     FROM memories
-                    WHERE content LIKE '%' || ? || '%' COLLATE NOCASE
-                    AND deleted_at IS NULL
-                    ORDER BY created_at DESC
-                ''', (content,))
+                    WHERE content LIKE '%' || ? || '%' ESCAPE '\\' COLLATE NOCASE
+                    AND deleted_at IS NULL AND (embedding_pending IS NULL OR embedding_pending = 0)
+                '''
+                params = [_escape_like(content)]
+                if store is not None:
+                    sql += ' AND store = ?'
+                    params.append(store)
+                sql += ' ORDER BY created_at DESC'
+                cursor = self.conn.execute(sql, tuple(params))
                 return cursor.fetchall()
 
             memories = []
@@ -573,6 +661,45 @@ class RetrieveMixin:
             logger.error("Error in exact content match: %s", _sanitize_log_value(e))
             return []
 
+    async def _get_supersession_map(
+        self, content_hashes: list, store: Optional[str] = None
+    ) -> Dict[str, Tuple[Optional[str], Optional[float]]]:
+        """SQLite implementation of the batched supersession-lineage lookup (issue #1724).
+
+        Returns content_hash -> (superseded_by, effective superseded_at), where
+        the effective time is superseded_at when known (migration 021), else
+        the successor's created_at. Deleted rows and deleted successors are
+        excluded (repository rule: successor lookups must be live-row only).
+        """
+        mapping: Dict[str, Tuple[Optional[str], Optional[float]]] = {}
+        if not content_hashes or not self.conn:
+            return mapping
+        try:
+            for batch_start in range(0, len(content_hashes), 999):
+                batch = content_hashes[batch_start:batch_start + 999]
+                placeholders = ",".join("?" for _ in batch)
+                store_pred = " AND m.store = ?" if store is not None else ""
+                params = list(batch) + ([store] if store is not None else [])
+
+                def _lookup(ph=placeholders, sp=store_pred, p=tuple(params)):
+                    return self.conn.execute(
+                        "SELECT m.content_hash, m.superseded_by, "
+                        "COALESCE(m.superseded_at, (SELECT s.created_at FROM memories s "
+                        "WHERE s.content_hash = m.superseded_by AND s.deleted_at IS NULL)) "
+                        f"FROM memories m WHERE m.content_hash IN ({ph}) "
+                        f"AND m.deleted_at IS NULL{sp}",
+                        p,
+                    ).fetchall()
+
+                for h, sup_by, sup_at in await self._execute_with_retry(_lookup):
+                    mapping[h] = (sup_by or None, sup_at)
+        except Exception as e:
+            logger.warning(
+                "Supersession lineage lookup failed, continuing without: %s",
+                _sanitize_log_value(str(e)),
+            )
+        return mapping
+
     async def get_all_memories(
         self,
         limit: int = None,
@@ -583,8 +710,18 @@ class RetrieveMixin:
         stale_days: Optional[int] = None,
         include_embeddings: bool = False,
         store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
+        exclude_pending: bool = False,
+        include_superseded: bool = True,
     ) -> List[Memory]:
-        """Get all memories in storage ordered by creation time (newest first)."""
+        """Get all memories in storage ordered by creation time (newest first).
+
+        exclude_pending=True hides embedding_pending rows — use it when this method
+        backs a SEARCH surface (e.g. the /search/by-tag endpoint). Default False keeps
+        the full listing for sync/reconciliation/export paths (they must see pending).
+        include_superseded=False hides rows replaced by a newer version, as
+        retrieve() does (#1803); default True keeps them for the same paths.
+        """
         try:
             await self.initialize()
 
@@ -601,6 +738,12 @@ class RetrieveMixin:
 
             where_conditions.append('m.deleted_at IS NULL')
 
+            if exclude_pending:
+                where_conditions.append('(m.embedding_pending IS NULL OR m.embedding_pending = 0)')
+
+            if not include_superseded:
+                where_conditions.append("(m.superseded_by IS NULL OR m.superseded_by = '')")
+
             if store is not None:
                 where_conditions.append('m.store = ?')
                 params.append(store)
@@ -614,12 +757,18 @@ class RetrieveMixin:
                 joiner = " AND " if tag_match == "all" else " OR "
                 tag_conditions = joiner.join(
                     [
-                        "(',' || REPLACE(m.tags, ' ', '') || ',') LIKE ? ESCAPE '\\'"
+                        "(',' || m.tags || ',') LIKE ? ESCAPE '\\'"
                         for _ in stripped_tags
                     ]
                 )
                 where_conditions.append(f"({tag_conditions})")
                 params.extend([f"%,{_escape_like(tag)},%" for tag in stripped_tags])
+
+            if agent_id is not None:
+                where_conditions.append(
+                    "(json_extract(m.metadata,'$.agent_id') = ? OR (',' || m.tags || ',') LIKE ? ESCAPE '\\')"
+                )
+                params.extend([agent_id, f"%,agent:{_escape_like(agent_id.strip())},%"])
 
             self._apply_stale_days_filter(where_conditions, params, stale_days, table_alias="m")
 
@@ -648,6 +797,26 @@ class RetrieveMixin:
 
         except Exception as e:
             logger.error("Error getting all memories: %s", _sanitize_log_value(e))
+            if should_raise_read_error():
+                raise
+            return []
+
+    async def get_stores(self) -> List[str]:
+        """Name of every store with at least one live memory, in name order."""
+        try:
+            await self.initialize()
+
+            def _get_stores():
+                cursor = self.conn.execute(
+                    "SELECT DISTINCT COALESCE(store, 'default') FROM memories "
+                    "WHERE deleted_at IS NULL ORDER BY 1"
+                )
+                return [row[0] for row in cursor.fetchall()]
+
+            return await self._execute_with_retry(_get_stores)
+
+        except Exception as e:
+            logger.error("Error listing stores: %s", _sanitize_log_value(e))
             return []
 
     async def get_recent_memories(self, n: int = 10) -> List[Memory]:
@@ -695,33 +864,33 @@ class RetrieveMixin:
             logger.error("Error getting largest memories: %s", _sanitize_log_value(e))
             return []
 
-    async def get_memory_timestamps(self, days: Optional[int] = None) -> List[float]:
-        """Get memory creation timestamps only, without loading full memory objects."""
+    async def get_memory_timestamps(self, days: Optional[int] = None, store: Optional[str] = None) -> List[float]:
+        """Get memory creation timestamps only, without loading full memory objects.
+
+        When ``store`` is provided, timestamps are limited to that partition.
+        """
         try:
             await self.initialize()
 
             def _get_timestamps():
+                conditions = ["deleted_at IS NULL"]
+                ts_params: List[Any] = []
                 if days is not None:
                     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-                    cutoff_timestamp = cutoff.timestamp()
-                    cursor = self.conn.execute(
-                        """
-                        SELECT created_at
-                        FROM memories
-                        WHERE created_at >= ? AND deleted_at IS NULL
-                        ORDER BY created_at DESC
-                        """,
-                        (cutoff_timestamp,)
-                    )
-                else:
-                    cursor = self.conn.execute(
-                        """
-                        SELECT created_at
-                        FROM memories
-                        WHERE deleted_at IS NULL
-                        ORDER BY created_at DESC
-                        """
-                    )
+                    conditions.append("created_at >= ?")
+                    ts_params.append(cutoff.timestamp())
+                if store is not None:
+                    conditions.append("store = ?")
+                    ts_params.append(store)
+                cursor = self.conn.execute(
+                    """
+                    SELECT created_at
+                    FROM memories
+                    WHERE """ + " AND ".join(conditions) + """
+                    ORDER BY created_at DESC
+                    """,
+                    tuple(ts_params),
+                )
                 return cursor.fetchall()
 
             rows = await self._execute_with_retry(_get_timestamps)
@@ -733,8 +902,17 @@ class RetrieveMixin:
             logger.error("Error getting memory timestamps: %s", _sanitize_log_value(e))
             return []
 
-    async def count_all_memories(self, memory_type: Optional[str] = None, tags: Optional[List[str]] = None, tag_match: str = "any", stale_days: Optional[int] = None, store: Optional[str] = "default") -> int:
-        """Get total count of memories in storage."""
+    async def count_all_memories(
+        self,
+        memory_type: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        tag_match: str = "any",
+        stale_days: Optional[int] = None,
+        store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
+        include_superseded: bool = True,
+    ) -> int:
+        """Count memories, preserving read errors during destructive maintenance."""
         try:
             await self.initialize()
 
@@ -754,14 +932,23 @@ class RetrieveMixin:
                 joiner = " AND " if tag_match == "all" else " OR "
                 tag_conditions = joiner.join(
                     [
-                        "(',' || REPLACE(tags, ' ', '') || ',') LIKE ? ESCAPE '\\'"
+                        "(',' || tags || ',') LIKE ? ESCAPE '\\'"
                         for _ in stripped_tags
                     ]
                 )
                 conditions.append(f"({tag_conditions})")
                 params.extend([f"%,{_escape_like(tag)},%" for tag in stripped_tags])
 
+            if agent_id is not None:
+                conditions.append(
+                    "(json_extract(metadata,'$.agent_id') = ? OR (',' || tags || ',') LIKE ? ESCAPE '\\')"
+                )
+                params.extend([agent_id, f"%,agent:{_escape_like(agent_id.strip())},%"])
+
             self._apply_stale_days_filter(conditions, params, stale_days)
+
+            if not include_superseded:
+                conditions.append("(superseded_by IS NULL OR superseded_by = '')")
 
             conditions.append('deleted_at IS NULL')
             count_query = 'SELECT COUNT(*) FROM memories WHERE ' + ' AND '.join(conditions)
@@ -776,19 +963,29 @@ class RetrieveMixin:
 
         except Exception as e:
             logger.error("Error counting memories: %s", _sanitize_log_value(e))
+            if should_raise_read_error():
+                raise
             return 0
 
-    async def get_all_tags_with_counts(self) -> List[Dict[str, Any]]:
-        """Get all tags with their usage counts."""
+    async def get_all_tags_with_counts(self, store: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get all tags with their usage counts.
+
+        When ``store`` is provided, counts are limited to that partition.
+        """
         try:
             await self.initialize()
 
             def _get_tags():
-                cursor = self.conn.execute('''
+                sql = '''
                     SELECT tags
                     FROM memories
                     WHERE tags IS NOT NULL AND tags != '' AND deleted_at IS NULL
-                ''')
+                '''
+                if store is not None:
+                    sql += " AND store = ?"
+                    cursor = self.conn.execute(sql, (store,))
+                else:
+                    cursor = self.conn.execute(sql)
                 return cursor.fetchall()
 
             rows = await self._execute_with_retry(_get_tags)
@@ -847,15 +1044,36 @@ class RetrieveMixin:
     async def get_graph_visualization_data(
         self,
         limit: int = 100,
-        min_connections: int = 1
+        min_connections: int = 1,
+        store: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Get graph data for visualization in D3.js-compatible format."""
+        """Get graph data for visualization in D3.js-compatible format.
+
+        When ``store`` is provided the node selection (including ``limit``) is
+        restricted to that partition, so another store's densely connected
+        nodes cannot crowd out the requested scope.
+        """
         try:
             if not self.conn:
                 logger.error("Database not initialized")
-                return {"nodes": [], "edges": []}
+                return _empty_graph_visualization(limit, min_connections)
 
             def _get_graph_nodes():
+                node_params = []
+                target_join = """
+                    INNER JOIN memories target
+                      ON target.content_hash = mg.target_hash
+                     AND target.deleted_at IS NULL
+                """
+                if store is not None:
+                    target_join += " AND target.store = ?"
+                    node_params.append(store)
+
+                store_filter = ""
+                if store is not None:
+                    store_filter = " AND m.store = ?"
+                    node_params.append(store)
+                node_params.extend([min_connections, limit])
                 cursor = self.conn.execute("""
                     SELECT
                         m.content_hash,
@@ -868,6 +1086,7 @@ class RetrieveMixin:
                         COUNT(DISTINCT mg.target_hash) as connection_count
                     FROM memories m
                     INNER JOIN memory_graph mg ON m.content_hash = mg.source_hash
+                """ + target_join + """
                     WHERE m.deleted_at IS NULL
                       -- has_entity rows point at an entity NAME, not a memory
                       -- hash, so the edge loop below always drops them. Counting
@@ -878,11 +1097,12 @@ class RetrieveMixin:
                       -- would silently drop those rows instead of keeping them. The
                       -- edge loop already reads NULL as 'related'.
                       AND COALESCE(mg.relationship_type, 'related') != 'has_entity'
+                """ + store_filter + """
                     GROUP BY m.content_hash
                     HAVING connection_count >= ?
                     ORDER BY connection_count DESC
                     LIMIT ?
-                """, (min_connections, limit))
+                """, tuple(node_params))
                 return cursor.fetchall()
 
             nodes = []
@@ -962,10 +1182,10 @@ class RetrieveMixin:
 
         except sqlite3.Error as e:
             logger.error("Database error getting graph visualization data: %s", _sanitize_log_value(e))
-            return {"nodes": [], "edges": []}
+            return _empty_graph_visualization(limit, min_connections)
         except Exception as e:
             logger.error("Unexpected error getting graph visualization data: %s", _sanitize_log_value(e))
-            return {"nodes": [], "edges": []}
+            return _empty_graph_visualization(limit, min_connections)
 
     async def get_stats(self) -> Dict[str, Any]:
         """Get storage statistics."""
@@ -1034,7 +1254,7 @@ class RetrieveMixin:
 
         return json.dumps(tags)
 
-    async def recall(self, query: Optional[str] = None, n_results: int = 5, start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None) -> List[MemoryQueryResult]:
+    async def recall(self, query: Optional[str] = None, n_results: int = 5, start_timestamp: Optional[float] = None, end_timestamp: Optional[float] = None, store: Optional[str] = None) -> List[MemoryQueryResult]:
         """Retrieve memories with combined time filtering and optional semantic search."""
         try:
             if not self.conn:
@@ -1061,9 +1281,19 @@ class RetrieveMixin:
                     query_embedding = self._generate_embedding(query, input_type="query")
 
                     # Filter eligible rows inside KNN so excluded neighbors do not consume k.
-                    memory_filter = "deleted_at IS NULL"
+                    memory_filter = "deleted_at IS NULL AND (embedding_pending IS NULL OR embedding_pending = 0)"
                     if time_where:
                         memory_filter += f" AND {time_where}"
+                    # recall() is a retrieval path, so it must hide superseded
+                    # rows exactly like retrieve() does. mark_superseded_batch()
+                    # only writes the column, so this cannot be filtered later.
+                    memory_filter += " AND (superseded_by IS NULL OR superseded_by = '')"
+                    filter_params = list(params)
+                    if store is not None:
+                        # Scope the KNN candidates to the requested partition so
+                        # another store's hits cannot consume the k budget.
+                        memory_filter += " AND store = ?"
+                        filter_params.append(store)
 
                     base_query = f'''
                         SELECT m.content_hash, m.content, m.tags, m.memory_type, m.metadata,
@@ -1080,7 +1310,7 @@ class RetrieveMixin:
 
                     base_query += " ORDER BY e.distance"
 
-                    query_params = [serialize_float32(query_embedding), n_results] + params
+                    query_params = [serialize_float32(query_embedding), n_results] + filter_params
 
                     def _recall_semantic(bq=base_query, qp=query_params):
                         cursor = self.conn.execute(bq, qp)
@@ -1135,21 +1365,27 @@ class RetrieveMixin:
                     logger.error("Error in semantic search with time filter: %s", _sanitize_log_value(query_error))
                     logger.info("Falling back to time-based retrieval")
 
+            where_parts = ["deleted_at IS NULL", "(embedding_pending IS NULL OR embedding_pending = 0)"]
+            if time_where:
+                where_parts.append(time_where)
+            # Keep the time-only branch consistent with the semantic one: a
+            # superseded memory is not a current answer either way.
+            where_parts.append("(superseded_by IS NULL OR superseded_by = '')")
+            tail_params = list(params)
+            if store is not None:
+                where_parts.append("store = ?")
+                tail_params.append(store)
+
             base_query = '''
                 SELECT content_hash, content, tags, memory_type, metadata,
                        created_at, updated_at, created_at_iso, updated_at_iso
                 FROM memories
+                WHERE ''' + " AND ".join(where_parts) + '''
+                ORDER BY created_at DESC LIMIT ?
             '''
+            tail_params.append(n_results)
 
-            if time_where:
-                base_query += f" WHERE deleted_at IS NULL AND {time_where}"
-            else:
-                base_query += " WHERE deleted_at IS NULL"
-
-            base_query += " ORDER BY created_at DESC LIMIT ?"
-            params.append(n_results)
-
-            def _recall_timebased(bq=base_query, p=params):
+            def _recall_timebased(bq=base_query, p=tuple(tail_params)):
                 cursor = self.conn.execute(bq, p)
                 return cursor.fetchall()
 
@@ -1199,32 +1435,49 @@ class RetrieveMixin:
         start_time: float,
         end_time: float,
         include_embeddings: bool = False,
+        exclude_pending: bool = False,
+        store: Optional[str] = None,
     ) -> List[Memory]:
-        """Get memories within a specific time range."""
+        """Get memories within a specific time range. Scoped to store partition when given (#1466).
+
+        exclude_pending=True drops rows with embedding_pending=1, so a possibly-stale
+        vector is never served as consistent (ADR-0016). Default False preserves the full
+        set for internal callers that must see every row (delete, consolidation). The
+        public search path (search_memories, time-only) passes True.
+        """
         try:
             await self.initialize()
 
+            pending_pred = " AND (m.embedding_pending IS NULL OR m.embedding_pending = 0)" if exclude_pending else ""
+            pending_pred_nojoin = " AND (embedding_pending IS NULL OR embedding_pending = 0)" if exclude_pending else ""
+
+            store_pred = " AND m.store = ?" if store is not None else ""
+            store_pred_nojoin = " AND store = ?" if store is not None else ""
+
             if include_embeddings:
-                sql = '''
+                sql = f'''
                     SELECT m.content_hash, m.content, m.tags, m.memory_type, m.metadata,
                            m.created_at, m.updated_at, m.created_at_iso, m.updated_at_iso,
                            e.content_embedding
                     FROM memories m
                     LEFT JOIN memory_embeddings e ON m.id = e.rowid
-                    WHERE m.created_at BETWEEN ? AND ? AND m.deleted_at IS NULL
+                    WHERE m.created_at BETWEEN ? AND ? AND m.deleted_at IS NULL{pending_pred}{store_pred}
                     ORDER BY m.created_at DESC
                 '''
             else:
-                sql = '''
+                sql = f'''
                     SELECT content_hash, content, tags, memory_type, metadata,
                            created_at, updated_at, created_at_iso, updated_at_iso
                     FROM memories
-                    WHERE created_at BETWEEN ? AND ? AND deleted_at IS NULL
+                    WHERE created_at BETWEEN ? AND ? AND deleted_at IS NULL{pending_pred_nojoin}{store_pred_nojoin}
                     ORDER BY created_at DESC
                 '''
 
             def _get_by_time_range():
-                cursor = self.conn.execute(sql, (start_time, end_time))
+                params = [start_time, end_time]
+                if store is not None:
+                    params.append(store)
+                cursor = self.conn.execute(sql, tuple(params))
                 return cursor.fetchall()
 
             results = []
@@ -1241,55 +1494,104 @@ class RetrieveMixin:
             return []
 
     async def get_memory_connections(self) -> Dict[str, int]:
-        """Get memory connection statistics."""
+        """Count graph neighbours per memory, keyed by content hash.
+
+        Decay looks connections up by ``memory.content_hash``, so the keys
+        must be hashes. Each neighbour counts once: symmetric relationships
+        (``related``, ``contradicts``) are stored as two rows and would
+        otherwise count twice. ``has_entity`` rows point at entity keys, not
+        memories, and both ends must be live (not soft-deleted) memories.
+        """
         try:
             await self.initialize()
 
             def _get_connections():
                 cursor = self.conn.execute("""
-                    SELECT tags, COUNT(*) as count
-                    FROM memories
-                    WHERE tags IS NOT NULL AND tags != '' AND deleted_at IS NULL
-                    GROUP BY tags
+                    WITH edges AS (
+                        SELECT source_hash AS node, target_hash AS neighbour
+                        FROM memory_graph
+                        WHERE relationship_type IS NULL OR relationship_type != 'has_entity'
+                        UNION
+                        SELECT target_hash, source_hash
+                        FROM memory_graph
+                        WHERE relationship_type IS NULL OR relationship_type != 'has_entity'
+                    )
+                    SELECT e.node, COUNT(DISTINCT e.neighbour)
+                    FROM edges e
+                    JOIN memories a ON a.content_hash = e.node AND a.deleted_at IS NULL
+                    JOIN memories b ON b.content_hash = e.neighbour AND b.deleted_at IS NULL
+                    WHERE e.node != e.neighbour
+                    GROUP BY e.node
                 """)
                 return cursor.fetchall()
 
-            connections = {}
-            for row in await self._execute_with_retry(_get_connections):
-                tags_str, count = row
-                if tags_str:
-                    tags_list = [tag.strip() for tag in tags_str.split(",") if tag.strip()]
-                    for tag in tags_list:
-                        connections[f"tag:{tag}"] = connections.get(f"tag:{tag}", 0) + count
-
-            return connections
+            return dict(await self._execute_with_retry(_get_connections))
 
         except Exception as e:
             logger.error("Error getting memory connections: %s", _sanitize_log_value(e))
             return {}
 
-    async def get_access_patterns(self) -> Dict[str, datetime]:
-        """Get memory access pattern statistics."""
+    async def get_access_patterns(
+        self, content_hashes: Optional[Sequence[str]] = None
+    ) -> Dict[str, datetime]:
+        """Get memory access pattern statistics.
+
+        Args:
+            content_hashes: Optional candidate window. When given, only these hashes are
+                queried, so a consolidation run loads access times for the current batch
+                instead of every ever-accessed memory in the store. An empty sequence
+                means "no candidates" and returns ``{}`` without touching the database.
+                ``None`` keeps the previous unbounded behaviour.
+        """
         try:
+            if content_hashes is not None:
+                hashes = list(dict.fromkeys(content_hashes))
+                if not hashes:
+                    return {}
+            else:
+                hashes = None
+
             await self.initialize()
 
-            def _get_access_patterns():
+            def _get_access_patterns_all():
                 cursor = self.conn.execute("""
-                    SELECT content_hash, updated_at_iso
+                    SELECT content_hash, last_accessed
                     FROM memories
-                    WHERE updated_at_iso IS NOT NULL AND deleted_at IS NULL
-                    ORDER BY updated_at DESC
-                    LIMIT 100
+                    WHERE last_accessed IS NOT NULL AND deleted_at IS NULL
+                    ORDER BY last_accessed DESC
                 """)
                 return cursor.fetchall()
 
+            rows = []
+            if hashes is None:
+                rows = await self._execute_with_retry(_get_access_patterns_all)
+            else:
+                # SQLite caps host parameters per statement; chunk like the other
+                # IN-clause call sites in this package do.
+                for i in range(0, len(hashes), _IN_CLAUSE_CHUNK):
+                    chunk = hashes[i:i + _IN_CLAUSE_CHUNK]
+                    placeholders = ",".join("?" for _ in chunk)
+
+                    def _get_access_patterns_scoped(ph=placeholders, c=chunk):
+                        cursor = self.conn.execute(
+                            f"SELECT content_hash, last_accessed "
+                            f"FROM memories "
+                            f"WHERE content_hash IN ({ph}) "
+                            f"AND last_accessed IS NOT NULL AND deleted_at IS NULL "
+                            f"ORDER BY last_accessed DESC",
+                            c,
+                        )
+                        return cursor.fetchall()
+
+                    rows.extend(await self._execute_with_retry(_get_access_patterns_scoped))
+
             patterns = {}
-            for row in await self._execute_with_retry(_get_access_patterns):
-                content_hash, updated_at_iso = row
+            for row in rows:
+                content_hash, last_accessed = row
                 try:
-                    patterns[content_hash] = datetime.fromisoformat(updated_at_iso.replace('Z', '+00:00'))
+                    patterns[content_hash] = datetime.fromtimestamp(last_accessed, tz=timezone.utc)
                 except Exception:
-                    patterns[content_hash] = datetime.now()
+                    patterns[content_hash] = datetime.now(tz=timezone.utc)
 
             return patterns
 

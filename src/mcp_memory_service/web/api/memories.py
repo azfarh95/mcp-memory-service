@@ -16,24 +16,37 @@
 Memory CRUD endpoints for the HTTP interface.
 """
 
+import asyncio
+import heapq
 import logging
 import socket
-from typing import List, Optional, Dict, Any
+from collections import Counter
+from typing import List, Optional, Dict, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ...storage.base import MemoryStorage
+from ...storage.mixins.base import deserialize_embedding
+from ...storage.resonance_db import ResonanceDB
 from ...models.memory import Memory
 from ...models.ontology import get_all_types
 from ...services.memory_service import MemoryService
+from ...compat import _sanitize_log_value
 from ...config import INCLUDE_HOSTNAME
 # OAuth config no longer needed - auth is always enabled
 from ..dependencies import get_storage, get_memory_service
+from .store_scope import resolve_store
 from ..sse import sse_manager, create_memory_stored_event, create_memory_deleted_event
 
 # OAuth authentication imports
-from ..oauth.middleware import require_read_access, require_write_access, AuthenticationResult
+from ..oauth.middleware import (
+    require_read_access,
+    require_store_read,
+    require_store_write,
+    get_current_user,
+    AuthenticationResult,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -48,6 +61,16 @@ class MemoryCreateRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default={}, description="Additional metadata for the memory")
     client_hostname: Optional[str] = Field(None, description="Client machine hostname for source tracking")
     conversation_id: Optional[str] = Field(None, description="Optional conversation identifier. When provided, semantic deduplication is skipped, allowing multiple incremental memories from the same conversation to be stored even if their content is topically similar.")
+    store: str = Field("default", description="Target store partition (default: 'default'). Use 'all' only for read scopes.")
+    restore_deleted: bool = Field(False, description="Bring back content that has a delete on record. Default false: re-sending content this server deleted is refused with status 409 (the delete's event_id, HLC and date are in the detail) instead of silently reviving it. Set true to purge the tombstone and store it again as a deliberate re-create.")
+
+    @field_validator("content")
+    @classmethod
+    def _content_must_not_be_blank(cls, value: str) -> str:
+        """Reject blank content before it becomes a zero-vector memory (#1791)."""
+        if not value.strip():
+            raise ValueError("content must not be empty or whitespace-only")
+        return value
 
 
 class MemoryUpdateRequest(BaseModel):
@@ -79,12 +102,77 @@ class MemoryListResponse(BaseModel):
     has_more: bool
 
 
+class ContentHashListResponse(BaseModel):
+    """Response model for paginated content hash list."""
+    hashes: List[str]
+    next_cursor: Optional[int] = None
+    has_more: bool
+
+
 class MemoryCreateResponse(BaseModel):
     """Response model for memory creation."""
     success: bool
     message: str
     content_hash: Optional[str] = None
     memory: Optional[MemoryResponse] = None
+    dedup_outcome: Optional[str] = Field(
+        None,
+        description=(
+            "Semantic-dedup decision, when one was made. "
+            "'deduplicated': nothing new was stored; matched_hash is the existing memory. "
+            "'superseded': the new memory was stored and matched_hash was marked superseded "
+            "by it (MCP_SEMANTIC_DEDUP_MODE=supersede). Null when dedup did not decide."
+        ),
+    )
+    matched_hash: Optional[str] = Field(
+        None,
+        description="Content hash of the memory semantic dedup matched. See dedup_outcome.",
+    )
+    dedup_decisions: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description=(
+            "Per-chunk semantic-dedup decisions when the write was split. "
+            "Each item has chunk_index, dedup_outcome, and matched_hash. "
+            "A single decision is also copied to dedup_outcome and matched_hash."
+        ),
+    )
+
+
+def _dedup_response_fields(result: dict) -> dict:
+    """Semantic-dedup fields for MemoryCreateResponse. Empty when dedup did not decide."""
+    fields = {}
+    outcome = result.get("dedup_outcome")
+    if outcome:
+        fields["dedup_outcome"] = outcome
+        fields["matched_hash"] = result.get("matched_hash")
+    decisions = result.get("dedup_decisions")
+    if decisions:
+        fields["dedup_decisions"] = decisions
+    return fields
+
+
+def _superseded_hashes(result: dict) -> List[str]:
+    """Hashes retired by this store, from the chunk list or the single decision."""
+    decisions = result.get("dedup_decisions") or []
+    hashes = [
+        decision.get("matched_hash")
+        for decision in decisions
+        if decision.get("dedup_outcome") == "superseded" and decision.get("matched_hash")
+    ]
+    if hashes:
+        return hashes
+    matched = result.get("matched_hash")
+    if result.get("dedup_outcome") == "superseded" and matched:
+        return [matched]
+    return []
+
+
+def _with_supersede_note(result: dict, message: str) -> str:
+    """Append the replaced hash when this store superseded an older memory."""
+    hashes = _superseded_hashes(result)
+    if not hashes:
+        return message
+    return f"{message} (superseded {', '.join(hashes)})"
 
 
 class MemoryDeleteResponse(BaseModel):
@@ -133,7 +221,7 @@ async def store_memory(
     request: MemoryCreateRequest,
     http_request: Request,
     memory_service: MemoryService = Depends(get_memory_service),
-    user: AuthenticationResult = Depends(require_write_access)
+    user: AuthenticationResult = Depends(get_current_user)
 ):
     """
     Store a new memory.
@@ -164,6 +252,16 @@ async def store_memory(
             if agent_tag not in tags:
                 tags.append(agent_tag)
 
+        if request.store == "all":
+            raise HTTPException(
+                status_code=400,
+                detail="store='all' is only valid for read scopes",
+            )
+
+        # Store write is gated per-store (store is in the body, so the check is
+        # here rather than in a dependency).
+        user.require_store_scope("write", request.store)
+
         # Use injected MemoryService for consistent business logic (hostname tagging handled internally)
         result = await memory_service.store_memory(
             content=request.content,
@@ -172,6 +270,8 @@ async def store_memory(
             metadata=request.metadata,
             client_hostname=client_hostname,
             conversation_id=request.conversation_id,
+            store=request.store,
+            restore_deleted=request.restore_deleted,
         )
 
         if result["success"]:
@@ -195,11 +295,11 @@ async def store_memory(
                         "memory_type": first_memory["memory_type"]
                     }
 
-                event = create_memory_stored_event(memory_data)
+                event = create_memory_stored_event(memory_data, store=request.store)
                 await sse_manager.broadcast_event(event)
             except Exception as e:
                 # Don't fail the request if SSE broadcasting fails
-                logger.warning(f"Failed to broadcast memory_stored event: {e}")
+                logger.warning("Failed to broadcast memory_stored event: %s", _sanitize_log_value(e))
 
             # Surface ontology coercion: when the requested memory_type is not
             # in the ontology, Memory.__post_init__ silently rewrites it to
@@ -222,32 +322,61 @@ async def store_memory(
             # Return appropriate response based on MemoryService result
             if "memory" in result:
                 # Single memory response
-                base_msg = "Memory stored successfully"
+                base_msg = _with_supersede_note(result, "Memory stored successfully")
                 return MemoryCreateResponse(
                     success=True,
                     message=base_msg + _coercion_warning(result["memory"].get("memory_type")),
                     content_hash=result["memory"]["content_hash"],
-                    memory=result["memory"]
+                    memory=result["memory"],
+                    **_dedup_response_fields(result),
                 )
             else:
                 # Chunked memory response
                 first_memory = result["memories"][0]
-                base_msg = f"Memory stored as {result['total_chunks']} chunks"
+                base_msg = _with_supersede_note(
+                    result, f"Memory stored as {result['total_chunks']} chunks"
+                )
+                refused_chunks = result.get("refused_chunks") or []
+                if refused_chunks:
+                    # #1560: not the whole content — name the chunks a recorded delete
+                    # kept out, and how to bring them back.
+                    base_msg += (
+                        f"; {len(refused_chunks)} chunk(s) not stored: deleted on "
+                        f"{refused_chunks[0]['deleted_at']}, pass restore_deleted=true "
+                        f"to bring them back"
+                    )
                 return MemoryCreateResponse(
                     success=True,
                     message=base_msg + _coercion_warning(first_memory.get("memory_type")),
                     content_hash=first_memory["content_hash"],
-                    memory=first_memory
+                    memory=first_memory,
+                    **_dedup_response_fields(result),
                 )
         else:
+            refused = result.get("refused_recreate")
+            if refused:
+                # #1560: re-sending content this server deleted conflicts with the
+                # recorded delete — 409, naming the delete, until the client says
+                # restore_deleted=true. Not a 200/success=false: bundled clients
+                # would log and move on, and the memory would quietly come back
+                # on the next sync.
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": result.get("error", "Not stored"), **refused},
+                )
             return MemoryCreateResponse(
                 success=False,
-                message=result.get("error", "Failed to store memory"),
-                content_hash=None
+                message=str(result.get("error", "Failed to store memory")),
+                content_hash=None,
+                **_dedup_response_fields(result),
             )
             
+    except HTTPException:
+        # Validation errors (e.g. store='all' on a write) must reach the client
+        # as their real status code instead of being flattened to 500.
+        raise
     except Exception as e:
-        logger.error(f"Failed to store memory: {str(e)}")
+        logger.error("Failed to store memory: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail="Failed to store memory. Please try again.")
 
 
@@ -258,8 +387,9 @@ async def list_memories(
     tag: Optional[str] = Query(None, description="Filter by tag"),
     memory_type: Optional[str] = Query(None, description="Filter by memory type"),
     tag_match: Optional[str] = Query("any", description="Tag matching mode: 'any' (OR) or 'all' (AND)"),
+    store: str = Query("default", description="Target store partition (default: 'default'). Use 'all' for every store."),
     memory_service: MemoryService = Depends(get_memory_service),
-    user: AuthenticationResult = Depends(require_read_access)
+    user: AuthenticationResult = Depends(require_store_read)
 ):
     """
     List memories with pagination and optional filtering.
@@ -276,7 +406,8 @@ async def list_memories(
             page_size=page_size,
             tags=tags_list,
             memory_type=memory_type,
-            tag_match=tag_match
+            tag_match=tag_match,
+            store=resolve_store(store),
         )
 
         return MemoryListResponse(
@@ -291,20 +422,43 @@ async def list_memories(
         raise HTTPException(status_code=500, detail=f"Failed to list memories: {str(e)}")
 
 
+@router.get('/memories/hashes', response_model=ContentHashListResponse, tags=['memories'])
+async def list_content_hashes(
+    cursor: int = Query(0, ge=0, description='id-based cursor; pass next_cursor from previous page'),
+    limit: int = Query(1000, ge=1, le=5000, description='max hashes per page'),
+    include_deleted: bool = Query(False),
+    storage: MemoryStorage = Depends(get_storage),
+    user: AuthenticationResult = Depends(require_read_access),
+):
+    try:
+        page = await storage.list_content_hashes_page(after_id=cursor, limit=limit, include_deleted=include_deleted)
+        hashes = [h for _, h in page]
+        has_more = len(page) == limit
+        next_cursor = page[-1][0] if (page and has_more) else None
+        return ContentHashListResponse(hashes=hashes, next_cursor=next_cursor, has_more=has_more)
+    except Exception as e:
+        # Log the real error for operators; return a generic message so a
+        # read-access client never sees raw DB/internal details (Greptile P2).
+        logger.error("Failed to list content hashes: %s", _sanitize_log_value(e))
+        raise HTTPException(status_code=500, detail="Failed to list content hashes")
+
+
 @router.get("/memories/{content_hash}", response_model=MemoryResponse, tags=["memories"])
 async def get_memory(
     content_hash: str,
+    store: str = Query("default", description="Target store partition (default: 'default'). Use 'all' for every store."),
     storage: MemoryStorage = Depends(get_storage),
-    user: AuthenticationResult = Depends(require_read_access)
+    user: AuthenticationResult = Depends(require_store_read)
 ):
     """
     Get a specific memory by its content hash.
-    
+
     Retrieves a single memory entry using its unique content hash identifier.
+    The lookup honours the same ``store`` scope as the list endpoint, so a hash
+    that belongs to another partition is reported as not found.
     """
     try:
-        # Use the new get_by_hash method for direct hash lookup
-        memory = await storage.get_by_hash(content_hash)
+        memory = await storage.get_by_hash(content_hash, store=resolve_store(store))
         
         if not memory:
             raise HTTPException(status_code=404, detail="Memory not found")
@@ -320,24 +474,37 @@ async def get_memory(
 @router.delete("/memories/{content_hash}", response_model=MemoryDeleteResponse, tags=["memories"])
 async def delete_memory(
     content_hash: str,
+    store: str = Query("default", description="Target store partition (default: 'default'). Use 'all' for every store."),
     storage: MemoryStorage = Depends(get_storage),
-    user: AuthenticationResult = Depends(require_write_access)
+    user: AuthenticationResult = Depends(require_store_write)
 ):
     """
     Delete a memory by its content hash.
-    
-    Permanently removes a memory entry from the storage.
+
+    Permanently removes a memory entry from the storage. The hash is resolved
+    within the requested ``store`` scope first, so a hash owned by another
+    partition cannot be deleted through a different scope.
     """
+    if store == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="store='all' is only valid for read scopes",
+        )
+
     try:
+        existing = await storage.get_by_hash(content_hash, store=resolve_store(store))
+        if not existing:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
         success, message = await storage.delete(content_hash)
         
         # Broadcast SSE event for memory deletion
         try:
-            event = create_memory_deleted_event(content_hash, success)
+            event = create_memory_deleted_event(content_hash, success, store=store)
             await sse_manager.broadcast_event(event)
         except Exception as e:
             # Don't fail the request if SSE broadcasting fails
-            logger.warning(f"Failed to broadcast memory_deleted event: {e}")
+            logger.warning("Failed to broadcast memory_deleted event: %s", _sanitize_log_value(e))
         
         return MemoryDeleteResponse(
             success=success,
@@ -345,8 +512,10 @@ async def delete_memory(
             content_hash=content_hash
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Failed to delete memory: {str(e)}")
+        logger.error("Failed to delete memory: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail="Failed to delete memory. Please try again.")
 
 
@@ -354,8 +523,9 @@ async def delete_memory(
 async def update_memory(
     content_hash: str,
     request: MemoryUpdateRequest,
+    store: str = Query("default", description="Target store partition (default: 'default'). Use 'all' for every store."),
     storage: MemoryStorage = Depends(get_storage),
-    user: AuthenticationResult = Depends(require_write_access)
+    user: AuthenticationResult = Depends(require_store_write)
 ):
     """
     Update memory metadata (tags, type, metadata) without changing content or timestamps.
@@ -363,9 +533,15 @@ async def update_memory(
     This endpoint allows updating only the metadata aspects of a memory while preserving
     the original content and creation timestamp. Only provided fields will be updated.
     """
+    if store == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="store='all' is only valid for read scopes",
+        )
+
     try:
-        # First, check if the memory exists
-        existing_memory = await storage.get_by_hash(content_hash)
+        # First, check that the memory exists inside the requested store scope
+        existing_memory = await storage.get_by_hash(content_hash, store=resolve_store(store))
         if not existing_memory:
             raise HTTPException(status_code=404, detail=f"Memory with hash {content_hash} not found")
 
@@ -387,11 +563,18 @@ async def update_memory(
                 memory=memory_to_response(existing_memory)
             )
 
-        # Perform the update
+        # Perform the update, confined to the store in the storage layer too
+        # (#1875). Backends that cannot confine do not accept ``store`` yet.
+        scope = (
+            {"store": resolve_store(store)}
+            if getattr(storage, "get_by_hash_is_store_scoped", False)
+            else {}
+        )
         success, message = await storage.update_memory_metadata(
             content_hash=content_hash,
             updates=updates,
-            preserve_timestamps=True
+            preserve_timestamps=True,
+            **scope,
         )
 
         if success:
@@ -419,8 +602,9 @@ async def update_memory(
 
 @router.get("/tags", response_model=TagListResponse, tags=["tags"])
 async def get_tags(
+    store: str = Query("default", description="Target store partition (default: 'default'). Use 'all' for every store."),
     storage: MemoryStorage = Depends(get_storage),
-    user: AuthenticationResult = Depends(require_read_access)
+    user: AuthenticationResult = Depends(require_store_read)
 ):
     """
     Get all tags with their usage counts.
@@ -429,8 +613,24 @@ async def get_tags(
     sorted by count in descending order.
     """
     try:
-        # Get tags with counts from storage
-        tag_data = await storage.get_all_tags_with_counts()
+        # Get tags with counts from storage. The storage-wide tag query is
+        # useful for the legacy all-store view; scoped reads must derive counts
+        # from the same filtered memory set as list/search.
+        scope = resolve_store(store)
+        if scope is None:
+            tag_data = await storage.get_all_tags_with_counts()
+        else:
+            memories = await storage.get_all_memories(store=scope)
+            tag_counts = Counter(
+                tag
+                for memory in memories
+                for tag in (memory.tags or [])
+                if tag
+            )
+            tag_data = [
+                {"tag": tag, "count": count}
+                for tag, count in sorted(tag_counts.items(), key=lambda item: (-item[1], item[0]))
+            ]
 
         # Convert to response format
         tags = [TagResponse(tag=item["tag"], count=item["count"]) for item in tag_data]
@@ -456,6 +656,7 @@ class SessionCreateRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Stable session identifier; auto-generated UUID if omitted")
     tags: List[str] = Field(default=[], description="Additional tags. 'session:<id>' is always added automatically.")
     metadata: Dict[str, Any] = Field(default={}, description="Optional extra metadata")
+    store: str = Field("default", description="Target store partition (default: 'default'). Use 'all' only for read scopes.")
 
 
 class SessionCreateResponse(BaseModel):
@@ -470,19 +671,28 @@ class SessionCreateResponse(BaseModel):
 async def store_session(
     request: SessionCreateRequest,
     memory_service: MemoryService = Depends(get_memory_service),
-    user: AuthenticationResult = Depends(require_write_access),
+    user: AuthenticationResult = Depends(get_current_user),
 ):
     """Store a conversation session as a single memory unit.
 
     All turns are concatenated into '[role] content' lines and stored as
     memory_type='session' with a 'session:<id>' tag for reliable session-level retrieval.
     """
-    import uuid as _uuid
+    import uuid as _uuid  # inline import
 
     session_id = request.session_id or str(_uuid.uuid4())
     lines = [f"[{t.role}] {t.content.strip()}" for t in request.turns if t.content.strip()]
     if not lines:
         raise HTTPException(status_code=422, detail="All turns have empty content")
+
+    if request.store == "all":
+        raise HTTPException(
+            status_code=400,
+            detail="store='all' is only valid for read scopes",
+        )
+
+    # Session write is gated per-store (store arrives in the body).
+    user.require_store_scope("write", request.store)
 
     content = "\n".join(lines)
     tags = [f"session:{session_id}"] + request.tags
@@ -493,6 +703,7 @@ async def store_session(
             tags=tags,
             memory_type="session",
             metadata=request.metadata,
+            store=request.store,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Storage error: {str(e)}")
@@ -516,3 +727,108 @@ async def get_memory_types(
 ) -> List[str]:
     """Return all valid memory types (built-in + custom from MCP_CUSTOM_MEMORY_TYPES)."""
     return sorted(get_all_types())
+
+
+# ── ResonanceDB — Wave-Based Semantic Search ──────────────────────────────────
+
+class ResonanceSearchRequest(BaseModel):
+    """Request model for ResonanceDB wave-based semantic search."""
+    query: str = Field(..., description="Search query text")
+    top_k: int = Field(default=10, ge=1, le=100, description="Max results to return")
+    mode: Literal["resonance", "phase", "hybrid"] = Field("hybrid", description="Search mode: 'resonance' (pure constructive interference), 'phase' (phase alignment only), 'hybrid' (default)")
+    store: str = Field(default="default", description="Target store partition (default: 'default'). Use 'all' for every store.")
+
+
+class ResonanceSearchResult(BaseModel):
+    """Single result from ResonanceDB search."""
+    content_hash: str
+    score: float
+    details: Dict[str, float]
+
+
+class ResonanceSearchResponse(BaseModel):
+    """Response model for ResonanceDB wave-based search."""
+    query: str
+    mode: str
+    results: List[ResonanceSearchResult]
+    total_stored: int
+    backend: str = "resonance"
+
+
+def _fetch_resonance_candidates(conn, store: Optional[str]) -> list:
+    """Read (content_hash, embedding blob) for every current, searchable memory."""
+    sql = """
+        SELECT m.content_hash, e.content_embedding
+        FROM memories m
+        JOIN memory_embeddings e ON m.id = e.rowid
+        WHERE m.deleted_at IS NULL
+          AND (m.embedding_pending IS NULL OR m.embedding_pending = 0)
+          AND (m.superseded_by IS NULL OR m.superseded_by = '')
+    """
+    params: tuple = ()
+    if store is not None:
+        sql += " AND m.store = ?"
+        params = (store,)
+    return conn.execute(sql, params).fetchall()
+
+
+def _score_resonance_candidates(rows: list, query_embedding: List[float], dimension: int, top_k: int, mode: str):
+    """Score all rows in batches and keep the overall top_k. Returns (results, scored_count)."""
+    best: list = []
+    scored = 0
+    batch_size = 1000
+    for start in range(0, len(rows), batch_size):
+        db = ResonanceDB(dimension=dimension)
+        for content_hash, blob in rows[start:start + batch_size]:
+            values = deserialize_embedding(blob)
+            if values is None or len(values) != dimension:
+                continue
+            db.add(content_hash, values)
+        scored += len(db)
+        best = heapq.nlargest(top_k, best + db.search(query_embedding, top_k=top_k, mode=mode), key=lambda r: r["score"])
+    return best, scored
+
+
+@router.post("/memories/resonance-search", response_model=ResonanceSearchResponse, tags=["memories", "resonance"])
+async def resonance_search(
+    request: ResonanceSearchRequest,
+    storage: MemoryStorage = Depends(get_storage),
+    user: AuthenticationResult = Depends(require_read_access),
+):
+    """
+    Wave-based semantic search using ResonanceDB (experimental).
+
+    Converts the stored real-valued embeddings to complex waveforms
+    ψ(x) = A(x) · exp(i · φ(x)) at query time and ranks them by
+    constructive interference and phase alignment with the query.
+
+    Requires a SQLite-backed storage (sqlite_vec, or hybrid via its local
+    primary). Scans every eligible memory in the selected store.
+
+    See: arXiv:2509.09691
+    """
+    # Hybrid keeps its SQLite backend in `primary`; Cloudflare and Milvus have no local table to scan.
+    backend = getattr(storage, "primary", storage)
+    if getattr(backend, "conn", None) is None or not hasattr(backend, "_execute_with_retry"):
+        raise HTTPException(status_code=501, detail="Resonance search requires the sqlite_vec or hybrid storage backend.")
+    if not getattr(backend, "embedding_model", None):
+        raise HTTPException(status_code=503, detail="Resonance search requires an embedding model.")
+
+    try:
+        store = resolve_store(request.store)
+        # ponytail: full scan in pure Python per request, O(n·dim); cache waveforms if stores grow past ~50k.
+        rows = await backend._execute_with_retry(lambda: _fetch_resonance_candidates(backend.conn, store))
+        query_embedding = await asyncio.to_thread(backend._generate_embedding, request.query)
+        results, scored = await asyncio.to_thread(
+            _score_resonance_candidates, rows, query_embedding, backend.embedding_dimension, request.top_k, request.mode
+        )
+    except Exception as e:
+        logger.error("Resonance search failed: %s", _sanitize_log_value(e))
+        raise HTTPException(status_code=500, detail="Resonance search failed")
+
+    return ResonanceSearchResponse(
+        query=request.query,
+        mode=request.mode,
+        results=[ResonanceSearchResult(**r) for r in results],
+        total_stored=scored,
+    )

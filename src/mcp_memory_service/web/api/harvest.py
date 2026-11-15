@@ -68,6 +68,7 @@ class HarvestSessionResult(BaseModel):
     stored: int
     by_type: Dict[str, int]
     candidates: List[HarvestCandidateModel]
+    coverage: Optional[Dict] = None  # Coverage report for this session
 
 
 class HarvestResponse(BaseModel):
@@ -182,6 +183,7 @@ async def harvest_sessions(
                 "total_messages": r.total_messages,
                 "found": r.found,
                 "stored": r.stored,
+                "skipped": r.skipped,
                 "by_type": r.by_type,
                 "candidates": [
                     {
@@ -192,6 +194,7 @@ async def harvest_sessions(
                     }
                     for c in r.candidates
                 ],
+                "coverage": r.coverage,  # Include coverage report
             }
             for r in results
         ],

@@ -54,14 +54,19 @@ def split_content(
     if not content:
         return []
 
-    if len(content) <= max_length:
+    content_length = len(content)
+    if content_length <= max_length:
         return [content]
 
     # Validate overlap to prevent infinite loops
     if overlap >= max_length:
         raise ValueError(f"Overlap ({overlap}) must be smaller than max_length ({max_length}).")
 
-    logger.info(f"Splitting content of {len(content)} chars into chunks of max {max_length} chars")
+    logger.info(
+        "Splitting content of %d chars into chunks of max %d chars",
+        content_length,
+        max_length,
+    )
 
     if not preserve_boundaries:
         # Simple character-based splitting with overlap
@@ -111,6 +116,16 @@ def _split_preserving_boundaries(content: str, max_length: int, overlap: int) ->
 
         # Extract chunk and prepare next iteration
         chunk = remaining[:split_point].rstrip()
+        if not chunk:
+            # The best boundary can sit in leading whitespace (a blank line
+            # before a paragraph longer than max_length). That prefix strips
+            # to nothing; aborting here used to drop the rest of the document.
+            remaining = remaining[split_point:].lstrip()
+            if not remaining:
+                # Preserve the previous result for whitespace-only tails.
+                chunks.append(chunk)
+                break
+            continue
         chunks.append(chunk)
 
         # Calculate overlap start to prevent infinite loop
@@ -132,7 +147,7 @@ def _split_preserving_boundaries(content: str, max_length: int, overlap: int) ->
         remaining = remaining[next_start:].lstrip()
 
         # Prevent infinite loop in edge cases
-        if not remaining or len(chunk) == 0:
+        if not remaining:
             break
 
     return chunks
@@ -160,8 +175,12 @@ def _find_best_split_point(text: str, max_length: int) -> int:
         return pos + 1
 
     # Priority 3: Sentence ending
-    sentence_pattern = r'[.!?](?=\s|$)'
-    matches = list(re.finditer(sentence_pattern, text_to_search))
+    sentence_pattern = r'[.!?](?=\s)'
+    matches = [
+        match
+        for match in re.finditer(sentence_pattern, text[:max_length + 1])
+        if match.end() <= max_length
+    ]
     if matches:
         return matches[-1].end()
 
@@ -214,6 +233,11 @@ def validate_chunk_lengths(chunks: List[str], max_length: int) -> bool:
     """
     for i, chunk in enumerate(chunks):
         if len(chunk) > max_length:
-            logger.error(f"Chunk {i} exceeds max length: {len(chunk)} > {max_length}")
+            logger.error(
+                "Chunk %d exceeds max length: %d > %d",
+                i,
+                len(chunk),
+                max_length,
+            )
             return False
     return True

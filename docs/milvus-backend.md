@@ -30,7 +30,7 @@ The backend auto-detects Lite vs. remote from the URI — file paths ending in `
 pip install -e ".[milvus]"
 ```
 
-The `milvus` extra pulls in `pymilvus>=2.5.0` and `milvus-lite>=2.4.10`. Milvus Lite is the default and requires no external service.
+The `milvus` extra requires `pymilvus>=2.5.0,<4.0.0` and `milvus-lite>=2.4.10`; CI covers both the 2.x and 3.x pymilvus lines. Milvus Lite is the default and requires no external service.
 
 ### 2. Configure
 
@@ -86,22 +86,30 @@ The collection is created once by `MilvusMemoryStorage.initialize()` with the fo
 |-------|------|-------|
 | `id` | VARCHAR (PK, 128) | The memory's content hash. Guarantees exact-hash deduplication for free. |
 | `vector` | FLOAT_VECTOR | Dimension matches the embedding model (384 for `all-MiniLM-L6-v2`). |
-| `content` | VARCHAR (65535) | Memory text. Milvus's VARCHAR hard cap. |
+| `content` | VARCHAR (65535) | Memory text. Milvus's VARCHAR hard cap. Analyzer enabled, so it can feed BM25. |
+| `content_lower` | VARCHAR (65535) | Lower-cased copy of `content`, written on every insert. Exact-content search filters it with `like`, which is case-sensitive. |
 | `tags` | VARCHAR (8192) | Comma-delimited with leading and trailing commas (`,tag1,tag2,`) for exact `like` matching. |
 | `memory_type` | VARCHAR (128) | Ontology-validated memory type. |
 | `metadata` | VARCHAR (65535) | JSON-serialized metadata dict. |
 | `created_at` / `updated_at` | DOUBLE | Unix timestamps. |
 | `created_at_iso` / `updated_at_iso` | VARCHAR (64) | ISO-8601 timestamp strings. |
+| `sparse_vector` | SPARSE_FLOAT_VECTOR | Filled from `content` by a server-side BM25 function. Only present when the collection was created with a pymilvus that supports BM25 (2.5+). |
 
-**Index**: single vector index on `vector` with `index_type=AUTOINDEX`, `metric_type=COSINE`. This works identically on Milvus Lite, self-hosted Milvus, and Zilliz Cloud.
+**Indexes**: a vector index on `vector` with `index_type=AUTOINDEX`, `metric_type=COSINE`, which works identically on Milvus Lite, self-hosted Milvus, and Zilliz Cloud. When `sparse_vector` exists, a `SPARSE_INVERTED_INDEX` with `metric_type=BM25` on it, and `memory_search` combines the two with RRF.
+
+Collections created by older versions may lack `content_lower` or `sparse_vector`; the schema is not migrated in place. Without `content_lower`, exact-content search falls back to a client-side scan. Without `sparse_vector`, search is vector-only.
+
+Two side collections sit next to the main one: `{collection}_graph` for associations and entity links, and `{collection}_access` for last-accessed timestamps.
 
 ## Semantics and limitations
 
 - **Primary key = content hash.** Duplicate stores with the same content are rejected at the client before insert. `cleanup_duplicates()` is a no-op for this reason.
 - **Tag matching is exact.** Tags are stored with leading/trailing commas and matched with `tags like "%,<tag>,%"`. Substrings never match — `test` does not match `testing`.
-- **Hard delete.** Unlike `sqlite_vec`, deletions are permanent. There is no tombstone table and no `is_deleted()` / `purge_deleted()` semantics (the base class defaults apply). If you need soft-delete for multi-device sync, use the `hybrid` backend instead.
+- **Hard delete.** Unlike `sqlite_vec`, normal deletions are permanent. Milvus Lite uses the same single-file format as SQLite Vec, so `is_deleted()` and `purge_deleted()` also recognize explicitly stored `metadata.deleted_at` tombstones. If you need first-class soft-delete for multi-device sync, use the `hybrid` backend instead.
+- **Knowledge graph and entity links.** Milvus stores associations, entity links, graph analytics, and reasoning traversal in a dedicated `{collection}_graph` collection. There is no server-side recursive CTE, so transitive closure and common-neighbour queries are evaluated in application code over drained edges.
+- **File-based backup and optimization.** Milvus Lite has a local database file and supports normal file-based backup. Self-hosted Milvus and Zilliz Cloud are remote-only: file backup and database optimization return an explicit unsupported error instead of claiming success. Use the deployment's own snapshot or export tooling for those backends.
 - **Content length.** Limited to `65535 - 256 = 65279` characters by the `max_content_length` property. Milvus's VARCHAR hard cap applies; longer content should be chunked by the calling service.
-- **Semantic deduplication** honours the same `MCP_SEMANTIC_DEDUP_*` environment variables as `sqlite_vec`, so behaviour is consistent across backends.
+- **Semantic deduplication** honours the same `MCP_SEMANTIC_DEDUP_*` environment variables as `sqlite_vec`, including `MCP_SEMANTIC_DEDUP_MODE` (`reject` or `supersede`) and `MCP_SEMANTIC_DEDUP_NEAR_IDENTICAL_THRESHOLD`, so behaviour is consistent across backends. Supersede marks the matched memory's metadata `superseded_by` the new hash, which is the lineage this backend already uses for versioned updates.
 - **External embedding APIs** (Ollama, vLLM, TEI) are not supported — the Milvus backend always uses local sentence-transformers. Use `sqlite_vec` if you need an external embedding endpoint.
 
 ## Deployment recipes
@@ -173,7 +181,7 @@ For a Zilliz Cloud setup, also add `"MCP_MILVUS_TOKEN": "your-token"`.
 | `Cannot invoke RPC on closed channel!` / `server unavailable` on Milvus Lite after long idle | The Lite daemon exited after idle (upstream [milvus-lite#334](https://github.com/milvus-io/milvus-lite/issues/334)). The backend detects this and auto-reconnects once on the next RPC — the failure surfaces as a `WARNING` log followed by a successful retry. If it recurs every call, check for Lite-on-Lite collisions (multiple processes writing the same `.db`). For production services, switch to self-hosted Milvus or Zilliz Cloud. |
 | Embedding dimension mismatch warning | An existing collection has a different vector dim than the current model. Drop the collection (`MilvusClient.drop_collection(...)`) or switch to a model that matches the stored dim. |
 | First `initialize()` takes a long time | The sentence-transformers model is downloading from Hugging Face. Once cached, later runs are fast (the backend automatically enables `HF_HUB_OFFLINE` when the cache is present). |
-| `pkg_resources is deprecated` warning on Python 3.13 | Harmless deprecation warning from `milvus-lite`; our `milvus` extra pins `setuptools<81` on Python 3.13+ to silence it. |
+| `pkg_resources is deprecated` warning on Python 3.13 | Harmless deprecation warning from `milvus-lite`; our `milvus` extra pins `setuptools<82` to silence it. |
 
 ## Support
 

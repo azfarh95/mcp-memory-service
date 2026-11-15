@@ -25,7 +25,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 
-from ...storage.base import MemoryStorage
+from ...storage.base import MemoryStorage, UntaggedCountChanged
 # OAuth config no longer needed - auth is always enabled
 from ..dependencies import get_storage
 
@@ -36,10 +36,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _sanitize_log_value(value: object) -> str:
-    """Sanitize a user-provided value for safe inclusion in log messages."""
-    return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
-
+from ...compat import _sanitize_log_value
 
 # Request/Response Models
 class BulkDeleteRequest(BaseModel):
@@ -82,7 +79,7 @@ class TagStatsListResponse(BaseModel):
 
 class SystemOperationRequest(BaseModel):
     """Request model for system operations."""
-    operation: str = Field(..., description="Operation: 'cleanup_duplicates', 'optimize_db', 'rebuild_index'")
+    operation: str = Field(..., description="Operation: 'cleanup_duplicates'")
 
 
 @router.post("/bulk-delete", response_model=BulkOperationResponse, tags=["management"])
@@ -177,7 +174,7 @@ async def bulk_delete_memories(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Bulk delete failed: {str(e)}")
+        logger.error("Bulk delete failed: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Bulk delete operation failed: {str(e)}")
 
 
@@ -206,7 +203,7 @@ async def cleanup_duplicates(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Duplicate cleanup failed: {str(e)}")
+        logger.error("Duplicate cleanup failed: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Duplicate cleanup failed: {str(e)}")
 
 
@@ -221,29 +218,17 @@ async def count_untagged_memories(
     Returns the number of memories that have no tags assigned.
     """
     try:
-        if hasattr(storage, 'count_untagged_memories'):
+        try:
             count = await storage.count_untagged_memories()
-        else:
-            # Fallback: use raw SQL for SQLite-based backends (exclude soft-deleted)
-            if hasattr(storage, 'conn'):
-                cursor = storage.conn.execute(
-                    "SELECT COUNT(*) FROM memories WHERE (tags IS NULL OR tags = '' OR length(trim(tags)) = 0) AND deleted_at IS NULL"
-                )
-                count = cursor.fetchone()[0]
-            elif hasattr(storage, 'primary') and hasattr(storage.primary, 'conn'):
-                cursor = storage.primary.conn.execute(
-                    "SELECT COUNT(*) FROM memories WHERE (tags IS NULL OR tags = '' OR length(trim(tags)) = 0) AND deleted_at IS NULL"
-                )
-                count = cursor.fetchone()[0]
-            else:
-                raise HTTPException(status_code=501, detail="Untagged count not supported by storage backend")
+        except NotImplementedError:
+            raise HTTPException(status_code=501, detail="Untagged count not supported by storage backend")
 
         return {"count": count}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Count untagged failed: {str(e)}")
+        logger.error("Count untagged failed: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Count untagged failed: {str(e)}")
 
 
@@ -272,21 +257,16 @@ async def delete_untagged_memories(
     try:
         # CRITICAL: confirm_count is now REQUIRED (fixed in v9.0.1)
         # Previous bug: confirm_count was optional, allowing accidental mass deletion
-
-        # First count untagged memories (exclude already soft-deleted)
-        if hasattr(storage, 'conn'):
-            conn = storage.conn
-        elif hasattr(storage, 'primary') and hasattr(storage.primary, 'conn'):
-            conn = storage.primary.conn
-        else:
+        try:
+            actual_count = await storage.count_untagged_memories()
+        except NotImplementedError:
             raise HTTPException(status_code=501, detail="Delete untagged not supported by storage backend")
 
-        cursor = conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE (tags IS NULL OR tags = '' OR length(trim(tags)) = 0) AND deleted_at IS NULL"
-        )
-        actual_count = cursor.fetchone()[0]
-
-        # CRITICAL Safety check - confirm_count MUST match actual_count
+        # CRITICAL Safety check - confirm_count MUST match actual_count.
+        # This answers a wrong count without touching the store; it is not the
+        # guarantee, because another request can change the set between this
+        # await and the delete. confirm_count is passed down and re-checked
+        # where the rows are selected, which is what holds the delete to it.
         if confirm_count != actual_count:
             raise HTTPException(
                 status_code=400,
@@ -302,30 +282,32 @@ async def delete_untagged_memories(
                 operation="delete_untagged"
             )
 
-        # Soft delete memories by setting deleted_at timestamp
-        import time
-        deleted_at = time.time()
-
-        cursor = conn.execute(
-            "UPDATE memories SET deleted_at = ? WHERE (tags IS NULL OR tags = '' OR length(trim(tags)) = 0) AND deleted_at IS NULL",
-            (deleted_at,)
+        # The backend decides how: SQLite tombstones and syncs the delete,
+        # Milvus has no tombstones and removes the rows outright.
+        deleted_count, message = await storage.delete_untagged_memories(
+            expected_count=confirm_count
         )
-        conn.commit()
-
-        deleted_count = cursor.rowcount
-        logger.info(f"Soft-deleted {deleted_count} untagged memories (tombstones created)")
+        logger.info("Deleted %d untagged memories", deleted_count)
 
         return BulkOperationResponse(
             success=deleted_count > 0,
-            message=f"Successfully soft-deleted {deleted_count} memories without tags (tombstones created for multi-PC sync)",
+            message=message,
             affected_count=deleted_count,
             operation="delete_untagged"
         )
 
     except HTTPException:
         raise
+    except UntaggedCountChanged as e:
+        # The set moved under the confirmation; nothing was deleted. Same 400 as
+        # a stale confirm_count, because that is what it is from here.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Confirmation count mismatch. Expected {e.actual}, got {e.expected}. "
+                   f"Use GET /api/manage/count-untagged to get the current count."
+        )
     except Exception as e:
-        logger.error(f"Delete untagged failed: {str(e)}")
+        logger.error("Delete untagged failed: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Delete untagged failed: {str(e)}")
 
 
@@ -365,7 +347,7 @@ async def get_tag_statistics(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get tag statistics: {str(e)}")
+        logger.error("Failed to get tag statistics: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Failed to get tag statistics: {str(e)}")
 
 
@@ -404,7 +386,7 @@ async def rename_tag(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Tag rename failed: {str(e)}")
+        logger.error("Tag rename failed: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Tag rename failed: {str(e)}")
 
 
@@ -417,19 +399,11 @@ async def perform_system_operation(
     """
     Perform system maintenance operations.
 
-    Supported operations: cleanup_duplicates, optimize_db, rebuild_index
+    Supported operations: cleanup_duplicates. Any other operation answers 400.
     """
     try:
         if operation == "cleanup_duplicates":
             return await cleanup_duplicates(storage, user)
-
-        elif operation == "optimize_db":
-            # Database optimization (would need storage-specific implementation)
-            raise HTTPException(status_code=501, detail="Database optimization not yet implemented")
-
-        elif operation == "rebuild_index":
-            # Rebuild search indexes (would need storage-specific implementation)
-            raise HTTPException(status_code=501, detail="Index rebuilding not yet implemented")
 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown operation: {operation}")
@@ -437,5 +411,9 @@ async def perform_system_operation(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"System operation {_sanitize_log_value(operation)} failed: {str(e)}")
+        logger.error(
+            "System operation %s failed: %s",
+            _sanitize_log_value(operation),
+            _sanitize_log_value(e),
+        )
         raise HTTPException(status_code=500, detail=f"System operation failed: {str(e)}")

@@ -10,12 +10,21 @@ shared core — adding a tool requires no changes here.
 import logging
 from typing import Any, Dict, Optional, Union
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Response, Request
 from fastapi.responses import JSONResponse
+import mcp.types as types
 from pydantic import BaseModel, ConfigDict
 
 from ..._version import __version__
-from ..oauth.middleware import require_read_access, AuthenticationResult
+from ...compat import _sanitize_log_value
+from ...utils.agent_context import (
+    reset_current_agent_id,
+    reset_current_agent_read_filter,
+    set_current_agent_id,
+    set_current_agent_read_filter,
+)
+from ...utils.tool_rate_limit import resolve_caller_identity
+from ..oauth.middleware import require_read_access, get_current_user, AuthenticationResult
 
 logger = logging.getLogger(__name__)
 
@@ -36,41 +45,43 @@ def _is_local_only(server, tool_name: Optional[str]) -> bool:
     return tool_name in server.local_only_tools()
 
 
-async def _requires_write(server, tool_name: Optional[str]) -> bool:
+async def _requires_write(server, tool_name: Optional[str], arguments: Optional[dict] = None) -> bool:
     """Return True if calling this tool requires the 'write' scope.
 
-    Derived per-call from `server.list_tools()`: a tool counts as write
-    unless its annotations explicitly set `readOnlyHint=True`. This matches
-    the MCP spec's default ("destructive=True, readOnly=False" unless
-    declared otherwise) and keeps the set in lockstep with the canonical
-    tool list — adding a new tool to `MemoryServer.list_tools` automatically
-    applies the right scope check.
-
-    Conditional tools like `memory_consolidate` only appear in the list once
-    their gating state is satisfied, so we derive on each call rather than
-    caching (the alternative would risk a stale cache locked in before the
-    consolidator finished initializing).
-
-    Conservative default: a tool name we don't recognise is treated as
-    requiring write scope.
+    The classification lives on `MemoryServer.tool_requires_write`, which
+    the SSE and Streamable HTTP transports use too (GHSA-9x7v-2vjj-xghg).
     """
-    if not tool_name:
-        return False
-    target = tool_name
-    # Fail closed if list_tools() raises during classification: the request
-    # MUST NOT be allowed through the scope gate just because we couldn't
-    # introspect the surface. A read-only token gets a clean -32003/403;
-    # call_tool would also fail, but the wrong response code there masks
-    # the scope decision.
-    try:
-        tools = await server.list_tools()
-    except Exception:
-        logger.exception("list_tools() raised during write-scope classification — failing closed")
-        return True
-    for tool in tools:
-        if tool.name == target:
-            return not (tool.annotations and getattr(tool.annotations, "readOnlyHint", False))
-    return True
+    return await server.tool_requires_write(tool_name, arguments)
+
+
+async def _scope_refusal(server, user, request_id, tool_name: str, arguments: dict) -> Optional[JSONResponse]:
+    """Return the 403 for a tool call the caller's scope does not cover, else None.
+
+    Mutating tools require 'write', read-only tools require 'read'
+    (GHSA-2r68-g678-7qr3). A global 'read'/'write' grants every store.
+    'read:<store>'/'write:<store>' grants exactly that store, and only where
+    MemoryServer.store_grant_target says the call stays inside it (the same rule
+    the SDK transports apply); anything else, including a call with no `store`,
+    requires the global operation scope.
+    """
+    operation = "write" if await _requires_write(server, tool_name, arguments) else "read"
+    target = await server.store_grant_target(tool_name, arguments)
+    if user.has_store_scope(operation, target):
+        return None
+    required = (
+        f"'{operation}' (global)" if target is None
+        else f"'{operation}' or '{operation}:{target}'"
+    )
+    response = MCPResponse(
+        id=request_id,
+        error={
+            "code": -32003,
+            "message": f"Insufficient scope: tool requires {required} access",
+            "data": {"required_scope": operation, "tool": tool_name, "store": arguments.get("store")},
+        },
+    )
+    return JSONResponse(content=response.model_dump(exclude_none=True), status_code=403)
+
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
 
@@ -120,7 +131,7 @@ def _get_memory_server():
         # `MemoryServer`. Without this, the lazy import here may fire while
         # `server` is mid-load and raise "cannot import name 'main' from
         # partially initialized module".
-        import mcp_memory_service.server  # noqa: F401
+        import mcp_memory_service.server  # noqa: F401  # inline import: breaks the server_impl circular dependency described above
         from ...server_impl import MemoryServer
         from ..dependencies import get_storage
 
@@ -144,30 +155,62 @@ def _get_memory_server():
 
 def _tool_to_dict(tool) -> Dict[str, Any]:
     """Convert an `mcp.types.Tool` to the wire shape MCP-over-HTTP returns."""
-    return {
+    out: Dict[str, Any] = {
         "name": tool.name,
         "description": tool.description,
         "inputSchema": tool.inputSchema,
     }
+    # The stdio transport serializes annotations through the SDK; this shim
+    # used to drop them, so remote clients never saw readOnlyHint /
+    # destructiveHint and could not pre-classify write tools the way stdio
+    # clients can.
+    if tool.annotations is not None:
+        if hasattr(tool.annotations, "model_dump"):
+            out["annotations"] = tool.annotations.model_dump(exclude_none=True)
+        else:
+            out["annotations"] = dict(tool.annotations)
+    return out
 
 
-def _wrap_tool_result(text_contents) -> Dict[str, Any]:
-    """Pack a `list[mcp.types.TextContent]` into an MCP `tools/call` result."""
-    return {
+def _wrap_tool_result(result, is_error: bool = False) -> Dict[str, Any]:
+    """Pack the shared dispatcher result into an MCP `tools/call` result."""
+    if isinstance(result, types.CallToolResult):
+        payload = {
+            "content": [
+                {"type": tc.type, "text": tc.text}
+                for tc in result.content
+            ],
+        }
+        if result.isError:
+            payload["isError"] = True
+        if result.structuredContent is not None:
+            payload["structuredContent"] = result.structuredContent
+        return payload
+
+    payload: Dict[str, Any] = {
         "content": [
             {"type": "text", "text": tc.text}
-            for tc in text_contents
+            for tc in result
         ]
     }
+    if is_error:
+        payload["isError"] = True
+    return payload
 
 
 @router.post("/")
 @router.post("")
 async def mcp_endpoint(
     request: MCPRequest,
-    user: AuthenticationResult = Depends(require_read_access)
+    http_request: Request,
+    user: AuthenticationResult = Depends(get_current_user)
 ):
-    """Main MCP protocol endpoint. Delegates to the shared MemoryServer."""
+    """Main MCP protocol endpoint. Delegates to the shared MemoryServer.
+
+    Scope is enforced per tool call (see tools/call below), not at the route,
+    so a store-restricted token (e.g. ``read:projectA``) can still initialize
+    and list tools but may only invoke tools within its stores.
+    """
     try:
         # JSON-RPC 2.0: a message without `id` is a Notification; the server
         # MUST NOT reply. MCP Streamable HTTP requires HTTP 202 Accepted with
@@ -190,6 +233,11 @@ async def mcp_endpoint(
                     },
                 },
             )
+            return JSONResponse(content=response.model_dump(exclude_none=True))
+
+        elif request.method == "ping":
+            # MCP liveness check: the spec requires an empty result object.
+            response = MCPResponse(id=request.id, result={})
             return JSONResponse(content=response.model_dump(exclude_none=True))
 
         elif request.method == "tools/list":
@@ -238,23 +286,43 @@ async def mcp_endpoint(
                 )
                 return JSONResponse(content=response.model_dump(exclude_none=True))
 
-            # Mutating tools require 'write' scope even through MCP. Read-only
-            # tools remain accessible with 'read' scope (GHSA-2r68-g678-7qr3).
-            if await _requires_write(server, tool_name) and not user.has_scope("write"):
+            refusal = await _scope_refusal(server, user, request.id, tool_name, arguments)
+            if refusal is not None:
+                return refusal
+
+            # The rate limiter reads transport identity, never tool arguments.
+            caller_identity = resolve_caller_identity(
+                http_request.headers.get("X-Agent-ID"),
+                http_request.client.host if http_request.client else None,
+            )
+            header_agent_id = http_request.headers.get("X-Agent-ID")
+            agent_id = header_agent_id.strip() if header_agent_id else None
+            agent_context_token = set_current_agent_id(agent_id)
+            read_filter_token = set_current_agent_read_filter(agent_id)
+
+            # This path bypasses the SDK wrapper, so a tool exception would surface
+            # as JSON-RPC -32603 (a request error) instead of the tool result with
+            # isError=true that MCP promises. Convert it here (#1601).
+            try:
+                text_contents = await server.call_tool(
+                    tool_name, arguments, caller_identity=caller_identity
+                )
+            except Exception as tool_error:
+                logger.warning(
+                    "Tool %s failed: %s",
+                    _sanitize_log_value(tool_name),
+                    _sanitize_log_value(tool_error),
+                )
+                text_contents = [types.TextContent(type="text", text=str(tool_error))]
                 response = MCPResponse(
                     id=request.id,
-                    error={
-                        "code": -32003,
-                        "message": "Insufficient scope: tool requires 'write' access",
-                        "data": {"required_scope": "write", "tool": tool_name},
-                    },
+                    result=_wrap_tool_result(text_contents, is_error=True),
                 )
-                return JSONResponse(
-                    content=response.model_dump(exclude_none=True),
-                    status_code=403,
-                )
+                return JSONResponse(content=response.model_dump(exclude_none=True))
+            finally:
+                reset_current_agent_read_filter(read_filter_token)
+                reset_current_agent_id(agent_context_token)
 
-            text_contents = await server.call_tool(tool_name, arguments)
             response = MCPResponse(
                 id=request.id,
                 result=_wrap_tool_result(text_contents),
@@ -272,7 +340,7 @@ async def mcp_endpoint(
             return JSONResponse(content=response.model_dump(exclude_none=True))
 
     except Exception as e:
-        logger.error(f"MCP endpoint error: {e}")
+        logger.error("MCP endpoint error: %s", _sanitize_log_value(e))
         response = MCPResponse(
             id=request.id,
             error={"code": -32603, "message": f"Internal error: {str(e)}"},
@@ -297,17 +365,18 @@ async def list_mcp_tools(
 
 @router.get("/health")
 async def mcp_health():
-    """MCP-specific health check."""
-    server = _get_memory_server()
-    await server._ensure_storage_initialized()
-    stats = await server.storage.get_stats() if server.storage else {}
-    tools = await server.list_tools()
-    return {
-        "status": "healthy",
-        "protocol": "mcp",
-        "tools_available": len(tools),
-        "storage_backend": (
-            server.storage.__class__.__name__ if server.storage else "uninitialized"
-        ),
-        "statistics": stats,
-    }
+    """MCP transport liveness check.
+
+    Deliberately unauthenticated and deliberately contentless. It used to
+    return storage statistics, the backend class name and the tool count to
+    any anonymous caller (GHSA-7w86-2vmv-fqwm). GHSA-73hc-m4hx-79pj had
+    already established that this class of data requires a proven identity —
+    it stripped /api/health down to a status field and moved the statistics
+    behind Depends(require_read_access) on /api/health/detailed — but that
+    change only touched health.py, so this parallel route stayed open.
+
+    The route stays open so that liveness probes keep working without
+    credentials; the statistics are simply gone. Authenticated callers get
+    them from /api/health/detailed, which is where they already live.
+    """
+    return {"status": "healthy", "protocol": "mcp"}

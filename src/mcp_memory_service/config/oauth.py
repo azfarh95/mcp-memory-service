@@ -5,6 +5,7 @@ import logging
 
 from .base import safe_get_int_env, safe_get_bool_env, get_base_directory
 from .transport import HTTPS_ENABLED, HTTP_HOST, HTTP_PORT, HTTP_ROOT_PATH
+from ..compat import _sanitize_log_value
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +182,7 @@ def validate_oauth_configuration() -> None:
     # Validate JWT configuration
     try:
         algorithm = get_jwt_algorithm()
-        logger.debug(f"OAuth JWT algorithm validation: {algorithm}")
+        logger.debug("OAuth JWT algorithm validation: %s", algorithm)
 
         # Test key access
         signing_key = get_jwt_signing_key()
@@ -237,7 +238,8 @@ def validate_oauth_configuration() -> None:
     # Log validation results
     # Note: errors/warnings may contain key-config info; log count only, raise with details
     if errors:
-        logger.error("OAuth configuration validation failed with %d error(s)", len(errors))
+        error_count = len(errors)
+        logger.error("OAuth configuration validation failed with %d error(s)", error_count)
         raise ValueError(f"Invalid OAuth configuration: {'; '.join(errors)}")
 
     if warnings:
@@ -278,6 +280,25 @@ OAUTH_REFRESH_TOKEN_EXPIRE_DAYS = safe_get_int_env('MCP_OAUTH_REFRESH_TOKEN_EXPI
 # OAuth security configuration
 ALLOW_ANONYMOUS_ACCESS = safe_get_bool_env('MCP_ALLOW_ANONYMOUS_ACCESS', False)
 
+# Scope granted to anonymous (un-authenticated) callers when
+# MCP_ALLOW_ANONYMOUS_ACCESS=true. Defaults to full "read write" so existing
+# anonymous deployments are unchanged. Operators running mixed access (some
+# agents authenticated with per-store OAuth scopes, others anonymous) can narrow
+# this to, e.g., "read:default" so un-authenticated callers get read-only access
+# to the shared `default` store while never reaching other partitions, the
+# cross-partition `store=all` sentinel, or the SSE firehose. A space-delimited
+# scope string, same grammar as issued tokens; "" grants nothing (every
+# store-scoped route returns 403). To disable anonymous access entirely, set
+# MCP_ALLOW_ANONYMOUS_ACCESS=false instead.
+def _resolve_anonymous_scope(raw):
+    """Resolve MCP_ANONYMOUS_SCOPE: unset (None) -> full "read write" (unchanged
+    default); set-but-empty ("") -> grants nothing. The distinction is
+    deliberate, so a plain ``os.getenv(...) or default`` would be wrong here."""
+    return ('read write' if raw is None else raw).strip()
+
+
+ANONYMOUS_ACCESS_SCOPE = _resolve_anonymous_scope(os.getenv('MCP_ANONYMOUS_SCOPE'))
+
 # Rate limiting + concurrency caps for the auth endpoints (/oauth/authorize,
 # /oauth/token, /oauth/register). In-process, per-client-IP — protects a single
 # instance against credential-stuffing / brute force / request floods.
@@ -311,5 +332,7 @@ if OAUTH_ENABLED:
     try:
         validate_oauth_configuration()
     except ValueError as e:
-        logger.error(f"OAuth configuration validation failed: {e}")
+        logger.error(
+            "OAuth configuration validation failed: %s", _sanitize_log_value(e)
+        )
         logger.error("OAuth will be disabled. To enable OAuth, fix configuration errors or set MCP_OAUTH_ENABLED=false")

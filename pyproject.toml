@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-memory-service"
-version = "11.12.0"
+version = "12.10.0"
 description = "Semantic memory layer for AI applications. REST API + MCP transport + knowledge graph + autonomous consolidation. Works with 14+ AI clients. Self-host, zero cloud cost."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = [
     "semantic-memory", "agent-memory", "ai-memory", "long-term-memory",
     "multi-agent", "langgraph", "crewai", "autogen", "agentic-ai",
@@ -24,7 +24,6 @@ classifiers = [
     "Topic :: Database :: Database Engines/Servers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11", 
     "Programming Language :: Python :: 3.12",
     "Operating System :: OS Independent",
@@ -42,12 +41,13 @@ dependencies = [
     "apscheduler>=3.11.0",
     "authlib>=1.6.9",
     "build>=0.10.0",
+    "certifi>=2026.10.19",
     "chardet>=5.0.0",
     "click>=8.0.0",
     "cryptography>=46.0.6",
     "fastapi>=0.115.5",
     "httpx>=0.24.0",
-    "mcp>=1.8.0,<2.0.0",
+    "mcp>=1.19.0,<2.0.0",
     "numpy>=1.24.0",
     "psutil>=5.9.0",
     "PyJWT[crypto]>=2.12.0",
@@ -72,6 +72,7 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-benchmark>=4.0.0",
     "pytest-timeout>=2.0.0",
+    "pytest-xdist>=3.6.0",
     "pytest-subtests>=0.10.0",
     "black>=26.3.1",
     "ruff>=0.1.0",
@@ -101,10 +102,14 @@ ml = [
 clustering = [
     "scikit-learn>=1.3.0",
 ]
-# NLI contradiction detection (Phase 3, RFC #732)
+# NLI contradiction detection (Phase 3, RFC #732). The ONNX inference path
+# imports tokenizers and huggingface_hub directly, so they are declared here
+# too — whether or not transformers (kept for its other uses) is installed.
 nli = [
     "transformers>=5.5.0,<6.0.0",
     "onnxruntime>=1.17.0",
+    "tokenizers>=0.22.2",
+    "huggingface_hub>=0.20",
 ]
 # SQLite-vec with lightweight ONNX embeddings (recommended for most users)
 # The ONNX embedding path needs both onnxruntime and tokenizers; shipping only
@@ -125,14 +130,12 @@ sqlite-ml = [
 # Milvus backend — Milvus Lite (single file), self-hosted Milvus, or Zilliz Cloud.
 # Shipped with the ML extras so sentence-transformers embeddings are available.
 milvus = [
-    # 3.x has breaking API changes and nothing here tests Milvus: the Test Milvus (Docker)
-    # job was dropped during the Codeberg era and never restored, so a break would be silent.
-    # Do not widen this bound until a Milvus CI job runs green against 3.x — see issue #1112.
-    # Dependabot cannot widen it any more either: .github/dependabot.yml ignores
-    # major updates for pymilvus, because a group bump rewrites this line rather
-    # than respecting it.
-    # A bulk uv-group bump (#976) already widened it to <4.0.0 once by accident.
-    "pymilvus>=2.5.0,<3.0.0",
+    # The milvus-tests job in .github/workflows/ci.yml gates the 2.x and 3.x
+    # lines, and the upper bound ships exactly what CI tests. Widen it to the
+    # next major only together with a gating CI leg for that major (#1112).
+    # .github/dependabot.yml ignores major updates for pymilvus, because a group
+    # bump rewrites this line rather than respecting it (#976, #1086).
+    "pymilvus>=2.5.0,<4.0.0",
     "milvus-lite>=2.4.10",
     # The default embedding path has been ONNX-first since v11, and [ml] below
     # only brings torch/sentence-transformers. Without onnxruntime a Milvus-only
@@ -216,66 +219,8 @@ changelog_sections = [
     ["test", "Tests"]
 ]
 
-[tool.coverage.run]
-source = ["src/mcp_memory_service"]
-omit = [
-    # OAuth system - no tests yet (Issue #316)
-    "src/mcp_memory_service/web/oauth/*",
-    # Web infrastructure - minimal test coverage
-    "src/mcp_memory_service/web/app.py",
-    "src/mcp_memory_service/web/sse.py",
-    # Web API endpoints - minimal test coverage
-    "src/mcp_memory_service/web/api/*",
-    "src/mcp_memory_service/web/dependencies.py",
-    # Sync infrastructure - no tests
-    "src/mcp_memory_service/sync/*",
-    # Backup/scheduler - infrastructure code
-    "src/mcp_memory_service/backup/scheduler.py",
-    "src/mcp_memory_service/consolidation/scheduler.py",
-    # CLI commands - minimal coverage
-    "src/mcp_memory_service/cli/*",
-    # API client layer - infrastructure code
-    "src/mcp_memory_service/api/client.py",
-    "src/mcp_memory_service/api/operations.py",
-    "src/mcp_memory_service/api/sync_wrapper.py",
-    # Ingestion system - minimal coverage
-    "src/mcp_memory_service/ingestion/*",
-    # Discovery system - infrastructure code
-    "src/mcp_memory_service/discovery/*",
-    # Utility modules - infrastructure code
-    "src/mcp_memory_service/utils/cache_manager.py",
-    "src/mcp_memory_service/utils/directory_ingestion.py",
-    "src/mcp_memory_service/utils/health_check.py",
-    "src/mcp_memory_service/utils/http_server_manager.py",
-    "src/mcp_memory_service/utils/quality_analytics.py",
-    "src/mcp_memory_service/utils/startup_orchestrator.py",
-    "src/mcp_memory_service/utils/time_parser.py",
-    "src/mcp_memory_service/utils/gpu_detection.py",
-    "src/mcp_memory_service/utils/db_utils.py",
-    "src/mcp_memory_service/utils/content_splitter.py",
-    "src/mcp_memory_service/utils/debug.py",
-    # Milvus storage - requires pymilvus (not installed in CI)
-    "src/mcp_memory_service/storage/milvus.py",
-    "src/mcp_memory_service/storage/milvus_graph.py",
-    # HTTP client - minimal usage
-    "src/mcp_memory_service/storage/http_client.py",
-    # CLI utilities
-    "src/mcp_memory_service/cli/utils.py",
-    # CLI entry points
-    "src/mcp_memory_service/__main__.py",
-    "src/mcp_memory_service/mcp_server.py",
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.4.0",
 ]
 
-[tool.coverage.report]
-precision = 2
-show_missing = true
-skip_covered = false
-exclude_lines = [
-    "pragma: no cover",
-    "def __repr__",
-    "if TYPE_CHECKING:",
-    "raise AssertionError",
-    "raise NotImplementedError",
-    "if __name__ == .__main__.:",
-    "@(abc\\.)?abstractmethod",
-]

@@ -14,6 +14,72 @@ from ..compat import _sanitize_log_value
 
 logger = logging.getLogger(__name__)
 
+
+def warn_unrecognized_path_var(environ: dict) -> str | None:
+    """Check for unrecognized MCP_MEMORY_* environment variables that look like path settings.
+    
+    Args:
+        environ: Environment dictionary (typically os.environ)
+        
+    Returns:
+        Warning message string if unrecognized path-like vars found and no correct path vars set,
+        None otherwise.
+        
+    The function warns when:
+    1. An unrecognized MCP_MEMORY_* variable exists that contains PATH/DB/DIR (case-insensitive)
+    2. AND neither MCP_MEMORY_SQLITE_PATH nor MCP_MEMORY_SQLITEVEC_PATH is set
+    
+    This helps users catch common typos like MCP_MEMORY_DB_PATH instead of MCP_MEMORY_SQLITE_PATH.
+    """
+    # Set of recognized MCP_MEMORY_* environment variables (16 total from spec)
+    recognized_vars = {
+        'MCP_MEMORY_ALLOW_HASH_EMBEDDINGS',
+        'MCP_MEMORY_ALLOW_SELF_SIGNED_CERTS',
+        'MCP_MEMORY_ARCHIVE_PATH',
+        'MCP_MEMORY_BACKUPS_PATH',
+        'MCP_MEMORY_BASE_DIR',
+        'MCP_MEMORY_INCLUDE_HOSTNAME',
+        'MCP_MEMORY_INTEGRITY_CHECK_ENABLED',
+        'MCP_MEMORY_INTEGRITY_CHECK_INTERVAL',
+        'MCP_MEMORY_OFFLINE',
+        'MCP_MEMORY_ONNX_ALLOW_DOWNLOAD',
+        'MCP_MEMORY_ONNX_PROVIDERS',
+        'MCP_MEMORY_SQLITE_PATH',
+        'MCP_MEMORY_SQLITE_PRAGMAS',
+        'MCP_MEMORY_SQLITEVEC_PATH',
+        'MCP_MEMORY_STORAGE_BACKEND',
+        'MCP_MEMORY_USE_ONNX'
+    }
+    
+    # Known correct path variables
+    correct_path_vars = {'MCP_MEMORY_SQLITE_PATH', 'MCP_MEMORY_SQLITEVEC_PATH'}
+    
+    # Check if any correct path var is already set
+    if any(environ.get(var) for var in correct_path_vars):
+        return None
+    
+    # Find unrecognized MCP_MEMORY_* vars that look like path settings
+    path_like_keywords = {'path', 'db', 'dir'}
+    unrecognized_path_vars = []
+    
+    for key in environ:
+        if key.startswith('MCP_MEMORY_') and key not in recognized_vars:
+            # Check if variable name contains path-like keywords (case-insensitive)
+            key_lower = key.lower()
+            if any(keyword in key_lower for keyword in path_like_keywords):
+                unrecognized_path_vars.append(key)
+    
+    if unrecognized_path_vars:
+        # Return warning for the first unrecognized path-like var found.
+        # Sanitize the raw env-var name (user-controlled) at the source to prevent
+        # log injection via newline/escape characters reaching the logger.
+        var_name = _sanitize_log_value(unrecognized_path_vars[0])
+        return (f"Unrecognized env var '{var_name}' looks like a database path setting "
+                f"but is not read by the service. Did you mean MCP_MEMORY_SQLITE_PATH? "
+                f"Falling back to default.")
+    
+    return None
+
 # =============================================================================
 # Content Length Limits Configuration (v7.5.0+)
 # =============================================================================
@@ -79,6 +145,10 @@ if STORAGE_BACKEND == 'sqlite_vec' or STORAGE_BACKEND == 'hybrid':
     if not sqlite_vec_path:
         sqlite_vec_path = os.path.join(BASE_DIR, 'sqlite_vec.db')
         logger.info("No SQLite-vec path environment variable found, using default: %s", _sanitize_log_value(sqlite_vec_path))
+        
+        # Check for unrecognized path-like environment variables
+        if warning_msg := warn_unrecognized_path_var(os.environ):
+            logger.warning(warning_msg)
     
     # Ensure directory exists for SQLite database
     sqlite_dir = os.path.dirname(sqlite_vec_path)
@@ -90,8 +160,16 @@ if STORAGE_BACKEND == 'sqlite_vec' or STORAGE_BACKEND == 'hybrid':
 else:
     SQLITE_VEC_PATH = None
 
-# Cloudflare specific configuration (also needed for hybrid backend)
-if STORAGE_BACKEND == 'cloudflare' or STORAGE_BACKEND == 'hybrid':
+# Hybrid secondary backend selector — read early so the Cloudflare validation
+# below can skip when the secondary is HTTP (RemoteHTTPStorage never uses Cloudflare).
+# Re-read (idempotent) further down where the rest of the secondary config lives.
+_HYBRID_SECONDARY_BACKEND_EARLY = os.getenv('MCP_HYBRID_SECONDARY_BACKEND', 'cloudflare').lower()
+
+# Cloudflare specific configuration (also needed for the hybrid backend, UNLESS the
+# hybrid secondary is HTTP — in that case Cloudflare creds are not required, #1304).
+if STORAGE_BACKEND == 'cloudflare' or (
+    STORAGE_BACKEND == 'hybrid' and _HYBRID_SECONDARY_BACKEND_EARLY != 'http'
+):
     # Required Cloudflare settings
     CLOUDFLARE_API_TOKEN = os.getenv('CLOUDFLARE_API_TOKEN')
     CLOUDFLARE_ACCOUNT_ID = os.getenv('CLOUDFLARE_ACCOUNT_ID')
@@ -138,6 +216,21 @@ else:
     CLOUDFLARE_LARGE_CONTENT_THRESHOLD = None
     CLOUDFLARE_MAX_RETRIES = None
     CLOUDFLARE_BASE_DELAY = None
+
+# HTTP Secondary backend configuration (RFC #1304 Phase 2) - Available regardless of global backend
+# These are used by HybridMemoryStorage when instantiated programmatically
+MCP_HYBRID_SECONDARY_BACKEND = _HYBRID_SECONDARY_BACKEND_EARLY
+MCP_HYBRID_SECONDARY_URL = os.getenv('MCP_HYBRID_SECONDARY_URL')
+MCP_HYBRID_SECONDARY_API_KEY = os.getenv('MCP_HYBRID_SECONDARY_API_KEY')
+
+# HTTP Secondary backend authentication configuration (R9b) - Available regardless of global backend
+MCP_HYBRID_SECONDARY_AUTH_STYLE = os.getenv('MCP_HYBRID_SECONDARY_AUTH_STYLE', 'bearer').lower()
+if MCP_HYBRID_SECONDARY_AUTH_STYLE not in ('bearer', 'x-api-key'):
+    logger.warning("Invalid MCP_HYBRID_SECONDARY_AUTH_STYLE '%s', falling back to 'bearer'", MCP_HYBRID_SECONDARY_AUTH_STYLE)
+    MCP_HYBRID_SECONDARY_AUTH_STYLE = 'bearer'
+
+MCP_HYBRID_SECONDARY_BASIC_USER = os.getenv('MCP_HYBRID_SECONDARY_BASIC_USER')
+MCP_HYBRID_SECONDARY_BASIC_PASS = os.getenv('MCP_HYBRID_SECONDARY_BASIC_PASS')
 
 # Hybrid backend specific configuration
 if STORAGE_BACKEND == 'hybrid':
@@ -189,18 +282,19 @@ if STORAGE_BACKEND == 'hybrid':
     CLOUDFLARE_WARNING_THRESHOLD_PERCENT = 80  # Warn at 80% capacity
     CLOUDFLARE_CRITICAL_THRESHOLD_PERCENT = 95  # Critical at 95% capacity
 
-    # Validate Cloudflare configuration for hybrid mode
-    if not (CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_VECTORIZE_INDEX and CLOUDFLARE_D1_DATABASE_ID):
-        logger.warning("Hybrid mode requires Cloudflare configuration. Missing required variables:")
-        if not CLOUDFLARE_API_TOKEN:
-            logger.warning("  - CLOUDFLARE_API_TOKEN")
-        if not CLOUDFLARE_ACCOUNT_ID:
-            logger.warning("  - CLOUDFLARE_ACCOUNT_ID")
-        if not CLOUDFLARE_VECTORIZE_INDEX:
-            logger.warning("  - CLOUDFLARE_VECTORIZE_INDEX")
-        if not CLOUDFLARE_D1_DATABASE_ID:
-            logger.warning("  - CLOUDFLARE_D1_DATABASE_ID")
-        logger.warning("Hybrid mode will operate in SQLite-only mode until Cloudflare is configured")
+    # Validate Cloudflare configuration for hybrid mode (skip if using HTTP secondary backend)
+    if MCP_HYBRID_SECONDARY_BACKEND != 'http':
+        if not (CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_VECTORIZE_INDEX and CLOUDFLARE_D1_DATABASE_ID):
+            logger.warning("Hybrid mode requires Cloudflare configuration. Missing required variables:")
+            if not CLOUDFLARE_API_TOKEN:
+                logger.warning("  - CLOUDFLARE_API_TOKEN")
+            if not CLOUDFLARE_ACCOUNT_ID:
+                logger.warning("  - CLOUDFLARE_ACCOUNT_ID")
+            if not CLOUDFLARE_VECTORIZE_INDEX:
+                logger.warning("  - CLOUDFLARE_VECTORIZE_INDEX")
+            if not CLOUDFLARE_D1_DATABASE_ID:
+                logger.warning("  - CLOUDFLARE_D1_DATABASE_ID")
+            logger.warning("Hybrid mode will operate in SQLite-only mode until Cloudflare is configured")
 else:
     # Set hybrid-specific variables to None when not using hybrid backend
     HYBRID_SYNC_INTERVAL = None
@@ -220,6 +314,10 @@ else:
     HYBRID_MIN_CHECK_COUNT = None
     HYBRID_FALLBACK_TO_PRIMARY = None
     HYBRID_WARN_ON_SECONDARY_FAILURE = None
+
+    # HTTP Secondary backend variables (kept for backward compatibility, but main values are always available above)
+    # Only the core HTTP secondary backend variables are set to None here, not the auth-specific ones
+    # since auth variables should be available even when not using hybrid backend globally
 
     # Also set limit constants to None
     CLOUDFLARE_D1_MAX_SIZE_GB = None
@@ -263,18 +361,16 @@ else:
     # Fallback to a default SQLite-vec path for HTTP interface
     DATABASE_PATH = os.path.join(BASE_DIR, 'memory_http.db')
 
-# Voyage parallel index file: same directory/name as SQLITE_VEC_PATH with a
-# `.voyage` infix (sqlite_vec.db -> sqlite_vec.voyage.db). One sqlite-vec file per
-# embedding backend — MiniLM (384) and Voyage (1024) vectors can never share a
-# vec0 table because the dimension is baked into the schema.
+# Voyage parallel index file: same directory/name with a `.voyage` infix
+# (sqlite_vec.db -> sqlite_vec.voyage.db). One sqlite-vec file per embedding
+# backend — MiniLM is 384-dim and Voyage 1024-dim, and sqlite-vec bakes the
+# dimension into the vec0 schema, so they can never share a table.
 if SQLITE_VEC_PATH:
     _svp_root, _svp_ext = os.path.splitext(SQLITE_VEC_PATH)
     VOYAGE_DATABASE_PATH = f"{_svp_root}.voyage{_svp_ext}"
 else:
     VOYAGE_DATABASE_PATH = None
 
-# Parallel index (default on): when EMBED_BACKEND=voyage, the storage layer keeps
-# BOTH indexes live — Voyage writes here, MiniLM writes the classic path — so a
-# Voyage outage degrades to the local index instead of losing semantic search.
-# Set MCP_MEMORY_PARALLEL_INDEX=0 for single-backend behavior (env-selected file only).
+# Parallel index (default on): with EMBED_BACKEND=voyage, both indexes stay live
+# so a Voyage outage degrades to the local index instead of losing search.
 PARALLEL_INDEX = os.getenv('MCP_MEMORY_PARALLEL_INDEX', '1').strip().lower() not in ('0', 'false', 'no')

@@ -14,9 +14,48 @@ except ImportError:
     pass
 
 from ...models.memory import Memory, MemoryQueryResult
+from ...models.ontology import coerce_memory_type
 from ...utils.hashing import generate_content_hash
+from ...compat import _sanitize_log_value
+from ..shared import (
+    _access_metadata_merge_sql,
+    _exclude_versioned_parent,
+    _merge_access_metadata_text,
+)
 
 logger = logging.getLogger(__name__)
+
+CONFLICT_TAG = "conflict:unresolved"
+
+
+def _store_clause(store: Optional[str]) -> Tuple[str, Tuple[str, ...]]:
+    """SQL suffix confining a hash-addressed statement to one store (#1875).
+
+    ``None`` and ``"all"`` mean unscoped, the same as on the read paths.
+    """
+    if store is None or store == "all":
+        return "", ()
+    return " AND store = ?", (store,)
+
+# A memory's contradicts partners, read over edges in either direction: the graph
+# can hold a pair one-way (a later INSERT OR REPLACE of another relationship type
+# overwrites one direction), and get_conflicts() reads only the source < target
+# edge, so a pair can be listed through either row's outgoing edge.
+_CONTRADICTS_PARTNERS_SQL = (
+    "SELECT target_hash FROM memory_graph "
+    "WHERE relationship_type = 'contradicts' AND source_hash = :h AND target_hash != :h "
+    "UNION "
+    "SELECT source_hash FROM memory_graph "
+    "WHERE relationship_type = 'contradicts' AND target_hash = :h AND source_hash != :h"
+)
+
+# Whether any of those partners is current: neither soft-deleted nor superseded,
+# the same condition get_conflicts() applies to both sides of a pair.
+_HAS_CURRENT_PARTNER_SQL = (
+    f"SELECT 1 FROM memories p WHERE p.content_hash IN ({_CONTRADICTS_PARTNERS_SQL}) "
+    "AND p.deleted_at IS NULL AND (p.superseded_by IS NULL OR p.superseded_by = '') "
+    "LIMIT 1"
+)
 
 
 class MetadataMixin:
@@ -24,12 +63,15 @@ class MetadataMixin:
 
     async def _persist_access_metadata(self, memory: Memory):
         """Persist access tracking metadata (access_count, last_accessed_at) to storage."""
+        merged_sql, merged_params = _access_metadata_merge_sql("metadata", memory.metadata)
+
         def update_metadata():
-            self.conn.execute('''
-                UPDATE memories
-                SET metadata = ?
-                WHERE content_hash = ?
-            ''', (json.dumps(memory.metadata), memory.content_hash))
+            # #1464: write only the access keys, not the whole snapshot.
+            self.conn.execute(
+                f"UPDATE memories SET metadata = {merged_sql} WHERE content_hash = ?",
+                (*merged_params, memory.content_hash),
+            )
+            self._merge_access_metadata_sqlite_rejects([memory])
             self.conn.commit()
 
         await self._execute_with_retry(update_metadata)
@@ -43,25 +85,69 @@ class MetadataMixin:
             # issue #1239: persist BOTH the metadata JSON and the dedicated
             # last_accessed column, so staleness/decay measure disuse (not age).
             # The column is what _apply_stale_days_filter reads.
-            rows = []
+            # issue #1464: merge only the access keys into the stored JSON, so a
+            # metadata update committed after the snapshot was read survives.
+            # Memories that carry the same access keys share one statement.
+            statements: Dict[str, List[tuple]] = {}
             for m in memories:
+                merged_sql, merged_params = _access_metadata_merge_sql("metadata", m.metadata)
                 la = m.metadata.get("last_accessed_at")
                 last_accessed = int(la) if la is not None else None
-                rows.append((json.dumps(m.metadata), last_accessed, m.content_hash))
-            self.conn.executemany(
-                "UPDATE memories SET metadata = ?, last_accessed = ? "
-                "WHERE content_hash = ? AND deleted_at IS NULL",
-                rows,
-            )
+                statements.setdefault(merged_sql, []).append(
+                    (*merged_params, last_accessed, m.content_hash)
+                )
+            for merged_sql, rows in statements.items():
+                self.conn.executemany(
+                    f"UPDATE memories SET metadata = {merged_sql}, last_accessed = ? "
+                    "WHERE content_hash = ? AND deleted_at IS NULL",
+                    rows,
+                )
+            self._merge_access_metadata_sqlite_rejects(memories)
             self.conn.commit()
 
         await self._execute_with_retry(batch_update)
 
-    async def update_memory_metadata(self, content_hash: str, updates: Dict[str, Any], preserve_timestamps: bool = True) -> Tuple[bool, str]:
-        """Update memory metadata without recreating the entire memory entry."""
+    def _merge_access_metadata_sqlite_rejects(self, memories: List[Memory]) -> None:
+        """Merge access keys in Python into rows SQLite's JSON functions reject.
+
+        The SQL merge leaves such rows unchanged (see
+        ``_access_metadata_merge_sql``). This runs in the caller's transaction,
+        before its commit, and only touches the access keys.
+        """
+        by_hash = {m.content_hash: m for m in memories}
+        hashes = list(by_hash)
+        for start in range(0, len(hashes), 500):
+            chunk = hashes[start:start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rejected = self.conn.execute(
+                "SELECT content_hash, metadata FROM memories "
+                f"WHERE content_hash IN ({placeholders}) AND deleted_at IS NULL "
+                "AND metadata IS NOT NULL AND metadata != '' AND NOT json_valid(metadata)",
+                chunk,
+            ).fetchall()
+            for content_hash, stored in rejected:
+                self.conn.execute(
+                    "UPDATE memories SET metadata = ? WHERE content_hash = ?",
+                    (_merge_access_metadata_text(stored, by_hash[content_hash].metadata), content_hash),
+                )
+
+    async def update_memory_metadata(
+        self,
+        content_hash: str,
+        updates: Dict[str, Any],
+        preserve_timestamps: bool = True,
+        store: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Update memory metadata without recreating the entire memory entry.
+
+        With ``store`` set (other than ``"all"``), a memory in another store
+        is reported as not found and left untouched (#1875).
+        """
         try:
             if not self.conn:
                 return False, "Database not initialized"
+
+            store_sql, store_params = _store_clause(store)
 
             def _read_current():
                 cursor = self.conn.execute(
@@ -69,8 +155,8 @@ class MetadataMixin:
                     SELECT content, tags, memory_type, metadata, created_at, created_at_iso,
                            updated_at, updated_at_iso
                     FROM memories WHERE content_hash = ? AND deleted_at IS NULL
-                """,
-                    (content_hash,),
+                """ + store_sql,
+                    (content_hash, *store_params),
                 )
                 return cursor.fetchone()
 
@@ -103,17 +189,40 @@ class MetadataMixin:
 
             protected_fields = {
                 "content", "content_hash", "tags", "memory_type", "metadata",
-                "embedding", "created_at", "created_at_iso", "updated_at", "updated_at_iso"
+                "embedding", "created_at", "created_at_iso", "updated_at", "updated_at_iso",
+                "superseded_by"
             }
 
             for key, value in updates.items():
                 if key not in protected_fields:
                     new_metadata[key] = value
 
+            # superseded_by column update (fix for bug #1352).
+            # Only touch the column when the caller explicitly asks: reading the
+            # current value and rewriting it on every unrelated update would race
+            # with mark_superseded_batch()/resolve_conflict() and silently undo a
+            # supersession recorded between our read and write (Greptile P1).
+            update_superseded_by = "superseded_by" in updates
+            if update_superseded_by:
+                new_superseded_by = updates["superseded_by"]
+                if new_superseded_by == "":          # empty string clears the column
+                    new_superseded_by = None
+                # Reconcile the legacy JSON value so an export or a JSON-reading
+                # backend does not keep hiding the memory after the column changes.
+                if new_superseded_by is None:
+                    new_metadata.pop("superseded_by", None)
+                else:
+                    new_metadata["superseded_by"] = new_superseded_by
+
             now = time.time()
             now_iso = datetime.utcfromtimestamp(now).isoformat() + "Z"
 
-            structural_change = any(k in updates for k in ("tags", "memory_type", "content"))
+            structural_change = (
+                set(new_tags.split(",") if new_tags else [])
+                != set(current_tags.split(",") if current_tags else [])
+                or new_type != current_type
+                or "content" in updates
+            )
             if preserve_timestamps and not structural_change:
                 updated_at = current_updated_at if current_updated_at else now
                 updated_at_iso = current_updated_at_iso if current_updated_at_iso else now_iso
@@ -127,28 +236,80 @@ class MetadataMixin:
                 updated_at_iso = now_iso
 
             def _do_update():
-                self.conn.execute(
-                    """
-                    UPDATE memories SET
-                        tags = ?, memory_type = ?, metadata = ?,
-                        updated_at = ?, updated_at_iso = ?,
-                        created_at = ?, created_at_iso = ?
-                    WHERE content_hash = ? AND deleted_at IS NULL
-                """,
-                    (
-                        new_tags,
-                        new_type,
-                        json.dumps(new_metadata),
-                        updated_at,
-                        updated_at_iso,
-                        created_at,
-                        created_at_iso,
-                        content_hash,
-                    ),
-                )
-                self.conn.commit()
+                set_clauses = [
+                    "tags = ?", "memory_type = ?", "metadata = ?",
+                    "updated_at = ?", "updated_at_iso = ?",
+                    "created_at = ?", "created_at_iso = ?",
+                ]
+                params = [
+                    new_tags, new_type, json.dumps(new_metadata),
+                    updated_at, updated_at_iso, created_at, created_at_iso,
+                ]
+                if update_superseded_by:
+                    set_clauses.append("superseded_by = ?")
+                    params.append(new_superseded_by)
+                    # Issue #1724 follow-up (review): superseded_at is the
+                    # historical instant the row ceased being current. Stamp it
+                    # only on the actual current -> superseded transition;
+                    # preserve the original on retries / re-points, and clear
+                    # it when superseded_by is cleared. (Column refs inside the
+                    # CASE see pre-update values.) Never overwrite it on a
+                    # plain metadata update — this branch only runs when the
+                    # caller explicitly sets superseded_by.
+                    set_clauses.append(
+                        "superseded_at = CASE "
+                        "WHEN ? IS NULL THEN NULL "
+                        "WHEN superseded_by IS NULL OR superseded_by = '' THEN ? "
+                        "ELSE superseded_at END"
+                    )
+                    params.extend([new_superseded_by, now])
+                params.append(content_hash)
+                params.extend(store_params)
+                # SAVEPOINT so a failure (UPDATE or event append) rolls back atomically
+                # WITHIN this serialized operation — never with a bare rollback outside the
+                # lock, which could discard another worker's transaction (greptile P1).
+                sp = f"update_meta_{os.urandom(4).hex()}"
+                self.conn.execute(f"SAVEPOINT {sp}")
+                try:
+                    cur = self.conn.execute(
+                        f"UPDATE memories SET {', '.join(set_clauses)} "
+                        "WHERE content_hash = ? AND deleted_at IS NULL" + store_sql,
+                        tuple(params),
+                    )
+                    # Only emit an event if a live row was actually updated — if the memory
+                    # was deleted between the existence check and here, rowcount is 0 and we
+                    # must NOT log a mutation that never happened (greptile P1).
+                    if cur.rowcount > 0 and hasattr(self, '_append_sync_event'):
+                        payload = {
+                            'content_hash': content_hash,
+                            'updates': updates,
+                            'updated_at': updated_at,
+                        }
+                        if update_superseded_by:
+                            # Issue #1773: carry the origin's superseded_at (the CASE above
+                            # may have kept an earlier instant) so receivers never re-stamp it.
+                            payload['superseded_at'] = self._read_superseded_at(content_hash)
+                        self._append_sync_event(self.conn, 'update_metadata', content_hash, payload)
+                    self.conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except Exception:
+                    # Fail-closed (ADR-0008): discard the UPDATE and the event together.
+                    self.conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    self.conn.execute(f"RELEASE SAVEPOINT {sp}")
+                    raise
+                try:
+                    self.conn.commit()
+                except Exception:
+                    # The SAVEPOINT is already RELEASE'd, so a failed commit can't be undone
+                    # by a savepoint rollback — roll the whole transaction back so the update
+                    # does not linger pending and leak into a later write (greptile P1).
+                    self.conn.rollback()
+                    raise
+                return cur.rowcount
 
-            await self._execute_with_retry(_do_update)
+            # Zero rows means the memory was deleted, or left the store, between
+            # the read and the write: report not found, not success (#1875).
+            if not await self._execute_with_retry(_do_update):
+                return False, f"Memory with hash {content_hash} not found"
 
             updated_fields = []
             if "tags" in updates:
@@ -157,21 +318,22 @@ class MetadataMixin:
                 updated_fields.append("memory_type")
             if "metadata" in updates:
                 updated_fields.append("custom_metadata")
+            if "superseded_by" in updates:
+                updated_fields.append("superseded_by")
 
             for key in updates.keys():
-                if key not in protected_fields and key not in ["tags", "memory_type", "metadata"]:
+                if key not in protected_fields and key not in ["tags", "memory_type", "metadata", "superseded_by"]:
                     updated_fields.append(key)
 
             updated_fields.append("updated_at")
 
             summary = f"Updated fields: {', '.join(updated_fields)}"
-            logger.info(f"Successfully updated metadata for memory {content_hash}")
+            logger.info("Successfully updated metadata for memory %s", _sanitize_log_value(content_hash))
             return True, summary
 
         except Exception as e:
             error_msg = f"Error updating memory metadata: {str(e)}"
-            logger.error(error_msg)
-            logger.error(traceback.format_exc())
+            logger.error("%s\n%s", _sanitize_log_value(error_msg), traceback.format_exc())
             return False, error_msg
 
     async def update_memories_batch(self, memories: List[Memory], preserve_timestamps: bool = False) -> List[bool]:
@@ -202,7 +364,7 @@ class MetadataMixin:
 
                         row = cursor.fetchone()
                         if not row:
-                            logger.warning(f"Memory {memory.content_hash} not found during batch update")
+                            logger.warning("Memory %s not found during batch update", _sanitize_log_value(memory.content_hash))
                             continue
 
                         (content, current_tags, current_type, current_metadata_str,
@@ -220,8 +382,9 @@ class MetadataMixin:
                         new_type = memory.memory_type if memory.memory_type else current_type
 
                         structural_change = (
-                            new_tags != current_tags or
-                            new_type != current_type
+                            set(new_tags.split(",") if new_tags else [])
+                            != set(current_tags.split(",") if current_tags else [])
+                            or new_type != current_type
                         )
                         if preserve_timestamps and not structural_change:
                             mem_updated_at = current_updated_at if current_updated_at else now
@@ -250,7 +413,7 @@ class MetadataMixin:
                         results[idx] = True
 
                     except Exception as e:
-                        logger.warning(f"Failed to update memory {memory.content_hash} in batch: {e}")
+                        logger.warning("Failed to update memory %s in batch: %s", _sanitize_log_value(memory.content_hash), _sanitize_log_value(str(e)))
                         continue
 
                 self.conn.commit()
@@ -258,16 +421,176 @@ class MetadataMixin:
             await self._execute_with_retry(_batch_update)
 
             success_count = sum(results)
-            logger.info(f"Batch update completed: {success_count}/{len(memories)} memories updated successfully")
+            logger.info("Batch update completed: %s/%s memories updated successfully", success_count, len(memories))
 
             return results
 
         except Exception as e:
             if self.conn:
-                self.conn.rollback()
-            logger.error(f"Batch update failed: {e}")
-            logger.error(traceback.format_exc())
+                await self._run_in_thread(self.conn.rollback)
+            logger.error("Batch update failed: %s\n%s", _sanitize_log_value(str(e)), traceback.format_exc())
             return [False] * len(memories)
+
+    def _read_superseded_at(self, content_hash: str) -> float | None:
+        """Return the row's superseded_at as written by the current transaction."""
+        row = self.conn.execute(
+            "SELECT superseded_at FROM memories WHERE content_hash = ? AND deleted_at IS NULL",
+            (content_hash,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def _append_supersede_event(self, content_hash: str) -> None:
+        """Log a supersede of ``content_hash`` for delta-sync peers (issue #1773).
+
+        Runs inside the caller's transaction/savepoint, so the UPDATE and the event
+        commit or roll back together (ADR-0008). The event is an ``update_metadata``
+        whose ``updates`` holds only ``superseded_by``, a field peers already treat as
+        protected, and whose ``superseded_at`` sits at the payload top level, where a
+        peer without #1773 never reads it. Both values and ``updated_at`` are read back
+        from the row, so receivers write the origin's values instead of re-stamping.
+        """
+        if not hasattr(self, '_append_sync_event'):
+            return
+        row = self.conn.execute(
+            "SELECT superseded_by, superseded_at, updated_at FROM memories "
+            "WHERE content_hash = ? AND deleted_at IS NULL",
+            (content_hash,),
+        ).fetchone()
+        if row is None:
+            return
+        superseded_by, superseded_at, updated_at = row
+        payload = {
+            'content_hash': content_hash,
+            'updates': {'superseded_by': superseded_by},
+            'superseded_at': superseded_at,
+            'updated_at': updated_at,
+        }
+        self._append_sync_event(self.conn, 'update_metadata', content_hash, payload)
+
+    def _supersede_with_event(self, winner_hash: str, loser_hash: str, now: float) -> None:
+        """Point ``loser_hash`` at ``winner_hash`` and log the change for sync peers.
+
+        Issue #1724 / follow-up review: stamp superseded_at only on the actual
+        current -> superseded transition. A retried call (same winner) or a re-point
+        keeps the ORIGINAL replacement moment — re-stamping would corrupt the
+        historical instant that point-in-time queries rely on. (CASE sees pre-update
+        values.) A retry that changes nothing logs no event.
+        """
+        before = self.conn.execute(
+            "SELECT superseded_by FROM memories WHERE content_hash = ? AND deleted_at IS NULL",
+            (loser_hash,),
+        ).fetchone()
+        cur = self.conn.execute(
+            "UPDATE memories SET superseded_by = ?, "
+            "superseded_at = CASE WHEN superseded_by IS NULL OR superseded_by = '' "
+            "THEN ? ELSE superseded_at END "
+            "WHERE content_hash = ? AND deleted_at IS NULL",
+            (winner_hash, now, loser_hash),
+        )
+        if cur.rowcount > 0 and before is not None and before[0] != winner_hash:
+            self._append_supersede_event(loser_hash)
+        if cur.rowcount > 0:
+            # Issue #1840: the loser no longer keeps its conflicts alive.
+            self._clear_stale_conflict_tags(self._contradicts_partners(loser_hash))
+
+    def _contradicts_partners(self, content_hash: str) -> List[str]:
+        """Hashes linked to ``content_hash`` by a contradicts edge, either direction."""
+        return [
+            row[0]
+            for row in self.conn.execute(_CONTRADICTS_PARTNERS_SQL, {"h": content_hash})
+        ]
+
+    def _find_stale_conflict_tags(self, hashes) -> List[Tuple[str, str]]:
+        """Current rows among ``hashes`` tagged conflict:unresolved with no current partner.
+
+        Returns ``(content_hash, tags_without_the_conflict_tag)`` pairs. Superseded and
+        deleted rows are skipped: they keep their own tags as history.
+        """
+        stale = []
+        for content_hash in dict.fromkeys(h for h in hashes if h):
+            row = self.conn.execute(
+                "SELECT tags FROM memories WHERE content_hash = ? AND deleted_at IS NULL "
+                "AND (superseded_by IS NULL OR superseded_by = '')",
+                (content_hash,),
+            ).fetchone()
+            if not row or not row[0]:
+                continue
+            tags = [t.strip() for t in row[0].split(",") if t.strip()]
+            if CONFLICT_TAG not in tags:
+                continue
+            if self.conn.execute(_HAS_CURRENT_PARTNER_SQL, {"h": content_hash}).fetchone():
+                continue
+            stale.append((content_hash, ",".join(t for t in tags if t != CONFLICT_TAG)))
+        return stale
+
+    def _clear_stale_conflict_tags(self, hashes) -> int:
+        """Issue #1840: drop conflict:unresolved where no current conflict partner remains.
+
+        Synchronous, on the caller's connection and inside the caller's transaction or
+        savepoint, so the clearing lands or vanishes with the supersede or delete that
+        caused it. Clear-only: it never adds the tag. Like _record_conflicts() and
+        resolve_conflict(), it logs no sync event and leaves updated_at alone. A peer
+        that applies the supersede or delete through sync does not clear inline; its
+        reconcile_conflict_tags() pass does.
+        """
+        stale = self._find_stale_conflict_tags(hashes)
+        for content_hash, tags in stale:
+            self.conn.execute(
+                "UPDATE memories SET tags = ? WHERE content_hash = ? AND deleted_at IS NULL",
+                (tags, content_hash),
+            )
+        return len(stale)
+
+    async def reconcile_conflict_tags(self, dry_run: bool = True) -> Dict[str, Any]:
+        """Clear conflict:unresolved from current memories with no current partner (#1840).
+
+        Catches what the inline cleanup does not reach: tags written before the fix,
+        bulk deletes, sync-applied tombstones, and direct metadata supersedes.
+        dry_run=True (default) only reports.
+        """
+        if not self.conn:
+            return {"supported": False}
+
+        def _reconcile():
+            sp = f"reconcile_conflict_tags_{os.urandom(4).hex()}"
+            self.conn.execute(f"SAVEPOINT {sp}")
+            try:
+                candidates = [
+                    row[0]
+                    for row in self.conn.execute(
+                        "SELECT content_hash FROM memories WHERE deleted_at IS NULL "
+                        "AND (superseded_by IS NULL OR superseded_by = '') AND tags LIKE ?",
+                        (f"%{CONFLICT_TAG}%",),
+                    )
+                ]
+                stale = self._find_stale_conflict_tags(candidates)
+                if not dry_run:
+                    for content_hash, tags in stale:
+                        self.conn.execute(
+                            "UPDATE memories SET tags = ? WHERE content_hash = ? "
+                            "AND deleted_at IS NULL",
+                            (tags, content_hash),
+                        )
+                self.conn.execute(f"RELEASE SAVEPOINT {sp}")
+            except Exception:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                self.conn.execute(f"RELEASE SAVEPOINT {sp}")
+                raise
+            if not dry_run:
+                self.conn.commit()
+            return [content_hash for content_hash, _ in stale]
+
+        # Same lock StoreMixin holds across its INSERT/commit sequence, so the commit
+        # below cannot land between a concurrent store()'s insert and its commit.
+        async with self._savepoint_lock:
+            stale_hashes = await self._execute_with_retry(_reconcile)
+        return {
+            "supported": True,
+            "dry_run": dry_run,
+            "found": len(stale_hashes),
+            "cleared": 0 if dry_run else len(stale_hashes),
+            "hashes": [h[:12] for h in stale_hashes[:20]],
+        }
 
     async def mark_superseded_batch(self, pairs: list[tuple[str, str]]) -> int:
         """Mark memories as superseded in a single transaction."""
@@ -275,19 +598,28 @@ class MetadataMixin:
             return 0
 
         def _batch_mark():
-            self.conn.executemany(
-                "UPDATE memories SET superseded_by = ? WHERE content_hash = ? AND deleted_at IS NULL",
-                [(winner, loser) for winner, loser in pairs],
-            )
+            now = time.time()
+            # SAVEPOINT: the UPDATEs and their sync events land or vanish together
+            # (fail-closed, ADR-0008), as in update_memory_metadata.
+            sp = f"supersede_batch_{os.urandom(4).hex()}"
+            self.conn.execute(f"SAVEPOINT {sp}")
+            try:
+                for winner, loser in pairs:
+                    self._supersede_with_event(winner, loser, now)
+                self.conn.execute(f"RELEASE SAVEPOINT {sp}")
+            except Exception:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                self.conn.execute(f"RELEASE SAVEPOINT {sp}")
+                raise
             self.conn.commit()
             return len(pairs)
 
         try:
             return await self._execute_with_retry(_batch_mark)
         except Exception as e:
-            logger.error(f"mark_superseded_batch failed: {e}")
+            logger.error("mark_superseded_batch failed: %s", _sanitize_log_value(str(e)))
             if self.conn:
-                self.conn.rollback()
+                await self._run_in_thread(self.conn.rollback)
             return 0
 
     @staticmethod
@@ -309,7 +641,9 @@ class MetadataMixin:
         decay = max(0.0, 1.0 - staleness * decay_rate)
         return round((confidence if confidence is not None else 1.0) * decay, 4)
 
-    def _detect_conflicts(self, new_hash: str, new_content: str, embedding) -> list:
+    def _detect_conflicts(
+        self, new_hash: str, new_content: str, embedding, exclude_hash: Optional[str] = None
+    ) -> list:
         """Detect conflicting active memories for a newly stored memory."""
         from difflib import SequenceMatcher
 
@@ -327,14 +661,18 @@ class MetadataMixin:
                    JOIN memory_embeddings me ON m.rowid = me.rowid
                    WHERE m.deleted_at IS NULL
                      AND (m.superseded_by IS NULL OR m.superseded_by = '')
-                     AND m.content_hash != ?
+                     AND m.content_hash NOT IN (?, ?)
                    ORDER BY distance ASC
                    LIMIT 5""",
-                (serialize_float32(embedding), new_hash),
+                (
+                    serialize_float32(embedding),
+                    new_hash,
+                    exclude_hash if exclude_hash is not None else new_hash,
+                ),
             )
             candidates = cursor.fetchall()
         except Exception as e:
-            logger.warning(f"Conflict detection query failed: {e}")
+            logger.warning("Conflict detection query failed: %s", _sanitize_log_value(str(e)))
             return []
 
         conflicts = []
@@ -399,7 +737,7 @@ class MetadataMixin:
             self.conn.commit()
 
         await self._execute_with_retry(_record_all_conflicts)
-        logger.info(f"Recorded {len(conflicts)} conflict(s) for {new_hash[:8]}")
+        logger.info("Recorded %s conflict(s) for %s", len(conflicts), _sanitize_log_value(new_hash[:8]))
 
     async def get_conflicts(self) -> list:
         """Return all unresolved conflict pairs."""
@@ -435,7 +773,7 @@ class MetadataMixin:
                 })
             return results
         except Exception as e:
-            logger.error(f"get_conflicts error: {e}")
+            logger.error("get_conflicts error: %s", _sanitize_log_value(str(e)))
             return []
 
     async def resolve_conflict(self, winner_hash: str, loser_hash: str) -> Tuple[bool, str]:
@@ -443,6 +781,8 @@ class MetadataMixin:
         try:
             if not self.conn:
                 return False, "Database not initialized"
+            if winner_hash == loser_hash:
+                return False, "Winner and loser must be different memories"
 
             def _check_both_exist():
                 for h, label in ((winner_hash, "Winner"), (loser_hash, "Loser")):
@@ -462,36 +802,52 @@ class MetadataMixin:
             now = time.time()
 
             def _do_resolve():
-                self.conn.execute(
-                    "UPDATE memories SET superseded_by = ? WHERE content_hash = ? AND deleted_at IS NULL",
-                    (winner_hash, loser_hash),
-                )
+                # SAVEPOINT around every write: the supersede, its sync event (#1773),
+                # the winner's confidence and the tag cleanup land or vanish together
+                # (fail-closed, ADR-0008). On a clean connection this savepoint is the
+                # outermost transaction, so it is released only after the last write.
+                sp = f"resolve_conflict_{os.urandom(4).hex()}"
+                self.conn.execute(f"SAVEPOINT {sp}")
+                try:
+                    self._supersede_with_event(winner_hash, loser_hash, now)
 
-                self.conn.execute(
-                    "UPDATE memories SET confidence = 1.0, last_accessed = ? WHERE content_hash = ? AND deleted_at IS NULL",
-                    (int(now), winner_hash),
-                )
+                    self.conn.execute(
+                        "UPDATE memories SET confidence = 1.0, last_accessed = ? WHERE content_hash = ? AND deleted_at IS NULL",
+                        (int(now), winner_hash),
+                    )
 
-                for h in (winner_hash, loser_hash):
+                    # The loser is out of every conflict now. The winner keeps the tag
+                    # while it still contradicts another current memory (#1840);
+                    # _supersede_with_event() already cleared the loser's other partners.
                     cursor = self.conn.execute(
-                        "SELECT tags FROM memories WHERE content_hash = ?", (h,)
+                        "SELECT tags FROM memories WHERE content_hash = ? AND deleted_at IS NULL",
+                        (loser_hash,),
                     )
                     row = cursor.fetchone()
                     if row and row[0]:
-                        tags = [t.strip() for t in row[0].split(",") if t.strip() != "conflict:unresolved"]
+                        tags = [t.strip() for t in row[0].split(",") if t.strip() != CONFLICT_TAG]
                         self.conn.execute(
                             "UPDATE memories SET tags = ? WHERE content_hash = ? AND deleted_at IS NULL",
-                            (",".join(tags), h),
+                            (",".join(tags), loser_hash),
                         )
-
-                self.conn.commit()
+                    self._clear_stale_conflict_tags([winner_hash])
+                    self.conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except Exception:
+                    self.conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    self.conn.execute(f"RELEASE SAVEPOINT {sp}")
+                    raise
+                try:
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
 
             await self._execute_with_retry(_do_resolve)
-            logger.info(f"Conflict resolved: {winner_hash[:8]} wins over {loser_hash[:8]}")
+            logger.info("Conflict resolved: %s wins over %s", _sanitize_log_value(winner_hash[:8]), _sanitize_log_value(loser_hash[:8]))
             return True, f"Conflict resolved: {winner_hash[:8]} supersedes {loser_hash[:8]}"
 
         except Exception as e:
-            logger.error(f"resolve_conflict error: {e}")
+            logger.error("resolve_conflict error: %s", _sanitize_log_value(str(e)))
             return False, str(e)
 
     async def retrieve_with_staleness(
@@ -551,7 +907,7 @@ class MetadataMixin:
             try:
                 await self._execute_with_retry(_touch)
             except Exception as e:
-                logger.warning(f"Failed to update last_accessed (non-fatal): {e}")
+                logger.warning("Failed to update last_accessed (non-fatal): %s", _sanitize_log_value(str(e)))
 
         return enriched
 
@@ -562,16 +918,24 @@ class MetadataMixin:
         new_tags: Optional[List[str]] = None,
         new_memory_type: Optional[str] = None,
         reason: Optional[str] = None,
+        store: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[str]]:
-        """Non-destructive versioned update using existing store/update infrastructure."""
+        """Non-destructive versioned update using existing store/update infrastructure.
+
+        With ``store`` set (other than ``"all"``), a memory in another store
+        is reported as not found and no new version is written (#1875).
+        """
         try:
             if not self.conn:
                 return False, "Database not initialized", None
 
+            store_sql, store_params = _store_clause(store)
+
             def _check_exists():
                 cursor = self.conn.execute(
-                    "SELECT content_hash, tags, memory_type FROM memories WHERE content_hash = ? AND deleted_at IS NULL",
-                    (content_hash,),
+                    "SELECT content_hash, tags, memory_type, version, metadata, store FROM memories "
+                    "WHERE content_hash = ? AND deleted_at IS NULL" + store_sql,
+                    (content_hash, *store_params),
                 )
                 return cursor.fetchone()
 
@@ -579,11 +943,28 @@ class MetadataMixin:
             if not row:
                 return False, f"Memory {content_hash} not found", None
 
-            old_hash, old_tags_str, old_type = row
+            old_hash, old_tags_str, old_type, old_version, old_metadata_str, old_store = row
+            # The conflict marker is not inherited (#1840): store() below re-runs
+            # detection for the new version and tags it again only if it still
+            # contradicts a current memory.
             resolved_tags = new_tags if new_tags is not None else (
-                [t for t in old_tags_str.split(",") if t] if old_tags_str else []
+                [t for t in old_tags_str.split(",") if t and t.strip() != CONFLICT_TAG]
+                if old_tags_str else []
             )
-            resolved_type = new_memory_type if new_memory_type is not None else old_type
+            # A caller-supplied type is a new write and gets coerced; an
+            # inherited one is kept as stored, even if this node lacks it.
+            resolved_type = coerce_memory_type(new_memory_type) if new_memory_type is not None else old_type
+
+            # The new version inherits the old row's custom metadata, so keys a
+            # client stored (source, agent fields, ...) survive a versioned
+            # update. Lineage keys stay on the old row only (#1408).
+            inherited_metadata = (
+                self._safe_json_loads(old_metadata_str, "update_memory_versioned")
+                if old_metadata_str
+                else {}
+            )
+            inherited_metadata.pop("superseded_by", None)
+            inherited_metadata.pop("evolution_reason", None)
 
             new_hash = generate_content_hash(new_content)
             new_memory = Memory(
@@ -591,21 +972,103 @@ class MetadataMixin:
                 content_hash=new_hash,
                 tags=resolved_tags,
                 memory_type=resolved_type,
+                metadata=inherited_metadata,
             )
-            store_ok, store_msg = await self.store(new_memory, skip_semantic_dedup=True)
+            # The new version lives in the old one's store partition, or it drops
+            # out of that store's searches once the old row is superseded.
+            with _exclude_versioned_parent(old_hash):
+                store_ok, store_msg = await self.store(
+                    new_memory, skip_semantic_dedup=True, store=old_store or "default"
+                )
             if not store_ok:
                 return False, f"Failed to store new version: {store_msg}", None
 
-            meta_updates: Dict[str, Any] = {"metadata": {"superseded_by": new_hash}}
-            if reason:
-                meta_updates["metadata"]["evolution_reason"] = reason
-            await self.update_memory_metadata(content_hash, meta_updates, preserve_timestamps=True)
+            # Link the lineage via the migration-011 COLUMNS (not only metadata JSON),
+            # so default retrieval (superseded_by IS NULL), get_memory_history
+            # (parent_id/version) and mark_superseded_batch see a consistent chain (#1318).
+            #
+            # Atomicity: the new-row link and the old-row supersede run in a single
+            # transaction. If it fails, we roll back AND remove the just-stored new
+            # row (store() already committed it separately), so a failed versioning
+            # never leaves an orphaned, unlinked new version behind.
+            new_version = (old_version or 1) + 1
 
-            logger.info(f"Memory evolved: {old_hash[:8]} → {new_hash[:8]}")
-            return True, "Memory versioned successfully", new_hash
+            def _link_and_supersede():
+                try:
+                    # new row: parent + version
+                    self.conn.execute(
+                        "UPDATE memories SET parent_id = ?, version = ? WHERE content_hash = ?",
+                        (old_hash, new_version, new_hash),
+                    )
+                    # old row: superseded_by column (drops it from default search) +
+                    # metadata trace, in the same transaction. Conditional on the old
+                    # row still being current (superseded_by IS NULL) so concurrent
+                    # versioned updates of the same memory don't fork history silently.
+                    mcur = self.conn.execute(
+                        "SELECT metadata FROM memories WHERE content_hash = ? AND deleted_at IS NULL"
+                        + store_sql,
+                        (old_hash, *store_params),
+                    )
+                    mrow = mcur.fetchone()
+                    old_meta = self._safe_json_loads(mrow[0], "update_memory_versioned") if mrow and mrow[0] else {}
+                    old_meta["superseded_by"] = new_hash
+                    if reason:
+                        old_meta["evolution_reason"] = reason
+                    cur = self.conn.execute(
+                        # Issue #1724: superseded_at in the same UPDATE. For
+                        # update_memory_versioned this is exact: the new row is
+                        # written in the same call, so now == its created_at.
+                        "UPDATE memories SET superseded_by = ?, superseded_at = ?, metadata = ? "
+                        "WHERE content_hash = ? AND deleted_at IS NULL AND superseded_by IS NULL"
+                        + store_sql,
+                        (new_hash, time.time(), json.dumps(old_meta), old_hash, *store_params),
+                    )
+                    if cur.rowcount == 0:
+                        # Another versioned update already superseded this row, it
+                        # vanished, or sync moved it to another store while store()
+                        # ran (#1875). Abort rather than fork the chain or reach
+                        # across stores; the caller removes the new row.
+                        raise RuntimeError(
+                            f"old version {old_hash[:8]} is no longer current (concurrent update)"
+                        )
+                    # Issue #1773: the new version's create is already logged; log the
+                    # supersede of the old row too, in this same transaction.
+                    self._append_supersede_event(old_hash)
+                    # Issue #1840: the old version no longer keeps its conflicts alive,
+                    # and tags passed explicitly may echo a marker the new version has
+                    # no partner for.
+                    self._clear_stale_conflict_tags(
+                        [new_hash, *self._contradicts_partners(old_hash)]
+                    )
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
+
+            try:
+                await self._execute_with_retry(_link_and_supersede)
+            except Exception as link_err:
+                # Compensate the already-committed store(): drop the orphan new row.
+                try:
+                    await self.delete(new_hash)
+                except Exception:
+                    logger.error("Failed to clean up orphan version %s after link failure",
+                                 _sanitize_log_value(new_hash[:8]))
+                logger.error("update_memory_versioned link failed: %s", _sanitize_log_value(str(link_err)))
+                return False, f"Failed to link version: {link_err}", None
+
+            logger.info("Memory evolved: %s → %s (v%d)",
+                        _sanitize_log_value(old_hash[:8]), _sanitize_log_value(new_hash[:8]), new_version)
+            versioned_message = "Memory versioned successfully"
+            store_note = store_msg.removeprefix("Memory stored successfully").strip()
+            if store_note:
+                versioned_message += f" {store_note}"
+            elif not store_msg.startswith("Memory stored successfully"):
+                versioned_message += f" ({store_msg})"
+            return True, versioned_message, new_hash
 
         except Exception as e:
-            logger.error(f"update_memory_versioned error: {e}")
+            logger.error("update_memory_versioned error: %s", _sanitize_log_value(str(e)))
             return False, str(e), None
 
     async def get_memory_history(self, content_hash: str) -> List[Dict[str, Any]]:
@@ -673,5 +1136,63 @@ class MetadataMixin:
             ]
 
         except Exception as e:
-            logger.error(f"get_memory_history error: {e}")
+            logger.error("get_memory_history error: %s", _sanitize_log_value(str(e)))
+            return []
+
+    async def list_superseded_orphans(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """List live memories whose ``superseded_by`` points at a missing winner.
+
+        Diagnostic / read-only (bug #1352). A loser row is "orphaned" when its
+        ``superseded_by`` column references a winner that no longer exists as a
+        live row — because the winner was deleted or purged. Such losers stay
+        hidden from default retrieval (``superseded_by IS NULL`` filter) with no
+        surviving winner to point at, so they are invisible forever until the
+        column is cleared. This surfaces them; it does NOT modify anything.
+
+        A winner is "missing" when there is no row with that ``content_hash`` and
+        ``deleted_at IS NULL`` (absent entirely, or soft-deleted).
+
+        Returns a list of dicts: ``content_hash``, ``superseded_by`` (the dangling
+        winner hash), ``content`` (truncated), and ``created_at``.
+        """
+        try:
+            if not self.conn:
+                return []
+
+            def _query():
+                cursor = self.conn.execute(
+                    """
+                    SELECT loser.content_hash,
+                           loser.superseded_by,
+                           substr(loser.content, 1, 200),
+                           loser.created_at
+                    FROM memories AS loser
+                    WHERE loser.deleted_at IS NULL
+                      AND loser.superseded_by IS NOT NULL
+                      AND loser.superseded_by != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM memories AS winner
+                          WHERE winner.content_hash = loser.superseded_by
+                            AND winner.deleted_at IS NULL
+                      )
+                    ORDER BY loser.created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                return cursor.fetchall()
+
+            rows = await self._execute_with_retry(_query)
+            return [
+                {
+                    "content_hash": r[0],
+                    "superseded_by": r[1],
+                    "content": r[2],
+                    "created_at": r[3],
+                }
+                for r in rows
+            ]
+
+        except Exception as e:
+            logger.error("list_superseded_orphans error: %s", _sanitize_log_value(str(e)))
             return []

@@ -17,6 +17,2404 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [12.10.0] - 2026-11-14
+
+### Security
+
+- **The OAuth authorize page did not say who was asking, and could hand out `admin` (GHSA-w8p9-5v6q-h9ch, reported by @hgrgr).**
+  With `MCP_DCR_REGISTRATION_KEY` unset, anyone could register a client with their own
+  redirect URI and send the owner a link to the owner's own authorize page. The page asked
+  for the API key and showed nothing else, so a third party's request looked exactly like a
+  Claude.ai reconnect, and the resulting token could carry `read write admin`. The page now
+  shows the redirect host, the self-reported application name (unverified) and the scope
+  that will be granted, it cannot be framed, and redirect URIs containing backslashes,
+  whitespace or control characters are refused. Upgrade if you run OAuth with open
+  registration, which is the Claude.ai connector setup.
+  **Behaviour change:** the `admin` scope is granted only to a client that declared `admin`
+  in a registration gated by `MCP_DCR_REGISTRATION_KEY`. A client that obtained `admin`
+  through open registration, or through a gated registration that named no `scope`, now
+  gets `read write`; to get it back, register again with the registration key and
+  `"scope": "read write admin"`. A refresh that asks only for `admin` on such a client is
+  refused with `invalid_scope`.
+  **Cleanup:** a client registered with an `admin` ceiling while registration was open keeps
+  that ceiling in the store and can hold `admin` again if the key is set later. Review with
+  `memory oauth list-clients` and remove what you do not recognise with
+  `memory oauth delete-client <client_id>`.
+
+### Added
+
+- **Semantic dedup can supersede an updated fact instead of dropping it (#1938).**
+  A changed fact is often phrased almost exactly like the one it replaces, so the
+  default dedup check (cosine 0.85, 24 h) refused the write and left the old value
+  as the only one retrieval could return. `MCP_SEMANTIC_DEDUP_MODE=supersede`
+  stores that update and marks the matched memory `superseded_by` the new hash,
+  the same lineage `memory_update` writes. A near-identical match (cosine at or
+  above `MCP_SEMANTIC_DEDUP_NEAR_IDENTICAL_THRESHOLD`, default 0.97, or the same
+  text once whitespace and case are collapsed) is still rejected. The default
+  mode stays `reject`, so nothing changes until the setting is opted in. Store
+  responses name the outcome: `deduplicated` with the existing hash, or
+  `superseded` with the old hash, on the service, REST and MCP paths.
+- **The dashboard's Manage tab shows one section at a time (#1973, shu-chen-dot-ca).**
+  Bulk Operations, Tag Management and Ontology were stacked on one page, so on a store
+  with many tags the Ontology section sat below the whole tag table. The tab now has
+  sub-tabs (Bulk Operations, Tags, Ontology) that show only the chosen section, work
+  with the arrow, Home and End keys and a screen reader, and are translated in all
+  eleven catalogs. Opening the Manage tab starts on Bulk Operations.
+- **The browser demo offers a prompt that lets a coding agent set up a trial (#1985).**
+  The demo at mcpmemory.services/demo/ ended with an install command. It now also shows a
+  prompt for Claude Code, as visible text with a copy button: the agent asks before it
+  acts, installs the service into one new folder, proves a store and search round trip
+  with `memory status --deep`, and registers the server as `memory-trial` with its own
+  `MCP_MEMORY_BASE_DIR` and `MCP_MEMORY_SQLITE_PATH`, so an existing installation and its database are not touched.
+- **The browser demo reports what it is doing in one status capsule, and the agent prompt opens in Claude Code (#1999).**
+  The capsule at the top of the demo card shows the real start-up steps, each store and
+  each search, and keeps an error with a retry on screen until it is handled. The model
+  download used to show "100%" from the first chunk when the server sent no
+  `Content-Length`; a percentage now needs a real total. A failed store or search no longer
+  leaves its button disabled, and Enter no longer stores a memory several times. The trial
+  prompt gains "Open in Claude Code" (`claude://code/new?q=`, built from the visible text)
+  and a copy-and-open entry for ChatGPT.
+- **The dashboard shows its connection state in a status capsule in the header (#2000).**
+  The "Connected" badge was a fixed overlay in the bottom right corner that covered content
+  on narrow screens, said "Connected" before the event stream was open, and showed
+  "Unknown" when the server refused the stream. It is replaced by a capsule in the logo
+  row (`web/static/status-island.js`) that reports connecting, connected, disconnected with
+  a reconnect action, and "Authentication required". The capsule keeps one entry per named
+  source and shows the most important one, an error before work in progress before a
+  confirmation, so further sources (sync, imports, consolidation, backup) can report to it
+  without covering each other's failures. It adds no catalog keys.
+
+### Fixed
+
+- **The dashboard's type-only search filter always failed with "Filter search failed" (#1971).**
+  Choosing a content type with no query, tag or date asked `GET /api/memories` for
+  `page_size=1000`, above the route's cap of 100, so the request was a 422. It now passes
+  the type to the server and pages through the result 100 at a time, so a type with more
+  than 100 memories is listed in full.
+- **The Memory Types chart heading was cut short in German, Spanish, French, Japanese and Korean (#1993).**
+  Those five catalogs defined `analytics.memoryTypes` twice. The second entry, a short
+  "Memory Types" label left over from the Knowledge Graph translations, came later in the
+  file, and `JSON.parse` keeps the last of two equal keys, so the dashboard showed it
+  instead of "Memory Types Distribution". The leftover entry is gone, and
+  `tests/web/test_i18n_catalog_parity.py` now fails on any key a catalog defines twice.
+  It replaces five tests that asserted the duplicate was still there.
+### Internal
+
+- **A search summarization test passed only where anonymous access was switched on (#2014).**
+  `test_http_mcp_round_trip_with_read_scope` overrode `require_read_access`, but `POST /mcp`
+  depends on `get_current_user` and checks the scope per tool call. The request was therefore
+  authenticated by the environment: as anonymous "read write" in CI, which sets
+  `MCP_ALLOW_ANONYMOUS_ACCESS=true`, and not at all elsewhere, where eight cases failed with
+  `authorization_required` and took `scripts/pr/pre_pr_check.sh` down for any change under
+  `src/`. The test now overrides the dependency the route uses, so it runs with the read-only
+  user its name promises, in every environment.
+- **`auto-assign` alone opts an issue into `/claim`, and a claim written in prose is told the command (#2015).**
+  Automatic assignment needed `good first issue` as well, so a bug with a settled scope stayed
+  on the manual path. On #1998 a contributor waited three hours for a go-ahead and someone
+  else opened a pull request in that window. `scripts/ci/mark_claim_pending.py` now takes the
+  `auto-assign` label as the maintainer's approval on any issue. A prose claim on such an
+  issue gets one reply per person naming the command; prose still does not assign. The claim
+  matcher also accepts "this one", "this issue", a trailing "too" or "as well" and "I would
+  like to take this", which is how the two claims on #1997 and #1998 were worded and why
+  neither was labelled `claim-pending`.
+- **`config/oauth.py` and `config/ontology.py` log with lazy `%`-style arguments (#1146).**
+  The `ValueError` that `validate_oauth_configuration()` raises at import time
+  carries `MCP_OAUTH_ISSUER` and a key path verbatim, and the base-type names
+  parsed from `MCP_CUSTOM_MEMORY_TYPES` are logged as given: both are wrapped in
+  `_sanitize_log_value`. The JWT algorithm and the three counts go as `%s`/`%d`
+  arguments. Both modules are added to `GUARDED_MODULES`.
+- **`storage/milvus_graph.py` and `models/ontology.py` log without bare outside values (#1146).**
+  The `exc` of the `except Exception` blocks around the pymilvus calls, and the
+  caller-supplied relationship type logged when it fails validation, are wrapped
+  in `_sanitize_log_value`, as the entity-link blocks of the same module already
+  did; the hop list in `find_shortest_path` is renamed so the guard no longer
+  reads it as a file path. The f-strings in `load_custom_memory_types` become
+  lazy `%s`/`%d` arguments with the same text. Both modules are added to
+  `GUARDED_MODULES`.
+- **`web/oauth/discovery.py` and `web/oauth/storage/factory.py` log with sanitised lazy `%`-style arguments (#1146).**
+  `oauth_authorization_server_metadata()` and `create_oauth_storage()` now pass
+  `_sanitize_log_value()` to `%s` instead of f-strings, and both modules are added
+  to `GUARDED_MODULES`.
+- **`consolidation/quarantine.py` and `consolidation/relationship_inference.py` log without bare outside values (#1146).**
+  The `content_hash[:8]` prefix in the quarantine, unquarantine and background
+  check messages goes through `_sanitize_log_value`, as `storage/hybrid.py`
+  already does for the same slice; the belief-challenged message and the four
+  confidence/threshold messages of the relationship inferrer become lazy
+  `%s`/`%.2f` arguments with the same text. Both modules are added to
+  `GUARDED_MODULES`.
+- **Clear the remaining five `Check 6.5` f-string logger modules and guard `self.logger` calls (#1146).**
+  `config/documents.py`, `consolidation/associations.py`, `storage/migration_runner.py`,
+  `sync/litestream_config.py`, and `utils/directory_ingestion.py` now use lazy `%`-style
+  logger arguments with `_sanitize_log_value()` around migration names, error messages,
+  config paths, and ingested filenames. All five join `GUARDED_MODULES`, and
+  `test_log_injection_guard.py` now inspects `self.logger.<level>()` calls alongside
+  module-level `logger` and `logging`.
+
+## [12.9.0] - 2026-11-13
+
+### Added
+
+- Add an adjustable minimum-use filter to dashboard tag management, defaulting to tags used at least twice.
+- **REST API and dashboard section for the ontology overlay (#1897, phase 5).**
+  `GET /api/ontology` returns the merged memory types, relationships, type patterns and
+  retention periods, plus the stored overlay rows. `POST`/`PUT`/`DELETE` routes under
+  `/api/ontology/` add and remove memory types, retention periods, relationship types and
+  type patterns through the same storage methods, so writes are validated and synced the
+  same way. Writes need the global `write` scope, since the ontology is shared by every
+  store. The dashboard's Manage tab gets an Ontology section to add memory types, set
+  retention periods and remove stored entries.
+- **The ontology overlay syncs between sqlite_vec nodes through the hub (#1897, phase 2).**
+  With `MCP_SYNC_EVENTLOG` on, every overlay write (memory types, retention, relationship
+  types, type patterns) records an `ontology_upsert` or `ontology_delete` sync event keyed
+  `ontology:<kind>:<key>`. Peers resolve them per key by HLC, as they do memory events, and
+  write the winning row. `/api/sync/capabilities` advertises `ontology_sync`; the feed
+  (`GET /api/sync/events?events=memory|ontology|all`), push and baseline carry ontology events
+  only to a peer that advertises it, so an older peer keeps syncing memories without
+  stalling on an op it does not know. The first cycle with a capable peer exchanges the
+  ontology events both cursors had already passed. If that exchange fails, the peer's
+  cycle shows as `incomplete` and the exchange is retried, while memories keep syncing.
+  Malformed ontology events are skipped, not retried.
+
+### Fixed
+
+- Delta sync restores the recreated memory's fields before merging later metadata edits, regardless of delivery order.
+- **A "from … to …" recall range kept only the start (GPT-AGI).** `from January to March` and `from 2024-01-01 to 2024-03-31` were read as the first month or the first day. They now cover the whole window, the same way `between … and …` already did. A from/to phrase that is not a date still falls through, so `from Alice to Bob yesterday` stays yesterday. A month name with a year keeps that year (`from January 2024 to March 2024`), `to now` ends today, and a window whose start comes after its end (`from march to january`) keeps the previous single-month reading.
+- **Dashboard update failed in pip-less uv environments after `git pull` had already moved the checkout (#1943).**
+  `/api/server/update` now resolves the installer for the running interpreter before `git pull`. It uses
+  `python -m pip` when pip is importable. Otherwise it uses `uv pip --python <interpreter>`, taking the uv that
+  launched the server (`$UV`) or else uv on PATH. If neither is available, it refuses with a clear error and
+  leaves the checkout unchanged.
+- **Dashboard logged `THREE.WARNING: Multiple instances of Three.js being imported` on every load (#1944).**
+  The import map pointed `three/webgpu` at esm.sh's bundled build, which embeds its own copy of
+  three's core next to the one `three` loads. It now maps `three/webgpu` to the unbundled build and
+  maps the `three/build/three.core.js` specifier it imports to the same module `three` uses, so one
+  core is loaded. The import map's CSP hash in `web/app.py` is updated to match.
+- **Cloudflare tag deletes treated `%` and `_` in a tag as wildcards and deleted memories that did not have the tag (#1948).**
+  `delete_by_tags`, `delete_by_timeframe` and `delete_before_date` built their D1
+  `tags LIKE ?` patterns from the raw tag, so deleting the tag `%` deleted every memory
+  with two or more tags, and `snake_case` also deleted a memory tagged `snakeXcase`. The
+  patterns are escaped now and carry `ESCAPE '\'`, as the sqlite-vec deletes and the
+  Cloudflare exact-content search already do.
+- **The `cascade`/`llm` NLI backends no longer hide their heuristic fallback.**
+  With no LLM provider configured, or on an unparseable/failed LLM response,
+  the classifier silently returned heuristic verdicts while `degraded`
+  stayed `false` — a harness or quarantine report then read as a clean LLM
+  run. All three fallback paths now set `degraded`, matching the
+  transformers backend.
+- **Milvus updates no longer embed the content between the read and the upsert**
+  (#1966). `update_memory_metadata` (and so `update_memory`) and
+  `update_memories_batch` read the stored vector with the row and write it back,
+  as `mark_superseded_batch` already did; only a row whose vector does not come
+  back is re-embedded. `update_memory_versioned` embeds the new content before it
+  reads the old row. The window between the read and the whole-row upsert is now
+  two round-trips with no embedding call in it; it is not closed, since pymilvus
+  has no conditional upsert, and that limit stays documented.
+- **Avoid false sentence breaks at content chunk-window edges (#1975).** A truncated
+  window no longer treats its artificial end as punctuation; a fitting URL, version,
+  or decimal remains whole when the next real boundary is a word break.
+- **mcpmemory.services told readers to install without the embedding runtime, and hid its navigation on phones (#1983).**
+  The home page, the browser demo, the remote MCP tutorial and the Open Graph card showed
+  `pip install mcp-memory-service`, which has no ONNX runtime, so semantic search falls back
+  to hash embeddings. They now show `pip install "mcp-memory-service[sqlite]"`, as the
+  language pages already did. Below 880px the main navigation was `display:none` with no
+  replacement; it wraps into its own row. The hero console was empty without JavaScript and
+  now has its first example in the HTML. "OAuth 2.0" is corrected to 2.1, "Cost: $0" and
+  "100% local" are reworded. The pages gain JSON-LD, the tutorial's canonical and sitemap
+  entry use the extensionless URL Cloudflare Pages redirects to, and the home page's first
+  load drops from 2,837 to 535 KiB because the loop video loads only while visible.
+- **Milvus dropped the store a memory was written to and served it from any store (#1879, massimiliano1991).**
+  The collection had no `store` field, so `store()` and `store_batch()` discarded the
+  value, and `get_by_hash`, `update_memory_metadata` and `delete` found a memory whatever
+  store the caller named. New collections get a `store` field (default `"default"`), the
+  three hash-addressed calls are confined to it, and every upsert writes the row's own
+  store back, so an update or a versioned update never moves a memory to `"default"`.
+  A collection created before this has no field to confine on: there a named store is
+  refused with one warning per instance (`None`, `"all"` and `"default"` are served as
+  before), and the collection has to be recreated to pick up confinement, as for
+  `content_lower`. `get_by_hash_is_store_scoped` stays `False`: search and listing still
+  ignore `store` on this backend.
+  A confined `delete` whose filter removes nothing (the row was deleted, or re-stored
+  elsewhere, between the read and the delete) now reports "not found" and leaves the
+  access record and graph edges alone, instead of removing them and reporting success.
+  A scoped update is confined within one client only: it is not race-safe across clients
+  sharing a collection, since a row re-stored elsewhere while the update is in flight is
+  written back by the unconditional upsert (the cross-client guard is a separate issue).
+  `update_memories_batch` and `mark_superseded_batch` now skip soft-deleted rows, as
+  `get_by_hash` does, instead of writing them back and counting them as updated.
+- **`/api/server/status` no longer discloses host details below admin scope
+  (GHSA-hm53-3f6c-cm5h).** Process ID, OS, kernel and Python version are now
+  returned to admin callers only; read-scoped and anonymous callers get
+  version, uptime and timestamp. The dashboard shows `-` for those fields
+  without admin scope.
+- **MCP prompts refuse store-restricted tokens (GHSA-wpp8-2qcw-x4pc).**
+  `prompts/get` applied no scope check, so a `read:<store>` token could read
+  other stores' memories through `knowledge_export` and `memory_analysis`
+  (tag search spans every store) and the `default` store through the other
+  prompts. Prompts now require a global `read` scope, like MCP resources.
+
+### Removed
+
+- **Dashboard: removed the System Maintenance placeholders (#1974).** The Manage tab
+  showed "Optimize DB" and "Rebuild Index" buttons that were disabled and, behind them,
+  only answered "not yet implemented". The section, its handlers, its strings in all
+  eleven catalogs and the `optimize_db` / `rebuild_index` branches of
+  `POST /api/manage/system/{operation}` are gone; the route now answers both with the
+  400 for an unknown operation. `cleanup_duplicates` is unchanged.
+
+### Internal
+
+- **`quality/ai_evaluator.py` logs with lazy `%`-style arguments (#1146).**
+  Its four multi-line f-string logger calls in the DeBERTa / MS-MARCO
+  fallback path now pass the scores (`%.3f`), thresholds and decision (`%s`)
+  as arguments. They were invisible to the line gate and only the AST scan
+  caught them. The module is added to `GUARDED_MODULES`.
+- **`server/client_detection.py` logs with lazy `%`-style arguments (#1146).**
+  When reading the parent process's command line fails, the error is now
+  passed through `_sanitize_log_value` instead of an f-string, so text from
+  another process cannot forge a log line. The module is added to
+  `GUARDED_MODULES`.
+- **`utils/content_splitter.py` logs with lazy `%`-style arguments (#1146).**
+  The two logger calls in `split_content()` and `validate_chunk_lengths()` now
+  log integer character counts and chunk indices via `%d` instead of f-strings,
+  and the module is added to `GUARDED_MODULES`.
+- **`embeddings/external_api.py` logs with lazy `%`-style arguments (#1146).**
+  Its two f-string logger calls now pass their values as arguments. The API
+  URL and model name, read from `MCP_EXTERNAL_EMBEDDING_URL` and
+  `MCP_EXTERNAL_EMBEDDING_MODEL`, go through `_sanitize_log_value`; the
+  embedding dimension and batch size are logged with `%d`. The module is added
+  to `GUARDED_MODULES`, with `api_url` in `EXTERNAL_NAMES` and `model_name`
+  listed for this module only, so dropping either wrapper fails the test.
+- **`ingestion/chunker.py` logs with lazy `%`-style arguments (#1146).**
+  Its one f-string logger call now passes the chunk and character counts as
+  `%d` arguments. `chunker.py` and the already clean `registry.py` join the
+  five loaders in `GUARDED_MODULES`, so every module in `ingestion/` that logs
+  is now held by the log-injection ratchet. `resolved_path`, the registry's
+  canonical form of the caller's path, is added to `EXTERNAL_NAMES`.
+- **`quality/metadata_codec.py` logs with lazy `%`-style arguments (#1146).**
+  Its two f-string logger calls now pass their values as arguments: the part
+  count of a malformed quality-metadata CSV string with `%d`, and the decode
+  error through `_sanitize_log_value`. The module is added to
+  `GUARDED_MODULES`, so the log-injection ratchet keeps it clean.
+- **`server_impl.py` logs with lazy `%`-style arguments (#1146).**
+  Its four f-string logger calls each spanned lines, so the line gate never
+  saw them and only the AST scan did. The Milvus URI and collection name read
+  from the environment are wrapped in `_sanitize_log_value` on both the eager
+  and the lazy init path; the caller-provided storage class name and the
+  unresolved-conflict count go as `%s` arguments. The module is added to
+  `GUARDED_MODULES`.
+- **`api/sync_wrapper.py` logs with lazy `%`-style arguments (#1146).**
+  When a wrapped call from the code-execution API fails, the exception is now
+  passed through `_sanitize_log_value` instead of an f-string, so error text
+  that echoes a caller's query or content cannot forge a log line. The module
+  is added to `GUARDED_MODULES`.
+- **`utils/system_detection.py` logs with sanitised lazy `%`-style arguments (#1146).**
+  The three exception logger calls in `_get_system_memory()`, `_check_cuda_available()`,
+  and `_check_mps_available()` now pass `_sanitize_log_value(e)` to `%s` instead of
+  f-strings, and the module is added to `GUARDED_MODULES`.
+- **`utils/cache_manager.py` logs with lazy `%`-style arguments (#1146).**
+  Its f-string logger calls now pass their values as arguments. The backend
+  name, the `backend:path` cache key and the caller's context label go through
+  `_sanitize_log_value`, as the same cache lines in `mcp_server.py` already do;
+  call counts and storage IDs are logged with `%d`, init times with `%.1f`.
+  The module is added to `GUARDED_MODULES`, so the log-injection ratchet keeps
+  it clean.
+  The ratchet's lazy scan treats `context_label` as outside data everywhere, and
+  `backend` in this module only (`self.backend` is internal in the PDF loader
+  and `reasoning/nli.py`), so dropping either wrapper fails the test.
+- **`utils/debug.py` logs with lazy `%`-style arguments (#1146).**
+  `exact_match_retrieve()`, which backs the `exact_match_retrieve` MCP tool,
+  logged the backend's exception through an f-string. A backend error that
+  echoed the caller's content could forge a second log line. The error now
+  goes through `_sanitize_log_value`, and the backend class name is a `%s`
+  argument. The module is added to `GUARDED_MODULES`.
+
+## [12.8.0] - 2026-11-10
+
+
+### Added
+
+- **The `transformers` NLI backend now exists and runs on ONNX Runtime (#1848).**
+  `MCP_NLI_BACKEND=transformers` used to answer `neutral 0.0` with a
+  "not implemented" warning; it now classifies through the spec's
+  `cross-encoder/nli-deberta-v3-small` loaded from the model repo's own ONNX
+  weights (`onnx/model.onnx` fp32 by default, quantized variants via
+  `MCP_NLI_ONNX_FILE`), using only `onnxruntime`, `tokenizers` and
+  `huggingface_hub` — torch and transformers are not on the inference path.
+  Batch classification goes through one session call; any load or inference
+  failure degrades to the heuristic for that call with one bounded warning.
+  No default changes: the backend stays opt-in.
+- **Export entity graph to a Markdown vault (`scripts/maintenance/export_entity_vault.py`, #1856, minaamulhaq).**
+  Generates an Obsidian-compatible Markdown vault from the memory entity graph with
+  one page per entity, YAML frontmatter, extractive summaries, ranked chunk quotes,
+  `[[entity_id]]` wikilinks to related entities, and an `index.md` grouped by type.
+  Extracts `get_entity_detail` and extractive summary logic in `server.handlers.graph`
+  for reuse while preserving store scoping and deleted memory filters.
+- **Custom memory types can live in the memory database, without a restart (#1897, phase 1).**
+  Migration 022 adds an `ontology_entries` table. `SqliteVecMemoryStorage.add_memory_type()`
+  and `remove_memory_type()` write to it, and the entries are merged after the built-ins and
+  `MCP_CUSTOM_MEMORY_TYPES`. The overlay only adds: it cannot replace or re-parent an existing
+  type. Every write bumps `ontology_version` in `metadata`, and processes sharing the database
+  file poll that counter (at most once per second) and reload their ontology caches when it
+  changes. The table is local to sqlite_vec for now. It is not synced through the hub and not
+  carried by Cloudflare, so multi-node setups still need `MCP_CUSTOM_MEMORY_TYPES`.
+- **Retrieve memories by exact content hash through `memory_search` (#1911).**
+  `content_hash` performs a store-scoped direct lookup instead of text search, and
+  misses return no results. An allowlist rejects `query` and unsupported search
+  arguments rather than ignoring them. Text queries, including hash-shaped strings,
+  are unchanged.
+- **Interactive Knowledge Graph focus mode on click (`src/mcp_memory_service/web/static/app.js`, #1855, itxmjr).**
+  Add interactive click-to-focus neighborhood mode in both 3D ForceGraph and 2D D3 graph
+  visualizations. Single-clicking a node highlights its direct connections and fades
+  distant nodes and edges across three visual tiers. Introduces a floating inspector HUD
+  with connection grouping by relationship type, quick neighbor pivoting, and full memory
+  detail launching, with smooth Escape key and canvas background dismissal.
+- **Relationship types and inference type patterns can live in the memory database (#1897, phase 3).**
+  `SqliteVecMemoryStorage.add_relationship_type()` / `remove_relationship_type()` store a
+  relationship with its `valid_patterns` and symmetry as a `relationship` row in
+  `ontology_entries`, and `set_type_pattern()` / `clear_type_pattern()` store the base-type
+  pairs relationship inference maps to a relationship (`type_pattern` rows). Both merge after
+  the built-ins and only add: built-in relationships, their patterns and the built-in pairs
+  cannot be replaced. `validate_relationship`, `is_allowed_pair` and
+  `is_symmetric_relationship` read the merged set, and the inline `type_patterns` dict moved
+  to `TYPE_PATTERNS` in `models/ontology.py`. `has_entity` is now a proper entry in
+  `RELATIONSHIPS`; type patterns cannot name it, since its target is an entity key.
+- **Retention periods for custom memory types, stored in the memory database (#1897, phase 4).**
+  A base type added through the ontology overlay had no key in `retention_periods`, so its
+  memories decayed on the 30-day fallback. `SqliteVecMemoryStorage.set_retention()` and
+  `clear_retention()` store a period (1..3650 days) as a `retention` row in `ontology_entries`,
+  and the decay calculator uses it for any type the consolidation config does not name.
+  Subtypes without their own entry inherit their parent's period. The overlay only fills gaps:
+  built-in periods and `MCP_RETENTION_*` overrides still win, and `set_retention()` refuses
+  those types. Like the rest of the overlay, the rows are local to sqlite_vec for now.
+
+### Fixed
+
+- **A search could erase metadata written while it ran (#1464).** After `retrieve()` the access write-back replaced the whole stored metadata JSON with the snapshot it had read, so a key that `update_memory_metadata()` committed in between (for example a `reviewed` flag set via `memory_update`) was lost without an error. The sqlite-vec and Cloudflare write-backs now `json_set` only `access_count`, `last_accessed_at` and `access_queries` into the stored JSON and keep every other key. Stored metadata that is not a JSON object is treated as `{}`, as on read.
+- **Cloudflare keeps a `store` per memory and confines hash-addressed operations to it (#1878, part of #1683).** D1 had no `store` column, so `get_by_hash`, `update_memory_metadata` and delete-by-hash accepted `store` and looked the memory up by `content_hash` alone. An existing D1 database now gets `store TEXT NOT NULL DEFAULT 'default'` on startup, which fills every existing row with `"default"`; the check runs on `PRAGMA table_info`, so a database that already has the column is left alone. `store()` writes the store it is given, and the three hash-addressed paths add `AND store = ?`, so a memory in another store is reported as not found and its D1 row, vector and R2 object stay untouched. `None` and `"all"` stay unscoped, and restoring a tombstone keeps the row's store. `get_by_hash_is_store_scoped` stays `False` for now: the server also grants per-store credentials `memory_search` and `memory_list` on that flag, and the Cloudflare read paths (`retrieve`, `recall`, `get_all_memories`, `count_all_memories` and others) still ignore `store`, so store-scoped credentials keep being refused on Cloudflare until those reads are confined too.
+- **`RemoteHTTPStorage` confines `get_by_hash`, `update_memory_metadata` and delete-by-hash to `store` (#1879, part of #1683).** `/api/sync/capabilities` now advertises `store_scoped_access`, taken from the server storage's `get_by_hash_is_store_scoped`. The HTTP client reads it when it initializes (and on each sync handshake) and sends a named store as the `store` query parameter, so a memory in another store comes back as not found. A peer that does not advertise the field (every server before this release) ignores the query parameter, so against it a call naming a store is refused without a request and logged once per peer. **Upgrade the hub before the clients:** once a caller passes a named store to an HTTP peer, an older hub refuses every such call. `None`, `"default"` and `"all"` keep working against an older hub: `"default"` is not sent because the server resolves a missing `store` to `"default"` itself, and `"all"` is passed through for reads.
+- **A restore the sync queue dropped after `max_retries` stayed off Cloudflare (#1890, massimiliano1991).**
+  `force_sync` protected every hash with a remote tombstone, so a restored row was never
+  pushed unless someone resolved the conflict by hand. A row stored after the tombstone
+  it conflicts with is now pushed through `store_if_tombstone_matches`; a local edit
+  racing a remote delete is still kept and reported as a conflict. The row is read again
+  around the upload, so one deleted while `force_sync` runs stays deleted on both sides.
+- **The dashboard and its static files are served with `Cache-Control: no-cache` (#1892).** Browsers kept running a stale `app.js` after an upgrade because nothing told them to check for a newer copy. They now revalidate every request against the ETag and get a `304` when the file is unchanged.
+- **Sync failures logged an empty reason whenever the exception carried no message (#1899, #1893, qwist1233-cpu).**
+  `str(exc)` is empty for most httpx timeout and transport errors, so a line like
+  "Delta-sync capability probe failed for peer hub: " ended at the colon and left no
+  trace of what went wrong. The remote-HTTP request path, the startup capability probe
+  and the sync cycle now log the exception class next to the message.
+- **A memory type the node did not know was overwritten with `observation` on read (#1897).**
+  `Memory()` coerced unknown types in its constructor, which also runs when storage
+  hydrates a stored row. A node without a peer's custom type (`MCP_CUSTOM_MEMORY_TYPES`
+  differs per process) turned the type into `observation` and wrote that back on the next
+  update. The coercion now happens only where a new memory is written, through
+  `coerce_memory_type()`, and the #843 warning in the store response is unchanged.
+  Merging custom subtypes also no longer extends the built-in `TAXONOMY` lists in place,
+  so a subtype removed from the env var stops validating after `clear_ontology_caches()`.
+- **Restore dashboard time-of-day cues (#1907).** Memory cards and document groups once again show the eight local time-of-day icons removed during emoji cleanup, alongside the clock time.
+- **Detected conflicts could not be listed, resolved or cleaned up on the hybrid backend (#1910, reported and diagnosed by mbreitkreuz).**
+  Hybrid stores through its sqlite-vec primary, which detects conflicts and tags both
+  memories `conflict:unresolved`, but hybrid did not delegate `get_conflicts()`,
+  `resolve_conflict()` or `reconcile_conflict_tags()`, so the base defaults applied:
+  `memory_conflicts` and `/api/conflicts` found nothing, `memory_resolve` and
+  `/api/conflicts/resolve` answered "not supported", and the `maintain` conflict steps
+  reported 0 conflicts and `{"supported": false}`. The three methods now run on the
+  primary, like `mark_superseded_batch()`.
+- **Cloudflare read paths honor `store` (part of #1915, tonydzi).** `retrieve`, `recall`, `get_all_memories`, `count_all_memories`, `get_memories_by_time_range`, `get_by_exact_content`, `get_all_tags_with_counts`, `get_memory_timestamps` and `delete_by_tags` accepted `store` and returned or deleted every store's memories. Each now adds the store predicate to its D1 statement; `retrieve` and the semantic branch of `recall` apply it when loading Vectorize matches from D1 by `vector_id`, since Vectorize holds every store's vectors, and `delete_by_tags` passes `store` on to `delete`. `None` and `"all"` stay unscoped, and the defaults are unchanged, so `get_all_memories`, `count_all_memories` and `retrieve` without a store now read `"default"` only, as on sqlite-vec. `get_by_hash_is_store_scoped` stays `False` until the hybrid sync queue carries `store` to Cloudflare as well.
+- **The dashboard answers 503 instead of 500 when its static files are missing (#1926).** Both fallbacks in `GET /` returned `html_template`, which no longer exists, so a missing or unreadable `web/static/index.html` raised `NameError` and hid the original error. The route now logs the cause and serves a short "Dashboard files not found" page with status 503; the REST API is unaffected.
+- **Five dashboard locale catalogs dropped seven dead `analytics.*` keys, and two guard
+  tests keep the i18n wiring from drifting again (#1928, Goldloli; follow-up to #1806).**
+  `de`, `es`, `fr`, `ja` and `ko` still carried `analytics.graphControls`,
+  `analytics.graphLegend`, `analytics.noRelationships`, `analytics.resetZoom`,
+  `analytics.untyped`, `analytics.zoomIn` and `analytics.zoomOut`, which `en.json` no
+  longer had and nothing referenced. `tests/web/test_i18n_catalog_parity.py` now fails
+  when any catalog's key set differs from `en.json`'s, missing or extra, and
+  `tests/web/test_dashboard_no_unwired_text.py` fails on visible text, `placeholder`,
+  `title` or `aria-label` values in `index.html` that carry English words without a
+  matching `data-i18n*` attribute, so hardcoded UI text cannot slip back in.
+- **The startup dependency check reported torch and sentence-transformers as missing on the ONNX install (#1930).**
+  `check_critical_dependencies()` only knew the PyTorch backend, so every start of a
+  `[sqlite]` install (onnxruntime + tokenizers, no torch) printed `[MISSING]` and timeout
+  warnings, doubled the init timeout, and pointed at `python install.py`, which pip,
+  `uv tool` and `uvx` installs do not have. Either backend now satisfies the check, the
+  hint is `pip install "mcp-memory-service[sqlite]"`, and `is_first_run()` also counts a
+  model in the ONNX model cache (`~/.cache/mcp_memory/onnx_models`) when its `model.onnx`
+  and `tokenizer.json` are both there.
+- **Auto-split dropped a note that started with a blank line (GPT-AGI).** With boundary preservation on (the default), a leading blank line was chosen as the split and the empty chunk aborted the loop, so a memory longer than the backend limit was stored as empty text. Leading whitespace is skipped and the rest of the note is split.
+- **Recall clipped "recently" and "yesterday morning" (GPT-AGI).** Extracting "recently" matched only "recent" and left "ly" in the search text. "yesterday morning" was the whole of yesterday, and "morning" was searched as text. Both now keep the window the time parser already returns for those phrases.
+- **Hybrid storage files the Cloudflare copy of a memory in the store it was written to (#1915, part of #1683).** `HybridMemoryStorage.store()` wrote the SQLite row into the named store but queued the sync without it, so the queue called `secondary.store(memory)` and every memory synced through hybrid landed in `default` on Cloudflare. The queued operation now carries the store, and the queue passes it to `secondary.store()` when the secondary's `store()` takes a `store` parameter; one that does not keeps the previous call and a warning is logged once. Of the other calls the issue lists, the queued delete and metadata update stay unscoped on purpose: `content_hash` is unique across stores in both SQLite and D1, the primary has already confined the operation, and D1 rows synced before this change all carry `default`, so a delete or update scoped to the real store would miss them. `force_sync()` reads only the primary's `default` store, so its uploads were already filed correctly, and a tombstone restore keeps the D1 row's own store. Memories pulled from Cloudflare by `get_by_hash()` still land in the local `default` store, because `Memory` carries no store. Existing D1 rows are not re-filed: D1 refuses a second `store()` of a live hash and `force_sync()` skips hashes already present, so the backfill needs its own step (an `UPDATE memories SET store = ? WHERE content_hash = ?` for each primary row outside `default`), and it has to land before `get_by_hash_is_store_scoped` flips on Cloudflare.
+
+### Internal
+
+- **Extract core entity detail and extractive summary logic for reuse (#1856).**
+  The core retrieval and hydration logic from `handle_memory_detail` and summary extraction from `_build_knowledge_map` are extracted into plain functions (`get_entity_detail` and `extract_extractive_summary`) for use by maintenance export scripts.
+- **The Claim Check passed PRs that named their issue without a closing keyword (#1901).**
+  PR #1895 referred to #1893 only as "Addresses #1893" plus a `Fixes #1893` that GitHub
+  did not parse, so it counted as linked for `no-issue` while the claim side saw no issue
+  and passed. Open issues of this repository mentioned in the description are now checked
+  for the author's assignment too, and an assignment re-runs the check of PRs that only
+  mention the issue.
+- **Documentation audit and consolidation for v11 & v12 features (#1905).**
+  Updates documentation guides for NLI cascade, harvest scheduler, decay and retention policies, and archives legacy ChromaDB migration guidance.
+- **`server/cache_manager.py` logs with lazy `%`-style arguments (#1146).**
+  Its f-string logger calls now pass their values as arguments. Storage IDs,
+  hit/miss counts, and instance totals are logged with `%d`, and percentages
+  and elapsed times with `%.1f`. The module is added to `GUARDED_MODULES`, so
+  the log-injection ratchet keeps it clean.
+- **`lm_studio_compat.py` logs with lazy `%`-style arguments (#1146).**
+  Its six f-string logger calls now pass their values as arguments; the values
+  that come from outside (the exception, the incoming notification and its
+  `reason`) stay wrapped in `_sanitize_log_value`. The module is added to
+  `GUARDED_MODULES`, so the log-injection ratchet keeps it clean.
+- **`web/oauth/storage/sqlite.py` logs with lazy `%`-style arguments (#1146).**
+  Its eight f-string logger calls now pass their values as arguments. The client
+  ids, the database path and the consumed authorization code stay wrapped in
+  `_sanitize_log_value`; the expired-row counts from the cleanup job are
+  internal integers and are logged with `%d`. The module is added to
+  `GUARDED_MODULES`, so the log-injection ratchet keeps it clean.
+- Expose untagged-memory and embedding-dimension storage APIs, share log sanitization, simplify ontology/taxonomy wrappers, and manage document cleanup through the web application lifespan.
+
+## [12.7.0] - 2026-11-06
+
+
+### Fixed
+
+- **Consolidation's typed-edge gates are the ones its docs state (#1457).** The docs said
+  confidence 0.75 and similarity 0.65, while the code shipped 0.50 and 0.45 and consolidation
+  ran at 0.6 and 0.45. On three hand-checked stores neither setting made a label right
+  (0 of 139), but the #541 gates write about ten times fewer of them, so those are now the
+  constructor defaults and the consolidator passes them explicitly. The 0.65 is on the
+  normalized score `(cos + 1) / 2`, i.e. cosine 0.3, and the docstrings say so. These gates
+  apply only with `MCP_TYPED_EDGES_ENABLED=true`, off by default since #1887.
+  `scripts/maintenance/update_graph_relationship_types.py` builds the same engine, so it
+  picks up the 0.75; it passes no similarity, so the similarity gate does not apply there.
+- **Optionally capture short Codex replies with their preceding assistant context (#1664).** The new `contextualCapture` setting is off by default and stores an opted-in reply/response pair with source turn metadata, without an LLM call.
+- **Search filter tooltips and most of the Documents tab stayed English (#1817).**
+  The five filter tooltips and the three Documents help icons already had catalog
+  keys, but only on `data-i18n-aria`, so the tooltip a user actually hovers kept its
+  English `title`; `data-i18n-title` now sits next to each aria attribute. Those icons
+  also sat inside the element whose text is translated, and `applyTranslations()`
+  writes `textContent`/`innerHTML`, so the first render dropped them from the page --
+  the translatable text now lives in its own `<span>` and the icon stays beside it.
+  The upload history (`No uploads yet`, its error line), the View/Remove buttons of
+  both document lists, the drop zone that `app.js` rebuilds after an upload, the
+  chunk-overlap illustration, the processing-mode help heading, the memory-viewer chunk
+  count and the removal confirmation go through `this.t()` or a `data-i18n*` attribute
+  now, with twenty-two new strings in all eleven catalogs. The chunk-size help icon also
+  gets its own `info-icon-chunk` class: it shared the bare `.info-icon` hook that
+  `setupDocumentsEventListeners()` queries, so once the processing-mode icon stayed in
+  the page the wrong icon answered the click. `documents.supported` also lists DOCX and
+  PPTX, which `semtools_loader.py` has accepted all along, and the static `#fileInput`
+  now accepts `.docx,.pptx` like the input `app.js` rebuilds.
+- **Test Connection and Save in the Settings Credentials tab send their requests again (#1839).** Both called `apiCall()` with a fetch-style options object instead of the method and the data as separate arguments, so neither request carried the method or body it needed. `tests/web/test_credentials_apicall_args.py` checks both calls.
+- **`conflict:unresolved` no longer outlives the conflict (#1840, mbreitkreuz).** Superseding or deleting one side of a conflict (`mark_superseded_batch`, `resolve_conflict`, `delete`, a versioned update) left the tag on the other side, and `resolve_conflict` stripped it from the winner even while the winner still contradicted another memory. `resolve_conflict` also refuses a memory resolved against itself now. The partner's tag is now cleared in the same transaction once it has no current conflict partner left, a new version no longer inherits the tag, and the `maintain` conflicts step reports (dry run, the default) or clears tags left behind by older data, bulk deletes and sync. sqlite-vec only.
+- `POST /api/manage/delete-untagged` now deletes through the storage layer on the SQLite backends instead of tombstoning the rows with a raw `UPDATE` on the shared connection. The new `DeleteMixin.delete_untagged_memories()` removes the graph edges, retracts the beliefs and summaries that cited the deleted hashes, appends one delete event per hash for delta-sync peers, and commits once under the connection lock — the same shape as `delete_by_tags()`. `count_untagged_memories()` joins it, so both endpoints now go through one predicate and the raw-SQL fallbacks are gone.
+- The `confirm_count` the caller is held to is now re-checked where the rows are selected for deletion — inside the connection lock and the transaction on SQLite, before the first write — so a concurrent request that strips the last tag off another memory between the count and the delete can no longer widen the delete past what was confirmed. The endpoint answers such a race with the same `400` as a stale count.
+- **Korean landing page headline reworded (#1873).** The hero read
+  `AI 어시스턴트에게 오래 남는 기억을`; it now reads `AI 어시스턴트를 위한 기억력`,
+  matching the page title.
+- **Entity linking no longer replaces `contradicts` edges (#1874, mbreitkreuz).** With `MCP_ENTITY_LINKING_ENABLED=true`, storing a memory that contradicts an existing one recorded the conflict and then overwrote both `contradicts` edges with `shares_entity`, because a pair holds one edge and the linker runs after conflict detection. `memory_conflicts` and the `maintain` auto-resolve lost the pair while both memories kept `conflict:unresolved`. The linker now skips any pair that already has an edge other than `has_entity` / `shares_entity`, the rule `rebuild_entities` already used. Pairs overwritten before this fix are not repaired: if you ran with entity linking enabled, run `memory_quality` `maintain` as a dry run first. An overwritten pair shows up as two reported hashes joined by a `shares_entity` edge; resolve it with `memory_resolve` before running `maintain` with `dry_run=false`, which clears the tag and with it the last trace of the conflict.
+- **Store-scoped metadata updates are confined in the storage layer (#1875, part of #1683).** `update_memory_metadata` and `update_memory_versioned` looked a memory up by `content_hash` alone. A claim on one store was only enforced by a `get_by_hash` pre-check in the MCP handler, so the check and the write were two separate steps. Both methods now take `store`, put `AND store = ?` into the lookup and the `UPDATE`, and report a memory in another store as not found without changing it. A metadata update whose `UPDATE` matches no row, because the memory was deleted or moved between the read and the write, now returns not found instead of success, and a versioned update aborts if the old row leaves the store while the new version is written. The MCP handler and `PUT /api/memories/{hash}` pass the claimed store through. `None` and `"all"` stay unscoped, so callers without a store behave as before. sqlite-vec and hybrid only; the other backends still refuse store-scoped updates until #1878 and #1879 land.
+- `memory_search` with `fallback=true` now runs its exact and tag fallbacks in the same store as the main search. Before, both fallbacks searched the `default` store whatever `store` the call named, so a search in one partition could return another partition's memories. A per-store credential (`read:<store>`) can now make a `fallback=true` search; it used to need the global grant.
+- **Beliefs and the NLI on-store check respect the store (#1877, part of #1683).** Beliefs aren't stored per store, so `memory_search` with `include_beliefs` returned beliefs from every store, and the opt-in NLI check on store (`MCP_NLI_ON_STORE`) compared a new memory with all of them. A per-store grant therefore could not cover `include_beliefs`. A belief is now visible in a store when none of its live source or contradicting memories sits in another store. Deleted memories don't count, so retention never hides a belief. The beliefs section of a search uses the same store as its memory results (`"default"` unless one is given), and the on-store check, in both the synchronous and the background path, compares a new memory only with beliefs visible in the store it was written to. A single-store user, with everything in `"default"`, sees every belief and keeps challenging them as before. `include_beliefs` no longer needs the global grant.
+- **Consolidation no longer labels inferred edges `fixes` / `contradicts` by default (#1883).**
+  `MCP_TYPED_EDGES_ENABLED` now defaults to `false`. A typed label came from the pair of
+  memory types (`learning` -> `bug` gave `fixes`, two note-like types gave `contradicts`),
+  not from what the two memories say, and hand-checked samples from three stores found
+  0 of 139 typed edges correct. Inferred associations are still stored, as `related`.
+  This release does not relabel stored edges in bulk, but `store_association()` writes
+  with `INSERT OR REPLACE`, so a pair that a later consolidation finds again is
+  stored as `related` and loses its typed label. `MCP_CONSOLIDATION_AUTO_SUPERSEDE`
+  acts on `contradicts` edges, so with the new default it has nothing to act on. To keep the old behavior, set
+  `MCP_TYPED_EDGES_ENABLED=true`; the #1457 gates still apply.
+- Keep selected source memories intact during semantic compression so rules retain
+  their exceptions and conditions, including short caveats and separate paragraphs.
+  Omit excerpts that exceed the summary budget instead of storing a partial rule.
+
+### Internal
+
+- **`pre_pr_check.sh` now runs the changelog fragment check.** Check 6.11 calls
+  `scripts/ci/check_changelog_entry.sh --staged origin/main`, the same script CI's
+  `changelog.yml` runs, but against the index, so a missing fragment or one without a
+  `- ` list item fails locally instead of in CI after the push.
+
+## [12.6.0] - 2026-11-05
+
+
+### Added
+
+- Rebuild existing entity graphs with `memory_quality(action="rebuild_entities")`, previewing changes by default and applying current extraction settings across all live memories on SQLite, Hybrid, and Milvus.
+- **The dashboard follows the system color scheme by default (#1737).** It used to
+  open in light mode whatever the OS was set to. A new `System` theme, the default
+  for anyone who never picked one, tracks `prefers-color-scheme` and updates live
+  when the OS switches. An explicit light or dark choice still wins, and the header
+  toggle keeps flipping between light and dark. `theme-init.js` applies the same rule
+  before first paint, so following a dark OS does not bring back the flash from #1705.
+- **`memory oauth list-clients` and `memory oauth delete-client` (#1804, timkjr).**
+  Registered OAuth clients, including ones that registered themselves through
+  Dynamic Client Registration, could only be removed by editing `oauth.db` by
+  hand. `list-clients` shows each client without its secret, with its newest
+  refresh token still on record. `delete-client` asks for confirmation (`--yes`
+  skips it) and removes the client with its authorization codes and tokens in
+  one transaction. Access tokens already issued as JWTs stay valid until they
+  expire, and while registration is open a deleted application can register
+  again. Both storage backends gain `list_clients()` and `delete_client()`.
+- Add Russian language support to the web dashboard with a complete translation catalog, automatic language discovery, and regression tests (#1763).
+- Added a Korean introduction to the project website, including setup guidance and language navigation.
+
+### Fixed
+
+- **Prevent a light-theme flash when the dashboard reloads in dark mode (#1705).** A synchronous external initializer applies the saved theme before dashboard content is parsed; blocked or malformed storage keeps the default light theme.
+- **The SQLite OAuth store never enforced its foreign keys (#1804, timkjr).**
+  The schema declares `ON DELETE CASCADE` from authorization codes, access
+  tokens and refresh tokens to `oauth_clients`, but the backend never turned on
+  `PRAGMA foreign_keys`, so deleting a client left its codes and tokens behind
+  and a code or token could be stored for a client that did not exist. The
+  pragma is now set on the connection. `store_client` switched from
+  `INSERT OR REPLACE` to an upsert: REPLACE deletes the row first, and with
+  enforcement on, that delete would have wiped the client's tokens whenever
+  `authenticate_client` upgraded a legacy plaintext secret to a hash.
+- **The Manage tab and the search counts stayed in English in every language (#1808, ZYZ666-RGB).**
+  Tag column headers, Rename and Delete, both “0 results” labels and “0 chunks found”
+  already had catalog keys, and the page never read them. `Filter by type:` and
+  `Delete Untagged` named keys no catalog defined, so the English markup remained.
+  The tag-statistics error, the untagged-memory sentence and its delete prompts now
+  come from the catalogs too. A language switch keeps the numbers in those counts.
+  One search result reads “1 result”, and one document chunk reads “1 chunk found”;
+  zero and every larger count stay plural. The chosen key stays on the element, so
+  the next language switch does not put the plural wording back.
+- **The Analytics activity report, activity heatmap and top-tags report stayed English in every language (#1809).**
+  Their labels (`Period:`, `N memories (N%)`, `Often with:`, `Active Days:`, the streaks, `Peak Times:`,
+  the heatmap's `N active days`, `Max: N memories/day`, day tooltips, `Less`/`More`, and the empty and
+  load-error messages) were English literals in `app.js`. They now come from 18 new `analytics.*` keys
+  in all ten catalogs, and the top-tags period reads as its menu label (`Last 30 Days`) instead of `30d`.
+- **The storage report and several Analytics and Quality chart labels were English in every language (#1810).**
+  The storage report's labels, units, date fallback and tag line, the empty and error messages
+  of the growth, tag usage, memory types and relationship types charts and their aggregate
+  rows, the quality analytics load error, the score distribution labels and axis title, and the
+  Local SLM and Implicit Only provider names now come from the catalogs, in all ten languages.
+  The tags in the storage report are escaped now.
+- **The Knowledge Graph toolbar and its fullscreen view were English in every language (#1811, ppcvote).**
+  The node-limit `All` option, the 3D/2D, rotation, fullscreen, legend and exit tooltips, the
+  layout group's screen-reader name, the Pause/Play rotation toggle, the node tooltip hints and
+  the empty and error messages now come from the catalogs, in all ten languages. The rotation
+  toggle keeps its key, so a language switch shows Play or Pause in the new language.
+- **The memory detail, add and edit dialogs stayed in English in every language (#1815).**
+  Opening a memory showed `Memory Details`, `Created:`, `Content`, `Tags` and `Metadata`
+  in English; editing showed `Edit Memory` and `Update Memory`; the delete confirmation,
+  the save and rating toasts, the active-filter chips, the quality badge tooltip and the
+  empty states of the recent memories, tag cloud, tag view, search and quality lists did
+  the same. They now come from the catalogs, with 31 new keys in all ten. Switching to
+  edit also moves the title's and button's `data-i18n` key along, so a later language
+  switch no longer turns `Update Memory` back into `Save Memory`.
+- **The authentication dialog stayed English in every other language (#1818).**
+  The dialog the dashboard shows when it needs an API key or an OAuth login carried
+  no `data-i18n` attributes at all, so its heading, both section titles, the API key
+  field, the two buttons and the local-development note kept their English text after
+  a language switch; the four messages around a login attempt were hardcoded English
+  strings passed straight to `showToast`. The markup now names nine keys
+  (`modal.auth.*`, with `data-i18n-html` for the note so its `<strong>`/`<code>`
+  markup survives) and `app.js` looks the messages up through `this.t()`; all ten
+  catalogs carry the thirteen new strings.
+- **The Settings Credentials tab is now translated (#1813).** The Cloudflare credentials and sync-owner form, its hints, the connection test and the save messages were English-only in every language. They now read from the catalogs in all ten locales. `tests/web/test_i18n_credentials_tab.py` checks the keys, their placeholders and markup, and that the tab uses them.
+- **Versioned updates no longer flag their parent as a conflict (#1838).** They still detect and report conflicts with other memories.
+- **The HTTP /mcp shim served a weaker protocol than stdio (#1847).**
+  `tools/list` over HTTP dropped every tool's `annotations` (0/26 carried
+  readOnlyHint/destructiveHint vs 28/28 on stdio), `ping` answered
+  `-32601`, and the `memory_graph` schema enum advertised 5 of the 9 actions
+  the handler accepts — `abduct`, `list_entities` and `entity_profile` were
+  unreachable for schema-respecting clients. The shim now serializes
+  annotations, answers `ping` with an empty result, the enum lists all nine
+  actions, and the write-scope exemption derives from a single
+  `GRAPH_ACTIONS` constant so the three lists cannot drift (`extract_entities`
+  stays write-only, GHSA-2mw6-h564-86wv behavior unchanged).
+- **`memory_graph` was advertised as read-only although `extract_entities` writes entity links (#1852).** The tool annotation now sets `readOnlyHint: False` on both stdio and the HTTP `/mcp` shim, so clients no longer auto-approve a write that should require user confirmation.
+- **Harvest no longer lets an older statement replace a newer memory (#1858).** A multi-session harvest now processes sessions oldest first, harvested memories record when they were said in `metadata.source_time`, and evolution skips a candidate that is older than the memory it matched, storing it separately instead. Opt-in auto-supersede now orders a contradicting pair by that statement time instead of the ingest time. Harvest provenance version is now 4.
+- **Dashboard restart and update no longer crash servers started with `python -m uvicorn` (#1861).** The delayed restart helper previously rebuilt the command as `[sys.executable] + sys.argv`. Under `-m uvicorn`, `sys.argv[0]` points to `uvicorn/__main__.py`, causing the process to re-execute `__main__.py` as a script and placing `site-packages/uvicorn/` first on `sys.path`. uvicorn's internal `logging.py` then shadowed standard library `logging` on startup, crashing with an `AttributeError` circular import error. The restart command now rebuilds from `sys.orig_argv` on Python 3.10+, preserving the original `-m uvicorn` invocation and interpreter options on both Unix and Windows.
+- **Any web page could drive an unauthenticated local `--streamable-http` or `--sse` server (GHSA-8p26-g7wp-65jw, orshih6).**
+  With no API key or OAuth on a loopback bind, the `/mcp` preflight answered every origin
+  with `Access-Control-Allow-Origin: *`, and neither transport checked `Host` or `Origin`,
+  so a cross-origin page could call `memory_delete` or plant memories, and a DNS-rebinding
+  domain could also read the results. An unauthenticated server now only accepts loopback
+  `Host` values and loopback origins plus `MCP_CORS_ORIGINS` (403/421 otherwise), and the
+  preflight grants exactly those origins. Servers with an API key or OAuth keep their
+  current behaviour, including behind a reverse proxy.
+- **Deleting a memory left beliefs and consolidation summaries citing it (#1857, ZYZ666-RGB).**
+  Graph edges were removed in the delete transaction, but `derived_from`,
+  `contradicted_by` and `metadata.merged_from_hashes` kept the hash, and
+  compression and association memories kept it in `source_memory_hashes`.
+  Retention deletes this way all the time, so `get_beliefs` kept returning a
+  belief whose evidence was gone. The same transaction now drops the hash from
+  those lists, records `metadata.stale_sources` (how many, and when), and marks
+  a belief `ungrounded` when nothing is left. That status is not `superseded`.
+  Confidence is unchanged until the next `challenge_belief`. Summaries are
+  flagged and not rewritten. A later re-derivation does not union a merged
+  source that is no longer live. Re-deriving an ungrounded belief promotes it
+  back to candidate, or to active when the usual floors are met. A tombstone
+  applied through delta sync runs the same cleanup. A summary flag advances
+  `updated_at` and records an `update_metadata` event when the sync log is on.
+  If that cleanup fails, the delta-sync apply rolls the tombstone and the
+  event back, so a retry can finish instead of sticking as a duplicate. A
+  local delete rolls that same transaction back before it releases the
+  connection lock. Re-derivation writes only sources that are still live,
+  and saves that list with confidence and status together.
+- **Five localized website introductions still allowed Python 3.10 (#1868).** The
+  German, Spanish, French, Japanese and Simplified Chinese pages said Python 3.10 or
+  newer was enough after #1770 had retired 3.10. They now say 3.11, like the English,
+  Brazilian Portuguese, Traditional Chinese and Korean pages.
+
+### Internal
+
+- Explain the optional `sqlite_vec` import guard in `storage/mixins/retrieve.py`, clearing CodeQL `py/empty-except` alert 639 (#1867).
+
+## [12.5.0] - 2026-11-03
+
+**Python 3.10 is no longer supported.** This release requires Python 3.11 or newer (#1770); see Removed below before upgrading.
+
+### Added
+
+- **Show delta-sync status in the Web GUI (#1555, Parth-Jadhav-2004).**
+  SQLite-vec clients previously had no visible indication of event-log sync.
+  A dashboard panel now shows peer destinations, scheduling, cycle results,
+  cursors, and errors, with styling that follows the existing dashboard cards.
+- The Web GUI refreshes dashboard data and delta-sync status after sync, memory changes, and consolidation, with coalesced SSE updates, a quiet 30-second fallback, and a live countdown based on the registered sync job (#1557).
+- **Per-stage timing of the `memory_search` rerank path (#1669, #1701, massimiliano1991).**
+  With `rerank=true` and `include_debug=true`, `debug.rerank_timing` carries the wall-clock of
+  each stage of the call — search and pool size, filters, scorer resolve (cold or warm, with the
+  `to_thread` hop), scoring with one line per ONNX inference chunk (items, padded length,
+  tokenize and run time) — and the debug block prints it. Without `include_debug` nothing is
+  measured and the response is unchanged.
+- **Choose which tags become entities for entity linking (#1704, andrunio).**
+  Every memory tag became an entity, so generic tags such as `bugfix` or `project:<name>`
+  linked almost every memory to every other. `MCP_ENTITY_TAG_INCLUDE` and
+  `MCP_ENTITY_TAG_EXCLUDE` take comma-separated `fnmatch` patterns, matched
+  case-insensitively, include first, then exclude. Unset keeps today's behaviour;
+  entities found in the content are not filtered, and existing edges are not rebuilt.
+- **A nullable `beliefs.embedding` column for later semantic re-ranking and dedup (#1728, filhocf).**
+  Migration 020 adds a `BLOB DEFAULT NULL` column plus a partial index on
+  `embedding IS NULL` to mark rows pending backfill. Additive and reversible: the
+  rollback follows the 015/016 pattern (Part A deregisters and rolls `schema_version`
+  back on every SQLite version, Part B drops the column on SQLite ≥ 3.35). The
+  migration runner's baseline recovery now also probes v20, so an upgrade after a
+  Part-A-only rollback (column retained, registry row removed) re-stamps the migration
+  and restores the pending index instead of re-running `ADD COLUMN` and failing
+  duplicate-column. The migration itself is pure DDL; the column is filled by belief
+  creation and the consolidation backfill, and read by the dedup entry below.
+- **Opt-in semantic dedup of beliefs by embedding cosine — library layer (#1733, filhocf).**
+  `BeliefService.dedup_beliefs(dry_run)` groups active/candidate beliefs whose stored
+  `embedding` (migration 020, #1729) has cosine ≥ `MCP_BELIEF_DEDUP_THRESHOLD`
+  (default 0.90), elects a deterministic canonical (confidence → |derived_from| →
+  updated_at → hash, never utility), and — when `dry_run=False` — merges the losers'
+  provenance and numeric feedback counters into the canonical and supersedes them
+  (never deletes), one transaction per group. A cap of 0 or less (`MCP_BELIEF_DEDUP_CAP`)
+  returns before grouping. Greedy single-linkage over the persisted embeddings, stable
+  via `ORDER BY belief_hash`.
+  The consolidation job calls `backfill_belief_embeddings()` and then `dedup_beliefs()`
+  when `MCP_BELIEF_DEDUP=true` (see the wiring entry below); dedup is a dry run unless
+  `MCP_BELIEF_DEDUP_APPLY=true`. Beliefs created before this release keep a NULL embedding
+  until the first backfill runs.
+  Note: `_create_belief` now computes an embedding for every new belief regardless of
+  `MCP_BELIEF_DEDUP` (per #1728, "compute the embedding on belief create"), so expect one
+  extra embedding inference per belief created. Part 2 of #1728.
+- **Memory Growth in the dashboard is a line chart (#1740).** The Analytics view drew
+  growth as a list of bars with "+0 (0 total)" rows. It is now an inline SVG line of the
+  running total over the selected period, the latest point in the accent, and it takes
+  the full row as the view's main chart. No new dependency.
+- **Dashboard: complete Indonesian (`id`) locale (#1765, closes #1762).** The dashboard shipped no
+  Indonesian catalog, so every label, Knowledge Graph control and quality setting fell back
+  to English for `id` users. `web/static/i18n/id.json` now carries all 424 keys from
+  `en.json` with matching interpolation tokens and HTML structure.
+  `tests/web/test_i18n_id.py` walks the real catalogs for key coverage, metadata and
+  placeholder parity, and asserts that `/api/languages` discovers `id`, so the gap fails in
+  CI instead of silently reappearing.
+- Add a German introduction to mcpmemory.services with a shared translation template, language links, search metadata, and generated-page checks.
+- Add a Spanish introduction to mcpmemory.services with installation guidance, language links and search metadata.
+- **Wire belief embedding backfill + semantic dedup into the consolidation job (follow-up to #1733).**
+  After belief derivation, `ConsolidationScheduler._run_consolidation_job` now runs
+  `backfill_belief_embeddings()` then `dedup_beliefs()` when `MCP_BELIEF_DEDUP` is on.
+  Backfill fills NULL embeddings on pre-existing beliefs so they become dedup-eligible;
+  dedup runs **dry-run by default** (reports the groups it would merge without writing).
+  Merging requires the separate `MCP_BELIEF_DEDUP_APPLY=true` switch, so enabling the
+  feature cannot silently mutate the corpus. The backfill and dedup stats are recorded on
+  the job history, and a dedup failure is non-fatal (the job still succeeds). The four
+  variables (`MCP_BELIEF_DEDUP`, `MCP_BELIEF_DEDUP_APPLY`, `MCP_BELIEF_DEDUP_CAP` /
+  `MCP_BELIEF_DEDUP_THRESHOLD`) are documented in `.env.example`. Completes #1728.
+  Derivation reads and writes share the dedup transaction's connection lock, so
+  overlapping jobs cannot commit a half-finished merge or lose merged sources.
+  Derivation status transitions also check their original status before promoting or
+  superseding a belief changed by another job.
+- Run locked belief reads and writes in worker threads so a competing backfill or
+  dedup transaction cannot freeze the event loop while a request waits for SQLite.
+- **Japanese website introduction (#1776, Sainath-Reddy7).**
+  Adds `scripts/maintenance/site_locales/ja.json` (48-key catalog, polite style) and the
+  generated `site/ja/index.html` with language links, alternate links and sitemap updates;
+  README's Getting started line now links 日本語.
+- Added a Brazilian Portuguese website introduction at https://mcpmemory.services/pt-br/, linked from every language page and the README (#1781).
+- **Brazilian Portuguese support in the dashboard (#1787).** The dashboard now includes a Brazilian Portuguese (`pt`) translation, allowing users to select and use the interface in Portuguese (Brazil) through the existing language selector. No new dependencies.
+- Add Hindi language support to the web dashboard, including translated navigation, search, document ingestion, analytics, settings, and quality management interfaces.
+- The website now has a Traditional Chinese (Taiwan) introduction at https://mcpmemory.services/zh-tw/.
+- **French introduction on mcpmemory.services (#1774).** The website now has a French entry page at `/fr/`, linked from the other language pages, the sitemap and the README.
+- The website now has a Simplified Chinese introduction at https://mcpmemory.services/zh-cn/.
+
+### Fixed
+
+- **More dashboard text follows the selected language (#1830, #1831, #1835; part of #1806).**
+  The header controls, the delta-sync panel and the connection status, the Settings Server
+  tab and the restart overlay, and the Settings tabs for Environment, System Info and
+  Backup now read their strings from the locale catalogs instead of hard-coded English.
+  Every shipped catalog gained the new keys, and tests walk the catalogs for key and
+  placeholder parity.
+
+- **Harvest parser and pattern loader logged file names, locale and YAML keys unsanitised (#1146, massimiliano1991).**
+  `harvest/parser.py` put the session file name of a corrupt or unrecognised transcript, and the
+  Kiro database name plus the `sqlite3` error of a database it could not open, into the log
+  through f-strings; `harvest/patterns/__init__.py` did the same with the locale-derived path of
+  a missing pattern file and with the file name, `memory_type` key and `re.error` text of a
+  pattern that does not compile. A newline in any of them forged a log line. They go through
+  `_sanitize_log_value` now; both modules are in the guard's `GUARDED_MODULES` list and a test
+  per module fails if the newline comes back.
+- **Belief derivation never saw a contradiction (#1657, debashishthakur).**
+  `_find_contradictions()` looked for the graph on `storage.graph`, which no storage
+  class sets, called a `get_edges()` that `GraphStorage` does not have, and asked for a
+  `CONTRADICTED_BY` edge type that nothing writes, so every belief was derived with
+  `contradicted_by: []`. `BeliefService` now takes the graph handle, the scheduler passes
+  the consolidator's, and contradictions are read from the `contradicts` edges that
+  contradiction detection writes.
+- **Reasoning modules logged caller hashes, entity names and backend errors unsanitised (#1146, #1698, massimiliano1991).**
+  `reasoning/inference.py`, `entity_linker.py`, `nli.py` and `multi_strategy.py` put the hash
+  handed to the `SemanticReasoner` lookups, the entity names extracted from memory content and
+  tags, and the exception text of the graph backend or a failed search strategy into the log
+  through f-strings, so a newline in any of them forged a log line. They go through
+  `_sanitize_log_value` now; the four modules are in the guard's `GUARDED_MODULES` list and a
+  test per module fails if the newline comes back.
+- **The search reranker ignored `MCP_QUALITY_LOCAL_DEVICE` (#1669, #1701, massimiliano1991).**
+  It resolved its scorer with `device='auto'` regardless of the setting the quality evaluator
+  already passes to the same loader; on Apple Silicon `auto` selects the CoreML provider, which
+  runs the int8 cross-encoder an order of magnitude slower than the CPU provider. The setting
+  now reaches the reranker; the default (`auto`) is unchanged.
+- **Under `max_response_chars`, the debug block could displace every result; a zero-hit search printed none (#1701, massimiliano1991).**
+  With `include_debug=true` the diagnostics now ride after the results as the optional section
+  of a limited response, so the limiter drops them before it drops a memory; and a search with
+  no matches prints its debug block (filter counts and the search/filter timing) too, and
+  keeps it under the limit whether or not a summarization warning precedes it. The non-empty
+  limited path without a summarization warning budgeted only the memories and appended the
+  header, the truncation notice and the optional section uncounted; every positive
+  `max_response_chars` now goes through the bounded formatter, so a limited non-summary search
+  carries the bounded formatter's truncation notice (result counts, no character counts).
+- **Milvus: deleting a memory left its graph edges behind, and entity linking kept linking new memories to it (#1703, andrunio).**
+  Every Milvus delete path removed the memory rows but not their rows in
+  `<collection>_graph`, so the dead memory's `has_entity` edge still answered
+  `find_memories_by_entity()` and `EntityLinker` connected new memories to it.
+  `delete()`, `delete_by_tag()`, `delete_by_tags()`, `delete_by_timeframe()`,
+  `delete_before_date()` and `delete_untagged_memories()` now remove the edges of
+  the memories they deleted, best-effort and logged, the way SQLite cascades them.
+- **OAuth client registration sent `"client_secret": null` to public clients, which Claude Code rejects (#1707, djimenezm2).**
+  Since v11.8.2 a client registering with `token_endpoint_auth_method: "none"` gets no secret, but
+  `POST /oauth/register` serialized the empty field as JSON null instead of leaving it out, and did
+  the same for an unset `client_name` or `scope`. RFC 7591 omits optional members that have no
+  value, and Claude Code aborted the OAuth flow on the null. The route now drops empty members from
+  the response, confidential clients still receive their secret, and a test that goes through
+  FastAPI fails if a null comes back.
+- **Milvus: `purge_deleted()` left the graph edges of purged memories behind (#1708, andrunio).**
+  It hard-deleted tombstoned rows but kept their rows in `<collection>_graph`, so a
+  purged memory's `has_entity` edge still answered `find_memories_by_entity()`. It now
+  removes those edges through the same best-effort helper the other delete paths got
+  in #1706.
+- **"pymilvus not available" logged on every start without Milvus (#1718).**
+  `storage/__init__.py` imported the Milvus backend eagerly, so every install
+  without pymilvus logged a WARNING at startup whatever backend it used.
+  `MilvusMemoryStorage` now loads on first access, and the missing-pymilvus
+  error is raised only when a Milvus storage is actually created.
+- **Async quality scorer logged a WARNING on every restart (#1719).**
+  Its first-use start is the only way the scorer starts, so
+  "Async quality scorer not running, starting now" is now logged at DEBUG.
+- **Delta-sync: the `sync_events` log grew without bound from `update_metadata` churn (#1721, filhocf).**
+  The event log is append-only and never compacted, so periodic local recomputes
+  (quality/utility) that rewrite metadata appended an `update_metadata` event per memory
+  several times a day — on a 3-week-old database, 1.36M events, 97% of them idempotent
+  `update_metadata`. A new `compact_update_metadata` job collapses the chain per
+  `content_hash` into one consolidated event carrying the LWW-resolved state (reusing the
+  apply resolver, not re-implementing it). It is convergence-preserving: compaction is
+  all-or-nothing per live incarnation — a hash is only collapsed when its whole live
+  `update_metadata` chain sits at or below the safe watermark `MIN(last_seq_pushed)` across
+  peers, so a field whose winning edit is still above the watermark can never be defeated by
+  a collapsed field carrying an inflated clock. The consolidated event keeps the winning
+  event's HLC pair and a deterministic id that includes the payload hash (so peers that
+  compact divergent chains never reuse an identity). The delete is chunked and the whole
+  batch is fail-closed under a single SAVEPOINT.
+- Fix harvest OpenAI-compatible requests for GPT-5 models by using max_completion_tokens.
+- **Point-in-time `as_of` searches no longer leak present-day fallback results (#1724).**
+  With `fallback=true`, an `as_of` search returning fewer than three matches could
+  append present-day exact or tag matches. The cascading fallback stages now forward
+  `as_of`, so historical queries only return memories that were current at the
+  requested date.
+- **Consolidation meta-statistics leaked into beliefs (#1727, filhocf).**
+  `derive_beliefs` turned the consolidation engine's own auto-generated
+  insights into beliefs: `[GAP] Decision gap: '<tag>'`, `[PATTERN] ... N
+  memories share tags [...], indicating a recurring theme.` and `[TREND] ...`.
+  These are tag co-occurrence counts and gap statistics, not actionable
+  knowledge, and they occupied top-k slots in belief search. `_is_noise` now
+  rejects the three bracket markers and the bracket-less "N memories share
+  tags ... recurring theme" sentence. Narrow by design: it requires the
+  share-tags + recurring-theme co-location, so a plain mention of "tag" or
+  "pattern" in a legitimate belief is never caught. Measured on a live
+  corpus of 3,168 active/candidate beliefs, 153 were meta-noise.
+- **The dashboard used emoji as icons and template copy (#1738).** Section headings,
+  footer links, memory cards, the graph tooltip and several settings messages carried
+  emoji, in all seven locales. They are gone; where an emoji did a job, an inline SVG,
+  a word or the local time does it now. The overview headline, the search placeholder
+  and the Quality and API Docs subtitles say what the page shows instead of
+  "Welcome to your Memory Dashboard" and "AI-powered scoring".
+  `tests/web/test_dashboard_no_emoji.py` keeps them out.
+- **The Analytics tag chart could report more than 100% (#1739, Esmail-sarhadi).**
+  The minor-tag bucket of the tag usage chart summed the per-tag percentages, but those
+  are `count / total_memories` and a memory carrying three tags contributes to three
+  rows, so the bucket passed 100% as soon as anything was multiply tagged — 225% for the
+  reported shape, which drew a 500px bar inside a 200px scale. The bucket now reports how
+  many tags it folded in and no percentage at all, since there is no honest percentage for
+  a set of overlapping tags, and the per-tag bars are clamped to the scale. The Database
+  Size tile no longer reads `N/A` for a genuinely empty database: the check was falsy, so
+  `0.0` was treated as missing.
+- **An unreadable primary database reads as unknown, not as 0 MB (#1739, Esmail-sarhadi).**
+  `HybridMemoryStorage.get_stats()` filled a missing `database_size_mb` with `0`, so when
+  the SQLite primary returned only `{"error": ...}` the hybrid backend reported an empty
+  database instead of a failed read — the tile showed `0.0 MB`. The key is left as `None`
+  now, which the API, the dashboard and `memory status` all render as unknown.
+- **The dashboard looked like a template and overflowed on phones (#1740).** Gradients,
+  cyan glows, hover lifts, bold weights everywhere and four highlighted metric tiles are
+  gone; figures are mono, destructive actions are outlined, and every memory card shows
+  its type as a small dot. At 390 px Analytics widened the page to 682 px and Manage to
+  417 px; the main content area now has `min-width: 0`, the auto-fit grids collapse to
+  one column and the tag table scrolls in place. `memory_type` and the quality provider
+  are escaped before they reach the markup. `tests/web/test_dashboard_style_guard.py`
+  keeps gradients, catch-all transitions, hover lifts and heavy weights out.
+- **Dashboard error toasts showed "[object Object]" for structured API errors (#1743, calude-bot).**
+  `apiCall()` built its `Error` from `detail` as-is, so the OAuth scope checks'
+  `{error, error_description}` and FastAPI's validation list both stringified to
+  "[object Object]": Settings > Server > Check for Updates without the admin scope read
+  "Failed to check for updates: [object Object]". The message now comes from a string
+  `detail`, then `error_description`, then `error`, else `HTTP <status>`; `err.detail`
+  still carries the original value for callers that branch on it.
+- **Japanese Knowledge Graph translations (#1753, Sainath-Reddy7).**
+  Selecting Japanese left the 13 Knowledge Graph labels and both filter tooltips in
+  English because `ja.json` did not define them and the dashboard's `t()` fell back
+  to the English catalog. All 13 keys are now translated with terminology matching
+  the rest of the catalog (知識グラフ, 凡例, ノード, グラフ); the two filters keep the
+  issue's load-vs-display distinction (最小接続数 reloads the graph from the database
+  link count, 最小次数 hides low-degree nodes among the shown memory types without a
+  reload, 1 = 無効).
+- **Korean Knowledge Graph translations (#1754, Sainath-Reddy7).**
+  Selecting Korean left the 13 Knowledge Graph labels and both filter tooltips in
+  English because `ko.json` did not define them. All 13 keys are now translated with
+  terminology matching the rest of the catalog (지식 그래프, 범례, 그래프); the two
+  filters keep the issue's load-vs-display distinction (최소 연결 수 reloads the graph
+  from the database link count, 최소 차수 hides low-degree nodes among the shown
+  memory types without a reload, 1 = 끔).
+- Allow a contributor's standalone `/claim` to confirm their own earlier informal claim on an opted-in good first issue, while preserving checks for intervening claimants, edits, withdrawals and existing work.
+- **The German Knowledge Graph labels fell back to English (#1750).** Thirteen
+  `analytics.*` keys — the graph description, edge types, node colours, the legend, the
+  refresh button, the Force and Rings layout toggles, and the Min Connections and Min
+  Degree filters with their tooltips — existed in `en.json` but not in `de.json`, so the
+  dashboard's `t()` fallback showed English to a German reader. All thirteen are
+  translated in place; the pre-existing duplicate `analytics.memoryTypes` key is left
+  untouched. `tests/web/test_i18n_de_knowledge_graph.py` pins the key set, rejects empty
+  values, and fails if the file is ever reserialized in a way that collapses the
+  duplicate.
+- **Auto-capture stored nothing when nothing was evolved (#1758, massimiliano1991, Esmail-sarhadi).**
+  `AutoCaptureService.capture()` unpacked `evolved, child_hash` from
+  `_try_evolve()`, which returned a bare bool on every path, so the unpack raised
+  `TypeError` before `store_memory()` and every candidate was logged as
+  `Auto-capture store failed: cannot unpack non-iterable bool object`.
+  `memory_store` with `auto_extract` and `memory_observe` both reach that path
+  with `dry_run=False`, so both reported 0 stored. `_try_evolve()` now returns
+  `(evolved, new_hash)`; `evolve_memory()` already produced the hash, so the
+  `derived_from` link costs nothing. `new_hash` stays None when the backend
+  reports an evolution without one, and callers branch on `evolved` so a
+  hashless success does not store the candidate twice. The old test patched
+  `_try_evolve` with a two-tuple the real method never returned; the new tests
+  leave it unpatched, and `tests/test_auto_capture_real_storage.py` runs
+  `capture()` on real sqlite-vec storage for the store, evolve and hashless
+  evolve paths.
+- **Auto-capture logged exception text unsanitised (#1146, massimiliano1991).**
+  `harvest/auto_capture.py` put the text of an exception raised while storing or linking a
+  candidate, which was extracted from conversation text and can be echoed by the backend, into
+  the log raw. It goes through `_sanitize_log_value` now. `harvest/harvester.py` and
+  `harvest/extractor.py` log their counters lazily; all of `harvest/` is in the guard's
+  `GUARDED_MODULES` list, and a test fails if a newline in the exception text comes back.
+- Complete the French Knowledge Graph translations for all graph controls, layout options and filter tooltips.
+- **A supersede made after a memory was first synced never reached the other delta-sync peers (#1773, ppcvote).**
+  `mark_superseded_batch`, `resolve_conflict` and `update_memory_versioned` changed
+  `superseded_by` / `superseded_at` without logging a sync event, and the receiver dropped
+  `superseded_by` from `update_metadata` events, so a replaced memory stayed current on every
+  other peer, in default search and in `as_of` queries. All three writers now log the
+  supersede inside the same savepoint or transaction as the UPDATE, and the receiver writes both columns
+  with the existing field-level last-writer-wins order, taking `superseded_at` from the
+  origin instead of re-stamping it. Peers that supersede the same memory with different
+  winners converge regardless of arrival order; a peer without this change keeps its
+  current behaviour.
+- **Milvus `memory_search` without a query returned the oldest matches (#1782, henry201605).**
+  A search by `time_expr`, `after`/`before` or `tags` alone took one unsorted Milvus query
+  and kept its first `limit` rows. Milvus has no server-side ordering, so those were the
+  memories written first: `{"time_expr": "last week", "limit": 20}` answered with the
+  week's oldest 20. The matching set is now read newest first, as on sqlite-vec, and
+  superseded memories are dropped before the limit is applied.
+- **Milvus full reads stopped at 16384 rows (#1785, henry201605).** `get_all_memories()`,
+  `get_memories_by_time_range()`, tag search and tag counts, `get_memory_timestamps()`,
+  exact-content search and the JSON export returned at most 16384 memories without a
+  warning: callers that meant "all" sliced the drained result to the Milvus query cap, and
+  the tag, timestamp, purge and conflict scans used a single capped `query()`. The rows
+  dropped were the oldest, so past 16384 memories the forgetting pass never saw them. These
+  reads now return every match, and the scans keep the Milvus Lite dead-channel reconnect.
+- **Schema migrations stopped at 008 on Windows with a cp950 or cp949 code page (#1789, ppcvote).**
+  `MigrationRunner` read the `.sql` files without an encoding, so Python on Windows decoded
+  them with the locale code page, which cannot decode the UTF-8 punctuation in 008 and 010.
+  A fresh database on a Traditional Chinese or Korean Windows machine never got the graph,
+  belief and sync tables or the columns later migrations add, and `retrieve()` and tag search
+  failed with `no such column`. The files are now read as UTF-8. `check()` also accepts the
+  checksum an earlier runner recorded on a machine whose code page could decode the files
+  (cp1252, for one), so upgrading does not report those migrations as modified.
+- **REST API: blank content no longer creates a zero-vector memory that breaks later writes (#1792, fixes #1791).**
+  `POST /api/memories` accepted an empty or whitespace-only `content` and stored it. Its
+  zero-length embedding made `vec_distance_cosine()` return NULL, and the next write in the
+  same store compared that NULL to a float in `_check_semantic_duplicate()`, so every later
+  write failed with a raw `TypeError` until the empty row was deleted. Blank content is now
+  rejected with a 422, NULL distances are ordered last so a real duplicate behind them is
+  still detected, and a NULL distance alone is treated as "no duplicate".
+- **Dashboard read `.env` with the locale encoding though it writes it as UTF-8 (#1799, ppcvote).**
+  The Configuration tab and the Quality tab's provider check opened `.env` without an encoding,
+  while `_write_credential_to_env()` and python-dotenv use UTF-8. On Windows with a CJK code page
+  (cp950, cp936, cp932) one non-ASCII character, even in a comment, made the whole file read as
+  empty, so a `GROQ_API_KEY` added by hand was still reported missing; single-byte code pages
+  showed non-ASCII values garbled. Both readers use UTF-8 now.
+- Complete the Español Knowledge Graph translations for all graph controls, layout options and filter tooltips.
+- **Tag-only and time-only search, tag search and `memory_list` returned superseded versions (#1803).**
+  On sqlite-vec, `memory_search` without a `query` (tags or time only), exact mode, `memory_list`,
+  the `search_by_tag` handler and the dashboard's `POST /api/search/by-tag` built their results
+  without going through `retrieve()`, so the old versions left behind by `memory_update` with
+  `versioned: true` came back as if current, while the same search with a query hid them. These
+  paths now hide superseded versions unless `include_superseded` or `as_of` asks for them, and
+  `memory_list` totals and pages count current versions only. The storage methods behind them
+  (`get_all_memories`, `count_all_memories`, `search_by_tag`, `search_by_tags`) keep every live
+  row by default for sync, export and maintenance callers.
+**Dashboard text built in JavaScript stayed in the old language after a language switch (#1807).** `setLanguage()` now re-renders the active view: the dashboard and search results from the data already loaded, the analytics reports, documents, manage and quality views through their own loaders. The knowledge graph is not reloaded, so its camera stays put. The "All types" search filter option is translated in place, keeping the selected filter. Reloading the manage view also keeps the tag selected for bulk delete, and no longer stacks a click handler per visit, which made Rename open its prompt once more on every reload.
+- **The Settings tab names and the Environment, System Info and Backup tabs stayed in English in every language, and Last Backup read "5m ago ago" (#1812, calude-bot).**
+  The seven tab names, the Environment tab's header, labels and toasts, the System Info
+  `N/A`/`Enabled`/`Disabled`/`Error` values and uptime units, the Backup tab's status texts and
+  the Backup History modal come from 40 new keys in all ten catalogs now. `formatTimeDelta()`
+  is split into a translated duration (`formatDuration()`) and a translated `{time} ago`, so the
+  sync cadence takes the duration instead of cutting " ago" off English text, and
+  `checkBackupStatus()` no longer appends a second " ago". Fields that JavaScript fills drop
+  their static `data-i18n` key, so a language switch cannot put `Never` or `Loading...` back over
+  a loaded value, and a failed System Info load finds its pending fields by `data-loading`
+  instead of comparing their text with the English `Loading...`.
+- **The Settings Server tab and the restart overlay stayed in English in every language (#1814, calude-bot).**
+  Their labels, buttons, status texts, confirmation dialogs and toasts were literals in
+  `index.html` and `app.js`. They come from 32 new `modal.settings.server.*` keys in all ten
+  catalogs now, and error details from the server are passed in through `{error}` as they are.
+  A status that shows a value (the commit count, the restart attempt) drops its `data-i18n` key,
+  so a language switch cannot put back the field's initial text.
+- **The header controls, delta-sync panel and connection status stayed English in every language (#1816).**
+  The header button tooltips and screen-reader names, the delta-sync panel (schedule line,
+  peer list, per-peer metrics and sync-details disclosure) and the connection indicator wrote
+  their text as literals in `index.html` and `app.js`, so no catalog could translate them.
+  They now read 47 new `header.*`, `sync.*`, `status.*` and `toast.connectionInsecure` keys from
+  all ten catalogs; `status.connected` and `status.disconnected` were already translated and are reused.
+- **Activity report showed English weekdays, weeks and hours in every language (#1819).**
+  `/api/analytics/activity-breakdown` built its labels (`Monday`, `Week 45 (2026)`) as
+  English display text and `peak_times` copied them, so no catalog could translate them,
+  and the heatmap formatted month names in the browser locale instead of the dashboard
+  language. Each breakdown item now also carries `hour`, `weekday` or `iso_year` and
+  `iso_week`, and the response adds `peak_periods`; `label` and `peak_times` are unchanged
+  for existing clients. The dashboard renders weekdays, hours and months with `Intl` in
+  the selected language and week labels through the new `analytics.weekLabel` key.
+- **`memory_update` said versioned updates work on sqlite-vec only (#1823, henry201605).**
+  Milvus has supported `versioned=true` since #1399, but the tool schema MCP clients read
+  still listed sqlite-vec alone, so a working call on Milvus looked unsupported. It now
+  lists sqlite-vec and Milvus, and a test keeps the list in step with the backends that
+  implement it. `docs/milvus-backend.md` also gains the `content_lower` and `sparse_vector`
+  fields, the BM25 index, and the `_graph` / `_access` side collections.
+- **Milvus still listed superseded versions in `memory_list` and tag search (#1824, henry201605).**
+  #1805 hid them on sqlite-vec, but Milvus accepted `include_superseded` and ignored it, so
+  `memory_list` kept listing the old versions left by a `versioned: true` update and
+  counting them in `total`, and `search_by_tag` / `search_by_tags` returned them. Milvus
+  now drops them before paging when `include_superseded` is false, and counts current
+  versions only. The storage default still keeps every live row for export, sync and
+  consolidation.
+
+### Removed
+
+- **Retired the redundant standalone API overview page (#1746).**
+  The dashboard API view and generated Swagger/ReDoc documentation already cover
+  its contents. Removed the extra dashboard link and page assets; existing
+  `/api-overview` bookmarks permanently redirect to `/api/docs`, including behind
+  reverse proxies with a URL prefix.
+- **Require Python 3.11 or newer (#1770).** Python 3.10 reached end of life on October 1, 2026 and cannot install the patched filelock releases. Update both distributions, installers and setup instructions, add a Python 3.11 CI check, and regenerate the lockfile without the vulnerable Python 3.10 dependency branch. Existing Python 3.10 installations must upgrade their interpreter and recreate their virtual environment before installing this release.
+
+### Internal
+
+- **Resonance search measured against cosine (#1674).**
+  `scripts/benchmarks/benchmark_resonance.py` runs DevBench, LoCoMo, 50 negation minimal
+  pairs and an endpoint latency suite. No mode clears the promotion rule: on the negation
+  pairs it was meant to separate none beats cosine, the DevBench and LoCoMo differences
+  are one and about ten queries, and a request costs 0.17 s at 1,000 memories and 3.4 s
+  at 20,000. The endpoint stays experimental; `docs/agents/http-generic.md` now carries
+  the measured limits.
+- **The rerank stage measured on the negation pairs (#1674, #1697).**
+  `scripts/benchmarks/benchmark_negation_rerank.py` compares plain cosine with the opt-in
+  `rerank` flag on the 50 minimal pairs plus distractors from the resonance measurement:
+  cosine scores 0.63 pairwise accuracy and reranking the top 40 lifts it to 0.87 (+24.0 p.p.,
+  paired 95% CI [+14.0, +34.0], 27 queries improved and 3 regressed); on a multilingual index
+  the baseline is already 0.77 and the stage takes it to 0.89 (+12.0 p.p., 95% CI
+  [+5.0, +19.0], 13 improved and 1 regressed). Explicit negation goes 0.88 → 1.00; implicit
+  negation moves 0.32 → 0.48 on the English index (at chance level, 12 of 25 decisions) and
+  0.28 → 0.56 on the multilingual one (14 of 25), so the gap that motivated the resonance
+  experiment is narrowed, not closed.
+  The harness aborts if the stage degrades to fail-open and measures pool coverage on the
+  pre-rerank ranking.
+- **filelock moved off 3.24.3 (#1702).** Dependabot flagged three filelock advisories
+  (GHSA-v4x8-3wr5-3wq8 high, GHSA-567q-5qvw-pf92 and GHSA-9vhv-jxww-xfm5 low), all
+  in `ReadWriteLock` and `SoftFileLock`, neither of which this project calls; filelock
+  only arrives through torch and huggingface-hub. Python 3.11 and up now resolve to
+  4.2.4. The fix requires Python 3.11, so the 3.10 resolution stops at 4.1.0, which is
+  still inside the advisory range.
+- **The Milvus CI suite runs in parallel (#1730).** Both pymilvus legs now run
+  `tests/storage/test_milvus*.py` with pytest-xdist instead of serially. They were
+  about as slow as the ML-extras job, so the workflow could not get faster while
+  either one stayed serial.
+- **The ML-extras CI tests run as two shards (#1731).** They were the longest job in
+  the CI workflow, so every pull request and every release waited on them. Each shard
+  now runs half of the test files on its own runner. The required check keeps its
+  name, `Tests with ML Extras (transformers paths)`, so the branch ruleset is
+  unchanged. Set `MCP_TEST_SHARD=<i>/<n>` to run one shard locally.
+- **Prepared good first issues can be claimed without waiting for a manual assignment (#1749).**
+  A standalone `/claim` on an issue labelled both `good first issue` and
+  `auto-assign` now assigns the earliest eligible claimant and confirms the
+  assignment in a comment. Earlier claims, withdrawals, existing work and issues
+  without the explicit opt-in still need maintainer confirmation. The workflow
+  refreshes Claim Check itself so automatic assignments clear stale warnings.
+- **Patch minimatch in the bridge test dependencies (#1767).** Both JavaScript test projects now lock minimatch 11.0.3 to address GHSA-g3hv-75wg-m249. Update glob alongside it so Mocha can still discover tests through wildcard paths.
+- **Keep the quality-gate skip test independent of the runner image.** Include `dirname` in the test's restricted tool path so the gate can locate its helper before reporting that the analysis backend is unavailable. The harness still excludes Python and Gemini to exercise exit code 3.
+- Remind contributors about unanswered review threads after 48 hours, with one final follow-up after seven days. Route threads with an author reply into the daily maintainer digest.
+
+## [12.4.0] - 2026-10-26
+
+
+### Added
+
+- **Negotiate peer compatibility before scheduled delta-sync (#1505).** A read-authenticated
+  capabilities endpoint advertises the delta-sync protocol range, event-envelope schema,
+  embedding identity, and package version. Scheduled peers stop before exchanging events
+  when they have no common protocol, a different event schema or embedding identity, or
+  do not advertise capabilities; `/api/sync/status` exposes each peer's latest result.
+  `/api/health/model` identifies hash-fallback embeddings so an HTTP hybrid secondary
+  refuses to start against a degraded hub instead of mistaking it for the configured
+  model.
+- **Claude Code hooks: an opt-in inter-agent inbox (#1526, Forest537).**
+  `docs/agents/README.md` documents agents using one memory service as a message bus via a sentinel tag (`msg:cluster`), but the reading side was entirely manual — nothing polled, nothing remembered what had been read. The hooks now poll the configured tags on session start and on prompts (throttled by `inbox.checkIntervalMinutes`, and by the state file rather than an in-memory cooldown, since every hook invocation is a fresh process) and inject the new messages as their own block. The last-seen marker advances only after a successful query. Per #1599 the marker throttles but does not gate delivery: each check queries from `marker - inbox.overlapMinutes` and drops rows already delivered by `content_hash`, so a message that reaches the store after a check while carrying an older `created_at` — the normal case under delta sync, and the clock-skew case — is still delivered, exactly once. Off by default; the config keys and the output format match the OpenCode client (#1527/#1541/#1636).
+- **Expose Delta-Sync settings in the Environment tab (#1556).** The web configuration now lists the sync event log, schedule, peers, and push allow-list while masking peer API and basic-auth credentials.
+- Add an opt-in `rerank` flag to `memory_search`: a second-stage ONNX cross-encoder reorders the top `MCP_RERANK_CANDIDATES` results when `MCP_RERANK_ENABLED` is set, fails open to the unreranked order, and never touches the default path.
+- Apple Foundation Models work as a local LLM provider on macOS 27: point the OpenAI-compatible quality scorer or the harvest provider chain at `fm serve`. The three OpenAI-compatible call sites (quality scorer, harvest rewriter, harvest classifier) now send `"stream": false` explicitly, because `fm serve` streams by default and the requests used to fall through to the next provider. New guide: `docs/guides/apple-foundation-models.md` (#1666).
+- Experimental `POST /api/memories/resonance-search`: ranks memories by wave interference instead of cosine similarity, after the ResonanceDB approach in arXiv:2509.09691. It converts the stored embeddings to complex waveforms at query time, so no schema change. Modes `resonance`, `phase` and `hybrid` (default), a `store` field like `/api/search`, and superseded memories stay hidden. Works on `sqlite_vec` and `hybrid`, and answers 501 on other backends (#1673).
+- **Per-store OAuth scope enforcement (#1681).** OAuth scopes were global
+  (`read`/`write`/`admin`) regardless of which store partition a request targeted, so any
+  read-scoped token could read or subscribe to every store. Tokens may now carry
+  parameterized `read:<store>` / `write:<store>` scopes; a global `read`/`write` still grants
+  every store, so existing tokens (and anonymous/API-key access) are unchanged. Enforced on
+  the store-carrying HTTP routes (memories, search, analytics), on the `/api/events` SSE
+  subscription (a store-restricted token may subscribe only to its stores, never the
+  firehose), and on the MCP `tools/call` transport. Cross-partition access (`store=all`)
+  requires the global scope. The `client_credentials` grant now honors a requested narrow
+  scope — including store-scoped grants — while never issuing `admin`, so store-restricted
+  machine tokens are issuable. A new `MCP_ANONYMOUS_SCOPE` setting makes the scope granted to
+  anonymous callers configurable (default `read write`, unchanged): narrowing it to, e.g.,
+  `read:default` lets authenticated per-store agents and read-only anonymous callers share one
+  instance without an all-or-nothing switch, and is the control for whether anonymous callers
+  may write the shared commons.
+- **Per-client OAuth scope ceiling (#1681).** A client's `scope` declared at Dynamic Client
+  Registration is now persisted (`allowed_scope`) and enforced as a permanent ceiling: a later
+  `client_credentials` token request or `/authorize` request may narrow within it but a request that
+  exceeds it is rejected with `400 invalid_scope` (rather than silently downscoped), and a
+  `client_credentials` request with no scope now defaults to the client's ceiling. A client that
+  declares no scope at registration remains unbounded (may request any non-admin scope), so existing
+  clients — and any already stored with a NULL `scope` column — are unchanged. This closes the gap
+  where any registered client could request any (non-admin) scope regardless of what it registered
+  for; combined with per-store scopes, a client can be pinned to exactly its partition at
+  registration time.
+- **SSE tickets inherit the minting credential's store scope (#1681).** The single-use SSE ticket
+  (issue #1117) was issued with a fixed global `read` scope; combined with per-store scopes that
+  would let a store-restricted token exchange it for a firehose connection. A ticket now carries only
+  the caller's `read` / `read:<store>` grant, and `/api/events` enforces it exactly as it enforces a
+  bearer token, so a per-channel agent's SSE connection stays confined to its own partition.
+
+### Fixed
+
+- **Re-sending deleted content no longer revives it silently (#1560, also #1468, massimiliano1991).**
+  A stale client that POSTed content the server had deleted got the server's own delete
+  stamped as `recreate_of` — a deliberate re-create by construction — and the tombstone was
+  purged. `storage.store()` / `store_batch()` take a tri-state `recreate` (`None` keeps
+  today's behaviour for every direct caller; `False` refuses when a delete is on record,
+  leaving the tombstone and appending no create event; `True` revives explicitly).
+  `MemoryService.store_memory()` passes `False` unless `restore_deleted` is set: REST answers
+  **409** naming the delete's `event_id`, HLC and date, the MCP `store_memory` tool answers
+  `success=false` with "pass restore_deleted=true to bring it back", harvest and auto-capture
+  report the refusal as `skipped`. The bundled Codex hook treats a 409 as handled instead of
+  re-sending the same capture every run, and does not report it as saved. A harvest session
+  whose remaining candidates were all refused counts as finished when the LLM rewrite skipped
+  one on purpose, and stays pending only when the rewrite lost one.
+  Backends advertise the refusal with `supports_recreate_refusal` (sqlite-vec, the HTTP client,
+  hybrid when its primary does); `recreate_kwargs()` forwards the flag only to those, so a
+  backend or test double that still has the previous `store()` signature keeps getting the
+  pre-#1560 call. An explicit restore through hybrid is carried to the secondary with the
+  queued sync operation; a chunked write that had some chunks refused names them in its reply.
+- **The dashboard's Quality tab now saves its settings (#1671).**
+  The AI provider dropdown and the quality-boost toggle were never read by anything, the
+  toggle rendered checked although the boost is off by default, and the "Current Provider"
+  box was hardcoded. A new admin-only `POST /api/config/quality` writes
+  `MCP_QUALITY_AI_PROVIDER` and `MCP_QUALITY_BOOST_ENABLED` to `.env` and restarts the
+  server; the tab loads both from `/api/config/env` and gets a "Save & Restart" button.
+  Values are checked against the choices the Environment tab already lists, and a provider
+  whose API key is missing (groq, gemini) is refused up front, because
+  `QualityConfig.validate()` would otherwise stop the server from coming back. Saved values
+  also apply after the restart when the old value had already been loaded from `.env`.
+- **Document loaders logged caller-provided paths and parser errors unsanitised (#1146, #1677, massimiliano1991).**
+  `ingestion/semtools_loader.py`, `json_loader.py`, `csv_loader.py`, `text_loader.py` and
+  `pdf_loader.py` put the path of the file being ingested, the parser's error text and the
+  `semtools` stderr into the log through f-strings, so a newline in any of them forged a log
+  line. They go through `_sanitize_log_value` now; the five modules are in the guard's
+  `GUARDED_MODULES` list and a test per loader fails if the newline comes back.
+- **`LOG_LEVEL` was ignored once the HTTP server handled its first MCP request (#1679).**
+  `client_detection` falls back to strict `claude_desktop` mode whenever no known client
+  is the parent process, as in Docker or under systemd, and in that mode
+  `DualStreamHandler` dropped every record below WARNING. The first MCP-over-HTTP request
+  installs that handler, so `LOG_LEVEL=INFO` (the Docker default) had no effect from then
+  on. Strict mode now only keeps output off stdout and follows `LOG_LEVEL`, which still
+  defaults to WARNING. The per-load "Tags with invalid namespaces" line moves to DEBUG, and
+  so do the lines that logged the user's search text: the sqlite-vec `retrieve()` query,
+  the `recall_memory` handler's original and cleaned query, and Cloudflare `recall()`'s
+  semantic query.
+- **The tag taxonomy rejected namespaces the server writes itself (#1680).** `harvest:`,
+  `source:`, `conflict:` and `confidence:` tags, written by harvest, hostname tagging, sync
+  import, conflict detection and the session-end hook, were reported as invalid on every
+  load. They are now built-in namespaces, and `MCP_CUSTOM_TAG_NAMESPACES` registers more
+  (comma-separated), the way `MCP_CUSTOM_MEMORY_TYPES` extends the memory-type ontology.
+  The "invalid namespaces" message lists the live set; it had named six namespaces after
+  `agent:` became the seventh.
+- **Milvus never matched a tag or exact-content query containing `_` (#1684, henry201605).**
+  The `like` helper removed `%` and `_` from the value instead of escaping them, so
+  `upload_id:abc123` was searched as `uploadid:abc123`. Every tag lookup, count and
+  tag-based delete on Milvus found nothing for such tags, including the `upload_id:`
+  tag that the dashboard's document delete and chunk-view endpoints look uploads up
+  by. Exact-content search for text such as `my_package` failed the same way. Both
+  characters are now escaped, and tag-based deletes re-check each row's tags before
+  deleting it.
+- **Per-store scopes no longer reach outside their store (#1690).** A `read:<store>` /
+  `write:<store>` grant authorized any MCP tool call that named the store, including tools
+  that ignore `store` (`memory_quality`, `memory_cleanup`, `memory_resolve`,
+  `memory_consolidate`, the mistake-note tools) and `memory_search` with `include_beliefs` or
+  `fallback`, which read every partition. A per-store grant now covers only the tools that
+  confine themselves to the store (`memory_store`, `memory_store_session`, `memory_search`,
+  `memory_list`, `memory_delete`, `memory_update`) and only without those two arguments;
+  everything else needs the global scope, including `memory_explore` and `memory_detail`,
+  whose entity names come from a graph that has no store partition. The SDK
+  transports and the `/mcp` shim share one rule. Store-restricted credentials are also
+  refused, over MCP and REST, on backends whose `get_by_hash` ignores `store` (cloudflare,
+  milvus, remote_http), where `GET /api/memories/{hash}` returned another store's memory.
+  They work on sqlite_vec and hybrid until the storage layer enforces `store` (#1683).
+
+### Removed
+
+- **Retired the remaining ChromaDB-era scripts that imported the removed backend (#1621, Parth-Jadhav-2004).**
+  Eleven validation, migration and testing scripts failed at runtime with `ModuleNotFoundError` on
+  `mcp_memory_service.storage.chroma` or `chromadb`; they, and the doc references pointing at them, are
+  gone. Legacy ChromaDB data is converted with the v7.6.0 `chromadb-legacy-final` release instead, as
+  `docs/guides/chromadb-migration.md` now describes. The dead ChromaDB branches also left
+  `migrate_to_cloudflare.py` and `test_installation.py`.
+
+## [12.3.1] - 2026-10-23
+
+### Fixed
+
+- **Refresh independent TLS trust stores after the eMudhra CA compromise.**
+  CI and Docker bootstrap now require pip 26.2.2 and uv 0.13.4 or newer. The lite
+  package and hand-curated Docker dependencies require certifi 2026.10.19, matching
+  the main package. Docker builds reject the affected root certificates before
+  bootstrapping pip and after installing application dependencies; CI builds both
+  standard and slim images. Existing installations must also update their package
+  managers, operating system certificates, and any custom trust bundles.
+
+## [12.3.0] - 2026-10-23
+
+### Added
+
+- Codex lifecycle hooks report memory load and save status through `systemMessage`, making successful hook activity visible in the session (#1648, dodoshell).
+
+### Fixed
+
+- **Bootstrap reads preserve agent session state (GHSA-xhjp-vf97-77wf).**
+  `get_bootstrap_profile` now requires write scope because it resets session
+  counters when a fresh start is due. Read-only clients can use
+  `memory://agent/{agent_id}/bootstrap`, which preserves the counter, timestamps,
+  sync events, and fresh-start signal. Counter lookup no longer writes access
+  metadata through semantic retrieval. Reported by @3099404236.
+- **Dashboard toggle, sliders and checkboxes still used the old blue (#1548, ozenyunus35).**
+  The checked toggle switch was hard-coded to `#2563eb`, and the range sliders and
+  checkboxes had no `accent-color`, so the browser drew them in its default blue.
+  `body` now sets `accent-color: var(--primary)`, and the remaining `#2563eb`,
+  `#3b82f6`, `#60a5fa` and `rgba(59, 130, 246, …)` values in `style.css` use the
+  brand variables or `rgba(25, 194, 218, …)`.
+- **OpenCode inbox delivery across polling boundaries (#1636, guamiao).** The inbox re-queries a configurable overlap window and drops previously delivered rows, so messages that arrive around a polling boundary are picked up without being shown twice.
+- **The hybrid health check said `syncing` while every Cloudflare call failed (#1638).**
+  It reported `cloudflare_sync: syncing` whenever the background sync loop was alive, so a
+  container with broken DNS synced nothing for 16 days without the health check noticing.
+  It now reports `sync_failing` when the sync service reports Cloudflare unreachable, and
+  exposes `cloudflare_available` and `consecutive_failures` next to the status.
+- **`memory_search` failed on every call with the Milvus backend (#1650).**
+  Since #1297 the MCP search handler passes `agent_id` to `storage.search_memories()`, `None`
+  included, and Milvus is the only backend that overrides that method — its signature stopped
+  at `store`, so each call raised `unexpected keyword argument 'agent_id'`. Milvus now accepts
+  the keyword: without an agent the search runs as before, and a non-None `agent_id` returns an
+  error result, as `get_all_memories` and `count_all_memories` already refuse it. The signature
+  conformance test now checks `agent_id` on every backend, alongside `store`.
+
+### Internal
+
+- **PR CI runs shorter (#1642).** A push to a PR now cancels the run for the commit it
+  replaces; pushes to main keep one run per commit. The two Milvus legs run only when a
+  PR reaches code the Milvus suite imports (by package prefix), and always on main.
+  Each pip-installing job restores its own download cache, keyed on `pyproject.toml`.
+- **CI installs dependencies with uv instead of pip (#1643).** The test jobs build a venv
+  with a pinned uv from the runner's python3 and put it first on PATH; installs took
+  18-77 s per job with pip. The per-job download cache now holds `~/.cache/uv`.
+- **Tests share the default ONNX InferenceSession across a run (#1644).** The autouse
+  fixture that empties the embedding model cache after every test made each storage
+  setup create a new ONNX session for all-MiniLM-L6-v2, about 0.3 s each. A
+  session-scoped fixture now hands out one session per provider list for that model
+  file only; everything else still reaches the real constructor. Locally the ML extras
+  suite went from 537 s to 216 s and the default suite from 686 s to 228 s.
+- **The ML extras job prints its 25 slowest tests and setups (#1645).** It is the
+  longest CI job; `--durations=25` puts the data for the next speed-up in every run's log.
+- **CI tests the default job against `uv.lock` (#1647).** No job read the lock, so a
+  Dependabot uv bump ran tests on exactly what main installed. Tests + Coverage and the
+  prove-fix job now install with `uv sync --frozen`; the ML extras and Milvus jobs keep
+  resolving from `pyproject.toml` to catch upstream breakage.
+- **Tests + Coverage and ML extras run in parallel with pytest-xdist (#1649).** Both
+  jobs use `-n auto`, one worker per runner core; each worker gets its own temp test
+  database from `tests/conftest.py`.
+
+## [12.2.1] - 2026-10-21
+
+### Fixed
+
+- **security:** `certifi` must now be at least 2026.10.19 (Dependabot alert #215, GHSA-6q48-6c7w-9gw2, critical). Older bundles trust the `emSign ECC Root CA - G3` root, under which eight intermediate CA keys were compromised; with one of them and an on-path position, an attacker can intercept the HTTPS calls the service makes through `httpx` and `requests` (Cloudflare sync, Hugging Face downloads, external embedding and LLM APIs). `certifi` was only a transitive dependency, so `pip install --upgrade mcp-memory-service` kept whatever version was already installed; the new floor in `pyproject.toml` makes pip upgrade it. `uv.lock` moves from 2024.12.14 to 2026.10.19. The v12.2.0 Docker images already ship 2026.10.19.
+
+- Bound the on-store belief check with `MCP_NLI_ON_STORE_BUDGET_S` (2 s default) and `MCP_QUARANTINE_MAX_BELIEFS`, log truncated checks as WARNING, and add the opt-in `MCP_NLI_ON_STORE_ASYNC` mode (#1630).
+
+## [12.2.0] - 2026-10-21
+
+### Added
+
+- **OpenCode inter-agent inbox (#1527, YaoSong808).** With `inbox.enabled`, the plugin checks
+  `/api/search/by-tag` for messages other agents stored under sentinel tags such as `msg:cluster`,
+  on the first prompt of a session and then at the configured interval, and adds them to the
+  system prompt as untrusted data: one escaped JSON object per line inside
+  `<untrusted-peer-messages>`, the format the Claude Code hooks will share (#1526). The agent's
+  own `agent:<id>` messages are excluded before the display cap, backlogs arrive oldest-first,
+  and the last-check marker is written under a cross-process lock. Delivered messages stay in
+  the block for the rest of the session, up to the 10 most recent. Disabled by default.
+- **Store-scoped SSE subscriptions (#1569).** `GET /api/events` delivered every
+  store's `memory_stored` and `memory_deleted` events to every connection, so a
+  client interested in one partition still received and discarded the rest. The
+  endpoint now accepts `?store=<name>` (repeat it for several; omit it or pass `all`
+  for the firehose) and delivers only matching events plus system-wide
+  events (heartbeat, health, connection lifecycle). `Last-Event-ID` replay is scoped
+  the same way, so a reconnecting subscriber is never replayed another store's
+  buffered events. Default behaviour with no `store` parameter is unchanged.
+- **Native Codex lifecycle memory hooks (#1574).** Load project memories at session
+  start and after compaction, capture new decisions and learnings, and checkpoint
+  incremental session outcomes. The installer preserves existing hooks and memory
+  settings; offline tests cover installation, deduplication, and failure handling.
+- **Per-agent rate limiting for MCP tool calls (#1593, juliasadler; closes #1096).**
+  Callers are keyed by the client-sent `X-Agent-ID` request header — read from the
+  transport layer, never from tool arguments — falling back to the socket peer IP
+  and then one per-process bucket. Unlimited by default; configure with
+  `MCP_RATE_LIMIT_PER_MINUTE` or per-tool `MCP_RATE_LIMIT_<tool>` overrides.
+  Denied calls get an MCP error (`-32029` / `rate_limit_exceeded`) carrying
+  `retry_after_seconds`. This is fairness between cooperating agents, not abuse
+  protection: a client that rotates the header gets a fresh bucket. The denied
+  call returns a `CallToolResult`, which the SDK's `call_tool` decorator only
+  passes through from `mcp` 1.19.0 on, so the `mcp` floor moves from 1.9.2 to
+  1.19.0.
+- **`scripts/hermes/install.py`: register the MCP server with Hermes and verify the round trip.**
+  Registers `mms` through `hermes mcp add`, then refuses to report success unless
+  `hermes mcp list` shows the server on the requested port and enabled, and a tagged probe
+  memory survives a write/read cycle. `hermes mcp add` exits 0 even when it cancels its
+  interactive prompt, so the exit code is never treated as evidence. Supports `MCP_API_KEY`
+  (Bearer on `/health` and `/mcp`, with an explicit 401 message). The probe is deleted after
+  verification, `--dry-run` prints the plan, `--uninstall` removes the registration and returns
+  non-zero when it fails. Scope is registration plus round trip only: starting the server,
+  lifecycle hooks and usage skills are separate work.
+
+### Fixed
+
+- **retrieval:** `retrieve_memories` filtered by `tags`/`memory_type` only after fetching `n_results` rows, so any match outside that first window was lost — `mistake_note_search` returned `{"notes": [], "count": 0}` over a populated table. The fetch now over-fetches when a filter is present and truncates to `n_results` after filtering.
+- **maintenance:** the embedding migrator re-created the `memory_embeddings` vec0 table with a fixed DDL, dropping the `store` partition key used by current schemas — every store-scoped query then failed with `no such column: store`, `semantic`/`ranked`/`exact` returned zero results while `hybrid` kept working, and the script still reported success. It now preserves the existing DDL (substituting only the vector dimension) and re-populates the partition column from `memories.store`.
+- **maintenance:** the migrator no longer prompts when the memory service appears to be running in a non-interactive context (CI, scripts): it aborts with a clear message unless `--yes` is passed. Databases without a `memories.store` column keep the previous read path instead of failing with `no such column: store`.
+- **The dashboard stopped putting the long-lived API key in SSE URLs (#1117).**
+  `EventSource` cannot set an `Authorization` header, so the web UI authenticated
+  every live-update connection with `GET /api/events?api_key=<key>`. uvicorn's
+  access log records the whole request line, so each SSE connection — and every
+  automatic reconnect — wrote the key in cleartext into
+  `~/.local/share/mcp-memory/logs/server.log`. TLS does not help there: it
+  protects the wire, not the log. The file outlives the session and gets pasted
+  into bug reports. Access-log redaction had already landed, which hid the leak
+  without closing it.
+
+  `POST /api/events/ticket` now exchanges real credentials (Bearer or
+  `X-API-Key` header) for a ticket that is single-use and expires in 60 seconds,
+  and the browser connects with `?ticket=…`. A pasted log line now holds
+  something that is dead within a minute and cannot be replayed. The
+  `?api_key=` query parameter is **no longer accepted** — requests using it get
+  a warning naming the migration rather than a silent 401. `X-API-Key` as a
+  header is unchanged, since headers do not reach the access log.
+
+  The OAuth `?token=` query fallback still exists and has the same shape of
+  exposure; it is left alone here because those tokens are already short-lived
+  and revocable.
+- **Limit semantic duplicate checks to the target store (#1517).** Similar content in another store no longer blocks an insert; global exact-hash uniqueness remains, and cross-store conflicts name the store that already contains the content.
+- **Apply a restrictive Content Security Policy to dashboard pages (#1547).** The dashboard, API overview, and SSE test page now load behavior from external scripts instead of inline scripts and handlers. The dashboard policy allows its import map by an exact SHA-256 hash and limits scripts, connections, frames, and other resources to the required sources.
+- **Gemini custom apps rejected with HTTP 400 at /oauth/authorize due to OAuth state length limit (#1554, #1553).**
+  The hard-coded 1024-character cap on the OAuth `state` parameter was too low for some clients (Gemini custom apps send ~2400 characters). `MCP_OAUTH_MAX_STATE_LEN`, `MCP_OAUTH_MAX_SCOPE_LEN` and `MCP_OAUTH_MAX_REDIRECT_URI_LEN` are now configurable via environment variables (defaults: 4096 / 1024 / 2048). These limits are read at process startup; changing them requires a restart.
+- Delta-sync (#1564, regression from #1562): a re-create AFTER the tombstone row was
+  purged now still stamps `recreate_of`. `_recreate_of_for` elected the dominant delete
+  ONLY when a soft-deleted tombstone row was still present; once `purge_deleted` /
+  `_purge_tombstone` hard-deleted that row (hybrid does this automatically after
+  `TOMBSTONE_RETENTION_DAYS`, default 30), the re-create emitted `recreate_of=""` (EMPTY),
+  which apply treats as delete-wins — the origin went live while peers stayed deleted,
+  permanently. The tombstone guard was redundant: `sync_events` only carries `op='delete'`
+  when a live row was actually deleted, so a fresh create (never deleted) has no delete
+  rows and still returns `None`. The lookup now decides solely from the recorded delete in
+  `sync_events` (which purge never touches), independently of the tombstone row. (#1564)
+- **Hybrid search gave the strongest keyword matches the lowest keyword score (#1567, debashishthakur).**
+  `_normalize_bm25_score()` read FTS5's bm25() as if 0 were a perfect match, but FTS5
+  negates it: a better match is more negative and 0 means no match. In the default
+  `weighted_average` fusion a memory matching more of the query terms therefore scored
+  lower on keywords than one matching fewer. Ranks now map through `x / (1 + x)` on
+  `x = -rank`, which keeps the order and stays between 0 and 1.
+- **`mode="hybrid"` ran vector-only search on the hybrid backend (#1576, debashishthakur).**
+  `search_memories()` takes the hybrid path only when the backend has
+  `retrieve_hybrid()`, which lives in the SQLite-vec mixin. `HybridMemoryStorage`
+  wraps a SQLite-vec primary but did not forward the method, so on the recommended
+  backend `mode="hybrid"` silently fell through to plain vector search and BM25 never
+  ran. It now delegates to the primary, the same way `retrieve()` does.
+- **Hybrid search with RRF fusion could return memories from other stores (#1576, debashishthakur).**
+  With `MCP_HYBRID_FUSION_METHOD=rrf`, `retrieve_hybrid()` returned before the store
+  filter added in #1466, and BM25 matches every store, so a store-scoped search could
+  include other partitions. Both fusion paths now apply the store filter before
+  truncating.
+- **Discovery client logged mDNS announcements and remote errors unsanitised (#1577, part of #1146, massimiliano1991).**
+  `discovery/client.py` interpolated the name and url another host announced over mDNS, the error of a failed health check and the text of a failed capabilities fetch straight into its log lines, so a newline in any of them forged a log record. They go through `_sanitize_log_value` now; the module is in `GUARDED_MODULES`, and a runtime test covers the listing, the selection and the two error paths.
+- **Milvus `retrieve_with_quality_boost` did not take the `store` argument of the base interface (#1578, CodeQL alert 608).**
+  `MemoryStorage.retrieve_with_quality_boost` gained `store` with the multi-store work, but the Milvus override kept its old signature, so any caller passing `store` to a Milvus backend got a `TypeError`. The override now declares `store` and forwards it to `retrieve()` on both the plain and the reranking path.
+- **Memory exporter logged the output path unsanitised (#1584, part of #1146, massimiliano1991).**
+  `sync/exporter.py` interpolated the export path it was given (the `--output` argument of `scripts/sync/export_memories.py`) straight into its start and completion log lines, so a newline in the path forged a log record. The path goes through `_sanitize_log_value` now, the count and size are logged lazily, the module is in `GUARDED_MODULES`, and a runtime test forges a newline into the path.
+- **Connected memories got no decay boost on SQLite-Vec and Hybrid (#1592, debashishthakur).**
+  Decay looks connection counts up by content hash, but the SQLite
+  `get_memory_connections()` returned tag-group counts keyed `tag:<name>`, so every
+  lookup missed and `connection_boost` stayed at 1.0. It now counts graph neighbours per
+  content hash from `memory_graph`, as Milvus already did: `has_entity` rows and
+  soft-deleted memories are left out, and a symmetric edge stored as two rows counts as
+  one neighbour.
+- **A versioned memory dropped out of its own store (#1594, serhiizghama).**
+  `update_memory_versioned()` wrote the new version into the `default` store
+  whatever store the old one was in, so after `memory_update(versioned=true)` or a
+  harvest evolve the memory dropped out of searches scoped to its own store. The
+  new version now inherits the old row's store.
+- honour `X-Agent-ID` on the streamable-http transport, resolving memory authorship as explicit argument > request header > `MCP_AGENT_ID` across `store_memory`, `evolve_memory` and harvest `auto_commit`
+- **A failed tool call now answers with `isError: true` instead of a successful
+  envelope carrying error text (#1601).** The tool dispatcher caught every
+  exception, formatted it as `{"error": ...}` and returned it as ordinary content,
+  so `isError` stayed `false` for writes that were actually refused — a duplicate
+  rejected by semantic dedup, for instance. Automation that trusts `isError`
+  (harvesters, importers, integration probes) counted those writes as stored while
+  nothing reached the database. The dispatcher now logs and re-raises, which the
+  SDK maps to `isError: true`; `memory_store` and `memory_store_session` likewise
+  raise on a refused write instead of returning the error as text.
+- **Rate limiting did not apply to the `mcp-memory-server` entry point (closes #1606).**
+  Its FastMCP tools call `MemoryService` directly and never go through
+  `MemoryServer.call_tool`, where #1593 added the per-caller limiter, so
+  `MCP_RATE_LIMIT_PER_MINUTE` and the per-tool overrides had no effect there. Each of
+  its 8 tools now runs the same check first, with the caller read from `X-Agent-ID`,
+  then the peer IP. A denied call returns `isError: true` with the same
+  `rate_limit_exceeded` payload, and a limiter failure lets the call through. Per-tool
+  overrides use this server's tool names, e.g. `MCP_RATE_LIMIT_store_memory`.
+- **maintenance:** removed `scripts/maintenance/repair_memories.py` (#1613). It had not parsed since the scripts reorganisation in September 2025, and fixing the indentation would not have helped: it repaired content hashes through `ChromaMemoryStorage`, a backend the service no longer ships.
+- **Configuration modules logged environment strings unsanitised (#1616, part of #1146, massimiliano1991).**
+  `config/search.py`, `config/quality.py` and `config/backup.py` interpolated the values they read from the environment straight into their import-time log lines, so a newline in `MCP_HYBRID_FUSION_METHOD`, `MCP_QUALITY_AI_PROVIDER` or `MCP_BACKUP_INTERVAL` forged a log record. The three strings go through `_sanitize_log_value` now, the parsed numbers are logged lazily, the modules are in `GUARDED_MODULES`, and a test reloads each module under a forged value.
+- **A sqlite-vec database created before v8.7.0 now finishes its schema upgrade (#1622).**
+  `initialize()` ran the migrations without creating the `metadata` table that the
+  runner stores `schema_version` in, so migration 008 failed and every later
+  migration — including 017's `embedding_pending` — was skipped: `retrieve()` and
+  `search_by_tag()` returned nothing on intact data. The existing-database path now
+  creates the table before the runner starts.
+- **`memory migrate` now finishes the schema upgrade of a sqlite-vec database created before v8.7.0 (#1628).**
+  `#1622` fixed the service path, but `memory migrate` opens the file with a plain
+  `sqlite3.connect()` and calls `MigrationRunner.run_pending()` directly, so it never
+  went through `initialize()` and never created the `metadata` table the runner stores
+  `schema_version` in. Migration 008 applied its DDL, the `schema_version` write then
+  failed with `no such table: metadata`, and the rollback took 008 with it: every later
+  migration — including 017's `embedding_pending` column on `memories` — was skipped, and
+  `retrieve()` / `search_by_tag()` returned nothing on intact data. `MigrationRunner` now
+  creates `metadata` next to its registry table before any pending migration runs, so
+  both callers are covered; `--dry-run` still writes nothing.
+- Delta-sync (#1522 finding 2): a concurrent `create` carrying a STALE/unrelated
+  `recreate_of` (one that does not name the dominant delete for the hash) no longer
+  resurrects the tombstone on apply — in ANY arrival order. The producer stamps an
+  intentionality signal (`recreate_of` on the create payload, naming the delete's
+  `event_id`); apply now derives liveness as a deterministic fold over the WHOLE
+  `sync_events` set for the hash (not the mutable row state), so every peer with the same
+  event set converges to the same `deleted_at`. A create whose `recreate_of` names the
+  dominant delete revives; a create with a stale/unrelated `recreate_of` stays deleted;
+  and — for back-compat — the ABSENCE of `recreate_of` REVIVES (today's behavior is
+  preserved: a bare re-create or an older v1 peer's create brings the memory back), with
+  no `schema_version` bump (the signal is an additive optional payload key). The REST/MCP
+  store path is a separate case tracked in #1560. ADR-0012 updated to v2. (#1522)
+- Delta-sync (Greptile r4302312738 on #1562): a NAMED re-create now resolves
+  deterministically when a peer holds BOTH the original delete and its `bl-...` bootstrap
+  baseline copy (same HLC + agent anchor). `names_delete` scanned the unordered `deletes`
+  set and returned `d is dtop` on the first anchor match, so the outcome flipped
+  (revive vs. stay-deleted) depending on which duplicate was read first — two peers with
+  the same events could disagree. The anchor is now compared directly against the dominant
+  delete `dtop` (the unique resolver winner), so liveness converges in any order.
+- **hermes:** `--dry-run` on an already-installed profile now prints that the server is registered instead of exiting 0 with no output. `plan()` returns no actions for an installed server, so the dry-run returned before the branch that reports it — success and a hung script looked identical.
+
+### Internal
+
+- **Logging in `storage/sync/orchestrator.py` is parameterised, so the file no longer trips the log-injection gate (#1146).** Check 6.5 in `scripts/pr/pre_pr_check.sh` greps the whole file for `logger.(info|warning|error|debug|critical)(f"` and ignores lines that sanitise their values, so the pre-existing f-strings blocked any pull request that touched the file. All 15 now use lazy `%`-style formatting — the gate's single-line grep only saw 14, because one call is spread over four lines. Values that cross a trust boundary are wrapped in `_sanitize_log_value()`: `peer_id` from sync configuration; `event_id`, `event_seq` and `batch_failed` from a peer payload or response, none of which is type-checked on arrival; and the cursors, which are seeded from the peer's `next_seq`. A peer sending `"seq": "1\nFORGED"` no longer adds a log line. Levels, conditions and message text are unchanged; `result.reason` stays unwrapped because it is produced by `apply_remote_event`, not by the peer.
+
+  `tests/test_issue_1146_orchestrator_logging.py` states the intent as a test rather than leaving it to the grep: it parses the module and fails on any logger call with an f-string, and on any single argument that interpolates an external value outside the sanitiser — per argument, not per call, so one raw value cannot hide behind a sanitised sibling. Both assertions fail against the base branch.
+- **A change that only touches `site/` no longer runs the Python test matrix (#1514).**
+  `is_docs_only()` in `scripts/pr/pre_pr_check.sh` and the `push.paths-ignore` list in
+  `ci.yml` now include `site/**`, so a landing-page PR skips Tests + Coverage, the ML
+  extras and both milvus legs (the skipped required jobs still report success), and the
+  merge to `main` no longer starts CI at all. `deploy-site.yml` still deploys, and
+  `Version Drift (site/index.html)` still runs on every PR. CodeQL is unchanged: its
+  `Analyze Python Code` job is a required check and has no skip path yet.
+- **The claim check now notices a PR that links no issue at all (#1570).**
+  `scripts/ci/check_issue_claim.py` passed any PR without a `Fixes #N`, so a
+  non-trivial change could skip the issue-first rule in CONTRIBUTING.md with a
+  green check (#1569). A PR from outside the collaborators that changes `src/` and
+  neither closes nor mentions an issue is now labelled `no-issue` and gets one
+  comment pointing at the rule; the PR template's hidden `Fixes #123` hint does not
+  count as a mention. The check still passes. A maintainer marks a small fix
+  `skip-issue`, and the workflow now also runs on `labeled` and `unlabeled`, so
+  adding or withdrawing it takes effect without a new push.
+- **The pre-PR gate now catches path literals in the wrong letter case (#1573).**
+  macOS resolves file names case-insensitively, so a test that read
+  `.github/pull_request_template.md` passed locally and failed on the Linux runner,
+  where only `.github/PULL_REQUEST_TEMPLATE.md` exists (#1571). Check 6.10 of
+  `scripts/pr/pre_pr_check.sh` runs `scripts/ci/check_path_case.py` over the staged
+  Python, shell and YAML files and reports any quoted literal that matches a tracked
+  path or file name only when case is ignored. A literal meant as a label opts out
+  with a `path-case: ok` comment.
+- **iOS Shortcut guide (#1586).** New `docs/integrations/ios-shortcut.md` explains how
+  to build an Apple Shortcut that saves shared text or a URL to `POST /api/memories`,
+  how a phone reaches a server bound to `127.0.0.1` (`tailscale serve`, or LAN with the
+  mkcert CA installed on the device), and why the repository ships no `.shortcut` file.
+- **docs:** README, CONTRIBUTING.md and mcpmemory.services now link the project's Discord server, where releases, good first issues and new Discussions are announced. Claims, decisions and reviews stay on GitHub.
+
+## [12.1.1] - 2026-10-16
+
+### Security
+
+- Escape stored tag, co-occurring tag and memory-type labels in dashboard management and analytics views to prevent stored HTML from executing in a viewer's session. (GHSA-6q59-m6vq-x65x)
+- Require OAuth write scope for graph entity extraction through the MCP dispatcher and HTTP shim, while keeping existing graph read operations available to read-only clients. (GHSA-2mw6-h564-86wv)
+
+### Added
+
+- **Label `claim-pending` on an unassigned claim comment (#1518).** When a comment on an unassigned issue reads as a claim (`/claim` or an anchored phrase such as "I'd like to work on this"), a new `issue_comment` workflow adds the `claim-pending` label, so a claim is visible at once instead of only in the next daily digest. Assignment stays manual — the label is the only automated signal, with no auto-assign and no bot comment — and the `issues: assigned` path drops the label once a maintainer assigns. Phrase matching is deliberately tight: it prefers missing a claim to mislabelling a question, so "can I take this approach?" does not match.
+
+### Fixed
+
+- **Consolidation keeps keyword-only contradictions visible and marks uncertain edges for review (#1460).**
+  Sharing words such as "never" could previously hide the older memory from
+  default retrieval. `MCP_CONSOLIDATION_AUTO_SUPERSEDE` now defaults to `false`.
+  Inferred graph edges retain their confidence: scores at or below 0.60 become
+  `related`, scores between 0.60 and 0.85 keep their label with `needs_review: true`,
+  and scores at or above 0.85 keep their label without the review flag. Only the
+  top band is eligible for explicitly enabled supersession; keyword contradictions
+  score at most 0.75. Consolidation also forwards similarity to the existing
+  inference guard (#1459). Existing supersessions are unchanged. Selection and
+  calibration of a local contradiction judgment model remain follow-up work.
+- **Remove the dashboard's five inline click handlers (#1549).** Dashboard interactions now use registered event listeners so they remain compatible with the planned Content-Security-Policy.
+
+## [12.1.0] - 2026-10-15
+
+### Added
+
+- **Dashboard now uses the same brand tokens, fonts and logo as the project site (#1525, george07-t).**
+  The `:root` and `body.dark-mode` tokens in `style.css` point at the site's cyan/blue accent and paper/panel/line/ink neutrals (names unchanged, `--success`, `--warning` and `--error` untouched), text on cyan fills is dark instead of white, Bricolage Grotesque and JetBrains Mono are self-hosted under `static/fonts/` so the dashboard still works offline, and the header shows the brain icon instead of the emoji.
+- **Resolve newer local edits that conflict with remote tombstones (#1538).** Sync results expose capped conflict hashes, and the authenticated sync API can explicitly keep the local memory or accept the current remote deletion after rechecking both stores. Competing resolutions are serialized across hybrid storage instances sharing a SQLite database. A restore links the exact tag set before clearing the observed D1 tombstone, stages unique Vectorize/R2 artifacts, and attempts to clean them if the compare-and-set rejects the restore.
+
+### Fixed
+
+- **A stored memory tag could run JavaScript in the dashboard (GHSA-j664-v823-6p9f, Taewoong1378).**
+  The dashboard's `escapeHtml()` encoded `<`, `>` and `&` but left `"` and `'` alone, and its
+  output is interpolated into quoted attributes such as `data-tag="..."`. A client with write
+  access could store a tag like `z" onmouseover="..." q="`, and the handler ran when anyone
+  hovered that tag in Browse, with access to the API key or OAuth token the dashboard keeps in
+  `localStorage`. Affected since v7.2.1. `escapeHtml()` now encodes both quote characters, which
+  closes every attribute sink at once: the tag cloud, the tag list, tag management, active filters
+  and upload rows.
+
+## [12.0.1] - 2026-10-15
+
+### Fixed
+
+- **Keep Cloudflare tombstones authoritative during hybrid sync (#1502).** A force sync
+  could treat a deleted remote hash as absent and upload its stale local copy again.
+  Hybrid sync now reconciles deletion timestamps before pulling or pushing, preserves
+  local edits newer than the remote delete as a reported conflict, and skips a push
+  when the D1 tombstone snapshot cannot be read. During a paginated scan, the latest
+  row for a hash now wins if that memory is restored or deleted while the scan runs.
+  Imported tombstones retain their original deletion HLC, so a later import cannot
+  make an old Cloudflare delete override a newer, unsynced peer create.
+- Hybrid backend: memories pulled from the secondary are no longer run through semantic dedup again on the receiving device. A pulled memory that was close to one the device already held was rejected with "Duplicate content detected" and never arrived, on every sync (#1504).
+- **The export/import round trip lost memories: the export read only the `default` store, and the import counted memories that `store()` had rejected (#1520, massimiliano1991).**
+  `MemoryExporter` now walks every store (`get_stores()`, new on the storage interface; sqlite-vec lists them, hybrid delegates to its primary) and writes each memory's `store` into the file. `MemoryImporter` writes each memory back to its store, skips semantic deduplication (the exact-hash check stays), and reports what the storage refused under `rejected`, with the reason, instead of counting it as imported. Export files written before the `store` field existed load into `default`.
+- **ONNX loader logged environment values and download errors unsanitised (#1540, part of #1146, massimiliano1991).**
+  `embeddings/onnx_embeddings.py` interpolated the model name, the Hub repo id, the cache paths and the text of a failed download straight into its log lines, so a newline in any of them forged a log record. They go through `_sanitize_log_value` now; the module is in `GUARDED_MODULES`, and a runtime test covers both download paths.
+- **`regenerate_embeddings.py` wrote vectors without their store partition (#1521).**
+  Since multi-store, `memory_embeddings` is a vec0 table with `store` as a partition key; the maintenance script inserted `(rowid, content_embedding)` with no `store`, so every regenerated vector landed outside the partition that store-scoped KNN queries, invisible to search while the script reported success. It now reads each memory's `store` and writes the vector into that partition. Also fixes a broken `serialize_float32` import that prevented the script from running at all.
+- **Soft-deleted memories are no longer regenerated.** `_load_memories` now filters
+  `WHERE deleted_at IS NULL` (count and select), so a tombstoned memory is not reloaded
+  and does not get a fresh vector that would resurrect it in the index — matching the other
+  maintenance scripts (`migrate_embeddings.py`, `repair_missing_embeddings_onnx.py`).
+- **Delta-sync first sync never installed the peer's baseline, and re-embedding left memories invisible (#1522 findings #3 and #4).**
+  `sync_from_peer` now calls `bootstrap_from_peer` on the first sync with a peer (no `sync_cursor` row) when the peer can serve a baseline, then resumes the pull loop at the parked watermark; it falls back to the previous pull-from-0 if the peer has no `get_baseline` or the bootstrap fails. The embedding repair (`reembed_missing_embeddings`, extracted from `repair_missing_embeddings_onnx.py`) now clears `embedding_pending=0` after embedding and writes each vector into the memory's own store partition instead of `default` (the latter also fixes #1521). Finding #2 (tombstone resurrection) is deferred pending an intentionality signal and ships as an xfail; #1 was fixed by #1523; #5 is doc-only.
+- **A read-only OAuth token could still write memories over SSE, Streamable HTTP and `prompts/get` (GHSA-9x7v-2vjj-xghg, gigio1023).**
+  The `write` scope check from GHSA-2r68-g678-7qr3 lived in the FastAPI JSON-RPC shim only.
+  SSE and Streamable HTTP authenticated the token, dropped its scope and dispatched straight
+  into `MemoryServer.call_tool`, so a `read` token could call `memory_store`, `memory_update`
+  and `memory_delete`; the `learning_session` prompt stored a memory without going through
+  `call_tool` at all. The transports now record the granted scope on each request, and
+  `call_tool` and `learning_session` refuse writes without `write`, per message. The
+  `readOnlyHint` classification moved onto `MemoryServer` so the shim and the transports share
+  it. The `mcp` SDK floor rises from 1.8.0 to 1.9.2, the first release that hands the
+  per-message request to handlers. Only affects servers with `MCP_OAUTH_ENABLED=true`; stdio
+  and API-key callers are unchanged.
+- **Belief noise filter no longer discards long but substantive insights.**
+  `_is_noise` rejected any observation over 500 characters as a "dump". Measured
+  against a live corpus of 6,896 actionable memories (decision/learning/error/
+  insight/pattern), that blind length rule discarded 538 of them — 537 (99.8%)
+  substantive, with token-diversity entropy ≥ 0.49, i.e. real detailed decisions
+  and learnings, not dumps. The rule now treats a long observation as noise only
+  when it is an actual dump: low information density (`_content_entropy < 0.4`) or
+  degenerate (fewer than 10 words). This reuses the already-present `_content_entropy`
+  helper and recovers ~497 actionable memories into belief eligibility while still
+  filtering genuine low-entropy dumps.
+
+### Internal
+
+- **CONTRIBUTING.md points agent users to Greptile's greploop skill.** The skill
+  automates the review-fix-resolve loop that `ResolveThreads` makes mandatory, but it
+  resolves false-positive threads without a reply and iterates toward a 5/5 score.
+  The note states where this repository differs: reply before resolving, stop at
+  resolved threads plus green checks, keep conventional commits.
+
+## [12.0.0] - 2026-10-13
+
+This is a major release because of one default that changes: search summarization is no longer
+switched on by configuring a Harvest LLM provider. Operators who relied on that must now set
+`MCP_SEARCH_SUMMARIZE_ENABLED=true` (#1479, fixes #1451). The headline feature is the self-hosted
+sync hub: a hybrid client can use another mcp-memory-service instance as its secondary over HTTP
+(`MCP_HYBRID_SECONDARY_BACKEND=http`). Separately configured, optional delta-sync (#1345,
+phases 1 to 5) provides event-based synchronization between hosts.
+v11.16.0 was never released; its changes are in this version.
+
+### Added
+
+- Add opt-in query-aware `memory_search` summaries with bounded LLM input, validated source citations, preserved source metadata, and visible fallback to raw results.
+- **Navigate the dashboard graph with concentric rings (#1114).** The Analytics graph can now
+  arrange memories by BFS distance from a center node and animate to a new center on click, while
+  retaining the force-directed view as a toggle.
+- **Add a mem0 export converter for the existing memory importer (#1390, Harbor404).**
+  mem0 OSS Qdrant exports and platform result/export JSON can now be converted into
+  `MemoryImporter` format, preserving timestamps and metadata while mapping
+  `user_id`, `agent_id`, and `run_id`. Dedupe hashes are identity-scoped, and
+  malformed records or timestamp fallbacks are reported without discarding valid records.
+- **Analytics graph gets a client-side Min Degree slider (#1454, kalo-biralo).**
+  A new slider next to Min Connections hides nodes with fewer distinct neighbours
+  than the chosen degree, working on the data already loaded, so moving it makes
+  no API call. Degree is counted after the type filter and the symmetric-pair
+  collapse, so a mutual relationship counts once and hiding a memory type lowers
+  its neighbours' degree. The range runs from 1 to the highest visible degree,
+  resets when the graph reloads, and applies to the 2D, 3D and fullscreen views.
+- Added an opt-in Prometheus `/metrics` endpoint (`MCP_METRICS_ENABLED`, default off) exposing aggregate cache, consolidation-health, and performance metrics in text exposition format, with graceful per-source degradation and no external dependency. (#1097)
+- Delta-sync Phase 3 (embedding consistency, #1345): sync events stamp the embedding model/version, and memories whose embedding does not match their content version are marked `embedding_pending` — excluded from all search surfaces (semantic recall, time-range, BM25, tag) but still visible to `list_content_hashes` so sync reconciliation sees them. Prevents serving a (new content, stale vector) pair as consistent. Migration 017 (additive).
+- Delta-sync Phase 4 (pull + push transport and orchestration, #1345): a spoke can now synchronize memories with a hub over HTTP without shipping whole database files. New `GET /api/sync/events` feed and `POST /api/sync/events` ingest endpoints, a `sync_from_peer` (pull) and `push_to_peer` (push) orchestrator, per-peer `sync_cursor` (migration 018) and dedicated `push_cursor` (migration 019), and an opt-in scheduled cycle on the consolidation scheduler (`MCP_SYNC_SCHEDULE`, Phase 4d). Both directions are initiated by the spoke so a firewalled/NAT'd node still syncs with a hub it cannot be reached from. Off by default (all new env vars unset → zero behaviour change). Migrations 018/019 are additive.
+- Delta-sync Phase 5 (bootstrap + event version negotiation, #1345): a new or reinstalled spoke can now bootstrap from a peer's current state instead of reprocessing the whole corpus. `generate_baseline(storage)` emits a deterministic, idempotent set of baseline events (create + tombstones) plus a durable watermark (MAX(seq) read under the sync lock, so a concurrent write is never lost); `install_baseline(...)` applies them through the existing Phase 4 apply path and parks the per-peer cursor at the watermark, so live pull/push continues with no reprocessing. Authorship is preserved (`metadata.agent_id`); memories with no verifiable author are marked `unattributed` rather than attributed to an invented agent. Soft-deleted memories bootstrap as tombstones. Plus: apply now rejects/quarantines an event whose envelope `schema_version` exceeds what this peer understands (`KNOWN_SCHEMA_VERSION`), without advancing the cursor past it — no silent accept of a newer protocol. On demand, sqlite_vec only; off unless invoked. Closes the delta-sync arc (Phases 1–5).
+- Decouple the hybrid background sync from Cloudflare: `BackgroundSyncService` is now typed against `MemoryStorage` and the Cloudflare-only steps (Vectorize capacity checks, metadata normalization, the 10 KB metadata limit) are gated behind two capability properties on the storage base — `supports_capacity_monitoring` and `requires_metadata_normalization` (default `False`, `True` on `CloudflareStorage`). An HTTP secondary skips those steps and forwards raw updates; the Cloudflare path is unchanged.
+- Local sync event-log (first slice of the delta-sync RFC #1345): a `sync_events` table and
+  per-mutation hooks record every supported mutation (store, store_batch, delete/soft-delete,
+  update_memory_metadata) as an append-only event, written in the SAME transaction as the
+  mutation (never a memory without its event). Idempotent via `UNIQUE(agent_id, event_id)`;
+  deletes are durable tombstones that survive `purge_deleted`. Gated by `MCP_SYNC_EVENTLOG`
+  (off by default — zero behavior change). No network/HLC/transport yet (later phases).
+- Deterministic ordering for the sync event-log (second slice of the delta-sync RFC #1345):
+  every event is now stamped with a Hybrid Logical Clock `(hlc_physical, hlc_logical)` in the
+  SAME transaction as the event, with a monotonic `last_hlc` persisted in `metadata` that never
+  regresses across restarts (ADR-0010/0011). A new pure resolver (`storage/sync/resolver.py`)
+  reconciles concurrent events for the same `content_hash` with a total, commutative order
+  (HLC → delete-vs-update → `agent_id` → `event_id`); quality/importance is deliberately
+  excluded so hosts converge (ADR-0012/0013). Migration 016 is additive and idempotent
+  (two nullable columns + one index + backfill of Phase 1 events). Still local-only: no
+  network or transport yet (that is a later phase). Gated by the existing `MCP_SYNC_EVENTLOG`
+  flag (off by default — zero behavior change).
+- MCP store path now honors `MCP_MEMORY_INCLUDE_HOSTNAME`: when enabled and the client sends no `client_hostname`, the server stamps its own hostname (`socket.gethostname()`) into memory metadata and a `source:{host}` tag — matching the Web API behavior. Best-effort; never fails the write.
+- Hybrid secondary backend is now pluggable via `MCP_HYBRID_SECONDARY_BACKEND=cloudflare|http`. The new `RemoteHTTPStorage` lets a self-hosted mcp-memory-service instance act as the hybrid secondary over the REST API (store, get, delete, metadata, stats, content-hash listing), with configurable auth (`bearer` default, `x-api-key` opt-in) and optional HTTP basic auth for instances behind an nginx `auth_basic` layer (#1304).
+- Add `list_content_hashes()` / `list_content_hashes_page()` to the storage base plus a cursor-paginated `GET /api/memories/hashes` endpoint, giving hybrid drift detection a backend-agnostic bulk hash listing (paginating `GET /memories` did not scale). sqlite-vec implements the paginated path; other backends return empty until their own override lands. Read-access gated.
+- Fail-closed embedding-model match check for the HTTP secondary. On startup, a hybrid client with an HTTP secondary verifies that the hub's configured embedding model matches its own via a new authenticated `GET /api/health/model` endpoint. A mismatch — or a missing/unreachable model — raises `EmbeddingModelMismatchError` and the service refuses to start, instead of silently degrading recall when nodes embed with different models. Set `expected_embedding_model` (wired automatically from the hybrid client's model) to enable the check; leaving it unset preserves the previous behavior.
+- **Claude Code plugin: `remember-session` skill.** `/mcp-memory-service:remember-session`
+  has the model save what a session actually decided and learned: decisions with their
+  reasons, root causes, reusable lessons, and one open-items memory with owners and
+  absolute dates. It searches before writing to skip duplicates, tags every memory with
+  the session's project, and reads the stored hashes back. It complements the automatic
+  keyword digest of the session-end hook rather than replacing it.
+
+### Fixed
+
+- **Require operator permission for search summaries (#1479, fixes #1451, VijaySreekar).** Configuring a Harvest LLM provider no longer enables search summarization by itself: the operator must set `MCP_SEARCH_SUMMARIZE_ENABLED=true`. Disabled requests return raw results with a warning, including searches with no matches, without initializing a provider or sending a summarization request.
+- Fixed relationship inference labelling associations with type pairs the ontology does not allow, such as a note or observation that "fixes" an error, or the non-existent label `uses`. Typed labels are now limited to the source → target pairs listed in each relationship's `valid_patterns`, and an allowed label is no longer lost when a disallowed one scores higher. (#1458)
+- Fixed `store_batch` silently dropping memories when a competing writer held the SQLite write lock. A transient `database is locked` on a batch item was caught and degraded to a permanent "Insert failed" result, so under real concurrency (several agents writing the same `sqlite_vec.db`) a store could lose data. Transient lock/busy errors are now re-raised so the existing retry logic reruns the whole atomic batch after a backoff, while non-transient errors still degrade the single item. (#1478)
+- **Hybrid `get_stats()` called every secondary "Cloudflare" (#1482, massimiliano1991).**
+  `HybridMemoryStorage` now records which secondary it built (`http` or `cloudflare`) and
+  reports it in `storage_backend` / `secondary_backend`, so a hybrid client synced to a
+  self-hosted hub no longer shows up as `Hybrid (SQLite-vec + Cloudflare)`; without a
+  secondary it says so instead of naming one. The hub side of the HTTP secondary gets its
+  own page, `docs/guides/self-hosted-sync-hub.md`, and `.env.example` lists the
+  `MCP_HYBRID_SECONDARY_*` and `MCP_SYNC_*` variables.
+- Delta-sync Phase 4 apply: fixed two concurrency/convergence P1s (#1345). update_metadata now rebuilds each metadata field from ALL update_metadata events for a hash via field-level last-writer-wins by HLC, so peers converge regardless of event arrival order (previously a newest-first peer discarded an older event's field edit). apply_remote_event and the sync/push cursor commits now run under the storage connection lock, so a sync write/commit can no longer drop an in-flight local write's savepoint on the shared SQLite connection.
+- **Key concepts no longer carry capitalized stop words or bare numbers (#1495, #1493, xiao115255).**
+  The stop-word check ran only over the lowercase frequent-word source, so `With`,
+  `That` and `What` — matched as capitalized terms — reached the cluster summary,
+  and the `numbers` pattern contributed values such as `0.682`. The check now runs
+  over every concept, case-insensitively, beside `SQL_KEYWORDS` and `META_CONCEPTS`,
+  and purely numeric concepts are dropped there too.
+- **Consolidation no longer stores pattern memories with nothing in them (#1500, #1492).**
+  Compression summarized memories the service wrote itself, so discovered
+  associations, auto-captured session summaries and earlier compression output
+  turned into patterns about `0.682, 0.695` or `Session, User, copies, Hash`.
+  Those memories are now left out of compression input; they are recognized by
+  tag (`association`, `session-consolidation`, `session-summary`, or `cluster`
+  plus `compressed`) or by `memory_type` `session`, since associations and most
+  session summaries are stored as `observation`. Theme keywords that only those
+  memories carried are dropped as well. The layout words `session`,
+  `summary`, `user`, `copies` and `hash` are dropped from key concepts, and a
+  cluster whose summary would hold no source sentence is skipped instead of being
+  stored as the generated overview line alone. The summary length budget no
+  longer counts the overview line twice, which had left room for source
+  sentences only up to about half the configured length.
+- **Hybrid pull skipped old cloud-only memories when the cloud held more than the local store (#1503).** `_sync_memories_from_cloudflare` only diffed content hashes when the secondary held no more memories than the primary; otherwise it fell back to the newest-first scan, which stops after `HYBRID_MAX_EMPTY_BATCHES` batches without a new memory and never reached old memories buried behind shared ones. The hash diff now runs whenever the secondary can answer a bulk hash fetch, and the scan is kept only for secondaries that cannot.
+- **Delta-sync push no longer stalls under `MCP_SYNC_PUSH_ALLOWED_AGENTS` (#1522).** Clients
+  push back the events they pulled from the hub, including the hub's own events stamped
+  `unknown`. The allow-list rejected those, so the first batch carrying one got a 403 and the
+  client's push stalled on every cycle. `POST /api/sync/events` now applies the allow-list
+  only to events the hub does not already hold. New events from unlisted agents are still
+  rejected whole.
+- Hybrid backend with an HTTP secondary (`MCP_HYBRID_SECONDARY_BACKEND=http`) no longer requires Cloudflare credentials. Previously the config validator demanded `CLOUDFLARE_*` and called `sys.exit(1)` whenever `MCP_MEMORY_STORAGE_BACKEND=hybrid`, even when the secondary was HTTP (which never touches Cloudflare), making hybrid-over-HTTP impossible without dummy Cloudflare values (#1304).
+- **Store partition is now honored in delete and non-semantic search (#1465, #1466).**
+  `delete_memories(store=...)` no longer crosses partitions: the `store` filter is
+  forwarded to delete-by-hash, delete-by-tag (any/all), and time-range deletion, and
+  the `store` kwarg was added to `delete`/`delete_by_tags`/`get_by_exact_content`/
+  `get_memories_by_time_range` across every backend to keep the interface uniform.
+  `search_memories(store=...)` now scopes `quality_boost`, `exact`, `tag-only`,
+  `time-only` and `hybrid` modes (previously only `semantic`/`ranked` honored it);
+  the hybrid path also applies a final store filter so the store-unaware BM25 half
+  cannot leak other partitions. Hybrid `delete_by_tags` queues cloud deletes only for
+  the hashes actually removed from the scoped primary, so deleting from one store no
+  longer removes another store's cloud copies.
+- Delta-sync no longer deadlocks on "poison" events. A create whose content is empty in both the event payload and the source table is now skippable (the orchestrator advances past it instead of fail-stopping the whole feed); the feed stops clobbering a payload's good content with an empty table value; and the push ingest classifies anti-replay payload-divergence rejections as skipped_duplicate so a single divergent event cannot block the entire push backlog. Anti-replay protection is unchanged — a divergent payload still never rewrites the stored memory.
+
+### Internal
+
+- **PyMilvus 3.x is supported (#1112).**
+  The `milvus` extra now declares `pymilvus>=2.5.0,<4.0.0`, and the Milvus CI
+  job gates both the 2.x and the 3.x line. The 3.0.2 probe passed 240 tests
+  before the bound was widened. The upper bound stays, so a future 4.x is not
+  shipped until a CI leg tests it, and Dependabot still ignores pymilvus majors.
+  `uv.lock` resolves 3.0.2.
+- **`health/integrity.py` cleared of unsanitised logger calls (#1444, mrhard9090; part of #1146).**
+  The integrity monitor logged what the corruption check and the repair printed, and the export path and
+  error, through f-strings, so a value carrying a newline could write forged lines into the server log.
+  Those values now go through `_sanitize_log_value` with `%`-style lazy formatting and every line
+  reads as before. The module is in `GUARDED_MODULES`, and `tests/health/test_integrity_logging.py` runs
+  the check, repair and export paths under `caplog` with a newline in each value.
+- **`models/memory.py` cleared of unsanitised logger calls (#1445, mrhard9090; part of #1146).**
+  Creating a memory logged the tags that fail namespace validation and the text of timestamp parse
+  errors without sanitising them, so a tag carrying a newline could write forged lines into the server
+  log. Those values now go through `_sanitize_log_value` with `%`-style lazy formatting and every line
+  reads as before. The module is in `GUARDED_MODULES`, and `tests/models/test_memory_logging.py` creates a
+  memory with a newline in a tag and in the memory type under `caplog`.
+- **Four CodeQL quality notes cleared (#1448, doobidoo).** An unused import in
+  `harvest/harvester.py` and two dead `status` initialisations in
+  `consolidation/health.py` are gone, and `memory stop` now returns `True` explicitly
+  instead of an implicit `None`, so its contract with `memory restart` (only `False`, a
+  refusal, stops the relaunch) is stated in code. No behaviour change.
+- **Landing page gets a 50-second explainer video (#1453).**
+  `site/index.html` now has a "See it in 50 seconds" section between the 3D knowledge graph and the
+  feature cards. It walks through store, retrieve, graph and consolidation with burned-in captions and a
+  locally generated narration track, as a plain `<video controls preload="metadata">` with a poster
+  frame, so nothing downloads until the visitor presses play. The 1080p H.264 file is 3.2 MB and lives
+  in `site/assets/videos/explainer.mp4`.
+- Sanitized unsanitised f-string logger calls in `storage/factory.py`, `quality/async_scorer.py`, and `consolidation/forgetting.py` (25 calls) via `_sanitize_log_value`, continuing the #1146 log-injection (CWE-117) cleanup. Logging-only; no behavior change.
+- **Analytics graph explains Min Connections vs Min Degree (#1477, kalo-biralo).**
+  Both controls filter on connection counts but count different things: Min Connections
+  counts a memory's linked memories across the whole database on the server, Min Degree
+  counts neighbours in the graph as drawn in the browser. Each control now has a tooltip
+  saying so, translated for English and Chinese through a new `data-i18n-title` attribute
+  in the i18n loader, and the dashboard guide gains a short section with the 10-vs-2
+  example.
+- **Split the unified memory-search handler into focused stages (#1484).** Retrieval and fallback, result filtering, optional summarization, and response formatting now live in separate helpers so each stage can be reviewed and tested independently without changing the returned content.
+
+## [11.15.0] - 2026-10-03
+
+### Added
+
+- **Phase 0 harvest coverage instrument: the parser now counts, per block kind, how many were seen vs extracted vs dropped (#1287).**
+  `TranscriptParser.coverage_report()` exposes `{kind: {seen, extracted, dropped}}`
+  accumulated since the instance was created. It changes nothing about what is
+  harvested — it makes the structural drop of `ToolResult` and other non-text
+  blocks measurable, so a later "long-form design content is being dropped" claim
+  is a counted coverage number rather than indistinguishable from an empty audit.
+  Groundwork for the harvest design-extraction RFC (#1287), gated on what it reports.
+- **`MCP_CONSOLIDATION_AUTO_SUPERSEDE` keeps `contradicts` edges without hiding memories (#1320).**
+  Consolidation supersedes the older memory of any association that relationship inference
+  labels `contradicts` (confidence >= 0.75), which drops it out of default retrieval, and
+  nothing gated that step. The new setting (default `true`, unchanged behavior) can turn off
+  only the supersession: the typed edge is still written and both memories stay visible.
+- **`POST /api/search/by-tag` accepts `limit` (#1324).**
+  The endpoint returned every memory carrying the tag, so a caller that wanted five
+  scoped results had to transfer and parse a long-lived tag's whole history. `limit`
+  (1-100, default unlimited, so existing callers see no change) keeps the newest matches,
+  and `total_found` still counts every match, so a client can tell that it got a page.
+- **Phase 0 coverage instrument now records detected language per text-bearing block (#1346).**
+  `TranscriptParser.coverage_report()` gains a per-kind `languages` sub-tally
+  (`{kind: {seen, extracted, dropped, languages: {pt, en, unknown}}}`) so the
+  coverage gap can be measured by language, not just by block kind. This answers
+  "how much of the dropped/kept content is pt-BR?" — the number that decides
+  whether the future design extractor must be multilingual, rather than assuming.
+  It is measurement, not inference: a cheap zero-dependency pt/en heuristic
+  isolated in `_detect_language` (ties and no-signal return `unknown`, never a
+  guess), upgradable to langid/fastText later without touching the rest of the
+  instrument. Additive and language is recorded only for text-bearing blocks;
+  non-text kinds carry no `languages` tally. Groundwork for the harvest
+  design-extraction RFC (#1346), R0.4.
+- Added `list_superseded_orphans()` to surface live memories whose `superseded_by` points at a deleted or missing winner — the rows that bug #1352 could strand invisibly (read-only diagnostic).
+- Add `scripts/maintenance/backfill_supersession_columns.py`: backfills the migration-011 `superseded_by`/`parent_id`/`version` columns for memories versioned before #1348 (metadata-only trace to real columns), skipping rows whose winner was deleted to avoid the #1352 orphaning. Dry-run by default. (#1372)
+- **Harvest coverage report is now visible in results and logs (#1423, closes part of #1346).**
+  The Phase 0 coverage instrument (`coverage_report()`, per-block seen/extracted/dropped
+  with the pt/en language sub-tally from #1350/#1379) had no caller in `src/`: the number
+  Phase 0 was built to measure was not in the harvest result, the log, or anywhere a run
+  could read it. `SessionHarvester.harvest()` and `harvest_and_store()` now capture the
+  parser's aggregated report at the end of a run, attach it to every `HarvestResult.coverage`
+  (optional, defaults to `None` — backward compatible), and emit one INFO log line summarising
+  per-kind counts. The block `kind` is passed through `_sanitize_log_value` before logging
+  (py/log-injection guard). This closes the Phase 0 measurability gate from #1287 so the
+  extraction decision can be made on real numbers.
+- **Harvest discovers Kiro workspace-layout sessions, not just the flat CLI mirror (#1346).**
+  `TranscriptParser.find_sessions()` now globs nested
+  `{workspace_hash}/{session_uuid}/messages.jsonl` (Kiro v4 payload-wrapped
+  workspace sessions, including sessions migrated from the old IDE) and the
+  `cli/*.jsonl` mirror, in addition to flat `*.jsonl` at the root. The v4 parser
+  already reads that content (#1366) — only discovery was missing:
+  `find_sessions(~/.kiro/sessions)` returned 0 while `find_sessions(.../cli)`
+  returned 1104. Now the root sees both layouts. Additive and backward-compatible:
+  pointing directly at `cli/` behaves exactly as before, and the `cli/` glob is
+  scoped rather than a broad `*/*.jsonl` wildcard.
+- **Harvest can parse Kiro CLI v3 sessions straight from the SQLite source (#1346).**
+  `TranscriptParser.parse_sqlite()` reads `conversations_v2` from a Kiro
+  `data.sqlite3` — the CLI v3 source of truth — extracting user/assistant text
+  from each conversation's structured `history[]` (user `content.Prompt.prompt`;
+  assistant `.content` of a `Response` or `ToolUse` variant). The store only read
+  `.jsonl` before, so those conversations were invisible to harvest. Opened
+  strictly read-only (`file:...?mode=ro`) and streamed row-by-row so the live
+  Kiro db is never written and large values are not all loaded at once. Feeds the
+  same Phase 0 coverage instrument (with language), so SQLite content enters the
+  coverage matrix. On a real 195-conversation db this recovers 6553 messages
+  (0 before), ~88% pt-BR — evidence that an English-only extractor would drop
+  most of the value. Alvo B of RFC harvest-kiro-sessions v2.0.
+
+### Fixed
+
+- **HTTP API can scope memory, search, CRUD and analytics by store (#1106).**
+  The store scope now also applies to hash-based `GET`/`PUT`/`DELETE`, so a hash
+  owned by another partition is reported as missing instead of being readable or
+  writable, and `store='all'` is rejected with `400` on writes instead of `500`.
+  Scoped analytics count in storage rather than over a sampled slice, exclude
+  soft-deleted tombstones, and apply the date window inside storage for the
+  overview, graph, growth, heatmap and time-search routes. `store=all` restores
+  the federated view; dashboard wiring remains a follow-up.
+- **Milvus now implements the full storage and graph contract instead of returning empty analytics, no-op graph operations, or backend-specific errors (#1201, ghulands).**
+  The web and MCP callers invoked untagged/storage analytics, versioned updates, entity links, transitive closure, and common-neighbour methods that Milvus either did not implement or inherited from the empty base default. Milvus now performs the operations against its collection, keeps the same call signatures as SQLite, and explicitly refuses file backup or database optimization on remote-only deployments.
+- **Cloudflare recall ceiling lifted from 50 to 100 neighbours (#1300, massimiliano1991).**
+  Both Vectorize queries sent `returnMetadata="all"`, which caps `topK` at 50, but the only
+  consumer of that metadata was recovering `content_hash` from the match, and `store()`
+  writes `memory.content_hash` as both the Vectorize id and the indexed D1
+  `memories.vector_id` column. Queries now send `returnMetadata="none"`, the loader keys
+  on the match id and looks the row up by `vector_id`, and the ceiling (with
+  `debug_info["retrieval"]["neighbour_ceiling"]`) moves to the 100 cap Vectorize applies
+  without metadata. The tag-filtered `n_results * 3` over-fetch now reaches
+  `n_results <= 33` before the ceiling clips it, up from `<= 16`.
+- **Memory decay used host-local time as its default reference, skewing age on non-UTC deployments (#1302).**
+  `ExponentialDecayCalculator.process()` defaulted `reference_time` to a naive
+  `datetime.now()`, and `DreamInspiredConsolidator` passed one explicitly. Memory
+  timestamps are stored as UTC and `base._get_memory_age_days()` treats a naive
+  reference as UTC, so the host's local offset silently shifted `age_days` — and thus
+  `decay_factor` and forgetting decisions. Both call sites now use
+  `datetime.now(timezone.utc)`, matching every other consolidation component.
+- **Endpoint quality scores were not reproducible, and the Groq tier threw away
+  recoverable answers (#1307, #1102, rubenmarcus).** Both the openai-compatible and
+  the Groq scorer sampled at `temperature=0.1`, so the same memory scored differently
+  on repeated calls even though those scores feed quality-boosted search ranking and
+  the consolidation retention tiers. Both now send `temperature=0`. The Groq loop also
+  parsed with a bare `float()` and fell through to implicit signals on any wrapper
+  ("Score: 0.7", a code fence, a trailing period), while the openai-compatible tier
+  already recovered exactly those shapes; that recovery moved into a shared
+  `_parse_score_response()` and both tiers use it.
+- **A human rating overwrote the machine quality score in the field retention reads, and thumbs-down could push a memory toward deletion (#1312).**
+  `quality_score` was a single field: rating blended `0.6*user + 0.4*old` into it,
+  erasing the scorer's number, and the decay/forgetting path read the blended
+  value. The score is now materialized from two origins in metadata —
+  `computed_quality` (machine) and `user_rating` (human) — via `effective_quality()`:
+  human wins when present (−1/0/+1 → 0.25/0.5/0.9), else computed, else 0.5. All
+  machine writers (scorer, async batch scorer, `/evaluate` endpoint) persist
+  `computed_quality`; both rating twins (MCP + HTTP) preserve it. The decay
+  relevance calculator and `forgetting.py` read `computed_quality` (fallback to
+  `quality_score` for pre-split memories), so a human down-vote de-ranks search
+  without changing the retention band or decay relevance, and the connection boost
+  still protects. `computed_quality` survives ratings and re-scoring; `rating_history`
+  stays capped at 10 (not codec-compressed; can exceed the 9.5KB Cloudflare sync
+  limit). No schema change. Note: ratings applied before this change cannot be
+  separated retroactively (the machine input was already lost in the old blend);
+  the fallback treats their stored value as computed, and re-rating restores the
+  split cleanly. The consolidation association boost is now retention-only: it
+  lifts a well-connected memory's relevance/decay but no longer writes the boosted
+  value back into `quality_score`, so it can't resurrect a machine score over a
+  human down-vote.
+- **A holiday in a time filter searched the wrong year (#1315).** `christmas`,
+  `halloween` and `thanksgiving` resolved to this year's date even while it was still
+  ahead, so the search covered a future window and found nothing; `valentine` and
+  `new year` jumped back a year too far once they had passed. A holiday now resolves to
+  its most recent occurrence whose window has started.
+- **Exact-mode search treated `%` and `_` in the query as wildcards (#1316).** On
+  sqlite-vec and Cloudflare the query went into `LIKE '%' || ? || '%'` unescaped, so
+  `user_id` also matched `userXid` and a query of `%` or `_` returned every memory. The
+  wildcards are escaped now, with `ESCAPE '\'`, as tag matching already does (#916).
+- **Contradiction detection never superseded anything (#1317).** With
+  `MCP_CONTRADICTION_DETECTION_ENABLED=true`, maintain Step 7 called a graph method
+  that does not exist and wrote `superseded_by` into metadata instead of the column
+  retrieval filters on, so no edge was written and no memory was hidden, while the
+  report counted them as marked. Hybrid's `mark_superseded_batch()` was a no-op for
+  the same reason, which also affected dedup consolidation.
+- **Versioned updates wrote `superseded_by` only to metadata JSON, so the old version stayed searchable and history could not link versions (#1318).**
+  `update_memory_versioned` now writes the migration-011 columns —
+  `superseded_by` on the old row (via `mark_superseded_batch`), plus `parent_id`
+  and incremented `version` on the new row. Default retrieval (which filters
+  `superseded_by IS NULL`) drops the old version as the tool description promises,
+  and `get_memory_history()` walks the full lineage instead of returning each
+  version standalone. The metadata trace is kept for audit. No schema change.
+- **Harvested memories that evolve an existing one were never quality-scored (#1326).**
+  When session harvest found a close match and evolved it (#641), the new version was
+  written straight to storage, bypassing `MemoryService`: no AI quality score, no
+  `agent_id`, no entity links, no `on_store` plugins, and none of the harvest provenance
+  metadata the normal store path records. Harvest now evolves through the new
+  `MemoryService.evolve_memory()`, which gives the new version the same treatment as a
+  stored memory. Memories evolved before this fix stay unscored until re-evaluated.
+- **Hybrid BM25 matched almost no keyword signal (#1327).** `HybridMixin._search_bm25()` wrapped the whole sanitized query in double quotes, which FTS5 treats as a phrase query: a multi-word query only matched text containing those words adjacent and in order. On one production store `tmux byte tap` matched 1 memory as a phrase versus 236 as individual terms, so hybrid search ranked like plain semantic search regardless of the keyword/semantic weights. The query is now an OR of its words, each quoted on its own so AND/OR/NOT/NEAR stay words instead of operators. Three follow-ups from review: the FTS5 trigram tokenizer drops terms shorter than three characters, so a query made entirely of short words (e.g. `go up`) falls back to the whole-query phrase; `_search_bm25()` now honors `include_superseded` and excludes superseded rows, so RRF no longer surfaces stale memories that semantic retrieval excludes; and the local `_sanitize_log_value` duplicate was replaced by the shared helper from `mcp_memory_service.compat`.
+- **Three consolidation features silently did nothing (#1330, #1319).** Belief challenges
+  looked up observations with a storage method no backend defines, so they always found
+  none; insight cards never wrote their `derived_from` graph edges because the edge method
+  lives on the graph storage, not the memory storage; and applying forgetting results raised
+  `AttributeError` on the Cloudflare backend, which had no `delete_memory()`. All three now
+  reach the storage they were meant to.
+- **Maintenance rewrote insight-card graph edges on every run (#1330).** The edge for each
+  source was written unconditionally, and the write is an `INSERT OR REPLACE` — so an edge
+  that already existed had its relationship type, metadata and creation time reset each time
+  the maintenance cycle ran. Only missing edges are written now, leaving an existing edge's
+  own history intact.
+- **Insight-card source links were mismatched by other edges (#1330).** The
+  "only write missing edges" check used `get_association()`, which returns
+  either direction's row with no ordering and (on the sqlite backend) does not
+  return the relationship type. So a reverse edge between the same two
+  memories, or a `supports`/`causes` edge on the same directed pair, made the
+  relink skip the forward `derived_from` link (leaving it unwritten) or — once
+  the direction/type was checked against the returned row — rewrite it when a
+  reverse row shadowed the forward one. The caller now asks each graph backend
+  for the exact directed, typed edge via `has_edge(source, target, type)`
+  (added to both the sqlite and Milvus backends); both return
+  `relationship_type` so the check is exact.
+- **Tags containing spaces now match exactly on sqlite-vec (#1331).**
+  Tag search, listing, counts, and tag-scoped deletes preserve inner spaces
+  in both the stored tag and query. Distinct tags such as `machine learning`
+  and `machinelearning` no longer collide during deletion.
+- **Yearless dates and quarters select their most recent occurrence (#1347, breken-ai).**
+  `parse_time_expression()` defaulted `12/25`, `10-01` and `fourth quarter` to the current
+  year even when that window was still ahead, so a memory search returned no matches for the
+  latest completed occurrence (with today fixed at 2026-09-25: `12/25` selected 2026-12-25
+  instead of 2025-12-25; `between 12/1 and 1/31` came back inverted, 2026-12-01 through
+  2026-01-31). A yearless date or quarter that has not started yet now resolves to last
+  year's occurrence, the same rule holidays and seasons already follow; explicit years
+  (including `12/25/26`) are still respected verbatim.
+  Yearless `2/29` resolves to the previous leap year instead of returning no range, and a
+  yearless `between` range whose ends would invert (`between 1/31 and 12/25` in September)
+  keeps both ends inside one calendar year. An explicit quarter year no longer needs `of`
+  (`4th quarter 2026` keeps 2026).
+- Fixed `update_memory_metadata` silently dropping `superseded_by`: the column is now written (including clearing it with `None`/`""`), so a loser can be un-superseded via a metadata update instead of the value landing in JSON while the column stays stale (#1352).
+- **`MCP_DECAY_ENABLED=false` had no effect (#1354, timkjr).** Nothing in
+  `consolidation/` read the flag, so every pass still ran relevance scoring and wrote
+  `relevance_score`, `decay_factor`, `connection_boost` and `access_boost` into memory
+  metadata. With the flag off the relevance phase is now skipped (and logged as
+  skipped), and forgetting computes scores for its own candidates without writing
+  them back. Scores written by earlier runs are left in place.
+- **Type-based retention never matched the real memory_type ontology (#1355, timkjr).**
+  `CONSOLIDATION_CONFIG['retention_periods']` was keyed only by the legacy names
+  (`critical`, `reference`, `standard`, `temporary`), and passing it to
+  `ConsolidationConfig(**...)` replaces the dataclass default wholesale, so
+  `_calculate_memory_relevance` hit its 30-day fallback for every ontology type:
+  a `decision` memory decayed on the `error` schedule instead of its documented
+  365 days, and with retention stuck at 30 days for almost everything the decay
+  factor dominated the quality multiplier. The runtime dict now carries the
+  ontology keys (`decision` 365, `learning` 180, `pattern` 90, `error` 30,
+  `observation` 30) alongside the legacy four, each with its own
+  `MCP_RETENTION_<TYPE>` environment override.
+  Subtypes (`insight` under `learning`, `architecture` under `decision`, ...)
+  resolve to their base type before the lookup, and the new overrides are
+  listed in the web configuration API.
+- **Surface missing embeddings in the consolidation and HTTP health checks (#1225).**
+  `/api/health/detailed` and the consolidation health monitor now report a `missing_embeddings` count and degrade the reported status instead of returning healthy, closing the two paths that bypassed `utils/health_check.py`. The ONNX repair script no longer re-embeds soft-deleted memories.
+- Health checks (`memory_health`, hybrid) now run their SQLite work through `_run_in_thread`, so it holds `_conn_lock` and stays off the event loop. Fixes a false `missing_embeddings` reading against an in-flight store and an event-loop stall on large databases (#1363).
+- Add support for Kiro CLI v4 payload-wrapped format in TranscriptParser. The new format uses `{"payload": {"type": "...", "content": "..."}}` structure instead of top-level `type`/`kind` keys. Enables harvesting from current Kiro CLI sessions that were previously skipped as "Unknown session format" (#1346).
+- Fixed sqlite_vec embedding cache to use bounded LRU shared cache with stable `{model}::{text}` keys instead of unbounded local dict with collision-prone `hash(text)` keys (#1099, PR #1367)
+- **Harvest, the harvest rewriter and the Kiro bootstrap ignored `MCP_LOCALE` (#1380).**
+  These read `HARVEST_LOCALE` directly, so setting only `MCP_LOCALE` gave English-only
+  harvest patterns, filters and rewriter instructions. They now go through
+  `get_active_locales()` like NER and NLI, so `MCP_LOCALE` wins and `HARVEST_LOCALE`
+  stays a fallback. The Kiro bootstrap formatter is built when it is requested
+  instead of at import time, so a locale set after import is honoured.
+  `get_active_locales()` also re-reads the env vars on every call (only the parsing is
+  cached), so a locale set after another module already resolved it is not ignored.
+- **`exc_info` on the entity-filter error path undid the log sanitisation in
+  `server/handlers/memory.py`.**
+  The two `%s` arguments were already wrapped in `_sanitize_log_value`, so the call
+  looked complete — but passing `exc_info` makes the logging module append the
+  formatted traceback, which carries raw `str(e)` and reintroduces the newline
+  forgery those wraps exist to stop. Measured with a raised exception whose message
+  is `ok\n<date> CRITICAL admin wiped all memories`: the old call produced 7 records
+  with that stamp standing alone as its own line, the new one produces 2 with the
+  text escaped inside a single error record. The fix drops `exc_info` and passes
+  `_sanitize_log_value(traceback.format_exc())` as a third argument, matching the
+  other error paths already in the file.
+- SQLite and Cloudflare preserve update timestamps for metadata-only changes, including unchanged tag sets and types; hybrid batch sync now forwards the caller's timestamp-preservation setting. Cloudflare updates to missing or tombstoned memories report failure instead of silent success, so the hybrid queue makes up to three attempts and records a failed sync.
+- **`migrate_to_cloudflare.py export` dropped every memory older than the newest 100 (#1414).**
+  The SQLite-vec export looped on `get_recent_memories(100)`, which always returns the
+  same newest 100, so a database of 250 memories produced 300 entries: the newest 100
+  three times, none of the other 150. It now pages through all memories in all stores.
+  The ChromaDB-to-Cloudflare steps in `docs/cloudflare-setup.md` also called options
+  and a script that do not exist; they now go through SQLite-vec on the
+  `chromadb-legacy-final` tag and this export on main.
+- **Harvest LLM rewriter no longer leaks the literal `TYPE:` placeholder into content (#1417).**
+  The rewriter prompt used the literal word `TYPE` as a format placeholder (`Format: TYPE: content`,
+  and the batch `1. TYPE: insight`). Providers such as deepseek-chat echoed it verbatim, so the
+  parser — capturing `TYPE` via `^(\w+):`, finding it absent from `VALID_TYPES`, and falling back to
+  the whole string — stored candidates as `TYPE: convention — ...` and let degenerate `TYPE: bug` /
+  bare `TYPE` / truncated fragments through. Over a curated 11-session corpus, 10 of 22 candidates
+  leaked the prefix and 5 were label-only noise. `_unleak_type()` now unwraps a leaked
+  `TYPE: <realtype> <sep> text` prefix (separators `:`/`-`/`—`), recovers the real type, and drops
+  label-only/truncated degenerates; a length guard applies only on the confirmed-leak path so clean
+  short content is never dropped. The prompt placeholder changed from `TYPE:` to `<type>:` with an
+  explicit instruction not to write the word `TYPE`, removing the trigger at the source. Applied in
+  both `_parse_response` and `_parse_batch_response`.
+- **Graph handlers logged unsanitised exceptions, reintroducing log forgery (#1424, #1146 family).**
+  Every error path in `server/handlers/graph.py` logged the caught exception with raw `str(e)`,
+  and `memory_explore`/`memory_detail` also passed `exc_info=True`, so the formatted traceback
+  carried `str(e)` a second time. A newline in an exception message forged a standalone log
+  record. All seven sites now drop `exc_info` where present and wrap `str(e)` and
+  `traceback.format_exc()` with `_sanitize_log_value()`, matching the entity-filter fix in #1397.
+- **`memory_update` schema declares the fields its versioned path requires, and the in-place path no longer reacts to them.**
+  The handler hard-requires `updates.content` (and reads `updates.reason`) when
+  `versioned=true`, but the tool schema listed only `tags`, `memory_type` and
+  `metadata` under `updates` — clients that build arguments from the declared
+  schema could never satisfy the requirement and always received "versioned update
+  requires 'content' field in updates." The schema now declares `content` and
+  `reason` and states the per-mode behavior of `metadata` and
+  `preserve_timestamps`, and the handler strips `content`/`reason` from in-place
+  updates so they cannot refresh `updated_at` or leak into custom metadata.
+- **Versioned updates inherit the old version's custom metadata (#1408, doobidoo).**
+  `update_memory_versioned()` built the new version from content, tags and memory type only,
+  so every custom metadata key on the old row (source, agent fields, anything a client
+  stored) was missing from the new version. The new version now inherits the old row's
+  metadata; the lineage keys `superseded_by` and `evolution_reason` stay on the old row.
+  Metadata passed to `evolve_memory()` still merges over what the new version inherited,
+  matching in-place updates.
+- **`mcp-memory-server` served the full MCP tool surface unauthenticated on any bind (GHSA-26rx-6fvr-qjqg, NotAFlightRisk).**
+  The FastMCP entry point builds its server with no auth and calls `mcp.run("streamable-http")`
+  without the bind check the SSE and Streamable HTTP transports got for GHSA-2hh8-qjxc-43x3.
+  With `MCP_HTTP_HOST=0.0.0.0`, the setting the docs use for network access, any caller
+  could read, store and delete memories, and setting `MCP_API_KEY` or OAuth changed nothing
+  because this entry point never consults either. It now refuses to start on anything but a
+  loopback address, whatever auth is configured. For network clients run
+  `memory server --streamable-http`, which enforces `MCP_API_KEY` or OAuth; note that it
+  binds `MCP_SSE_HOST` (or `--sse-host`), not `MCP_HTTP_HOST`.
+
+### Internal
+
+- **`server/handlers/memory.py` cleared of unsanitised logger calls (#1306, massimiliano1991; part of #1146).**
+  The handler that reads request data directly carried 27 f-string logger calls and one
+  `%`-style call passing the exception unwrapped, so check 6.5 blocked every unrelated
+  pull request touching the file. Outside values (the exception in each `except` branch,
+  `error_msg`, `MCP_MAX_RESPONSE_CHARS`) now go through `_sanitize_log_value`; parsed
+  timestamps and dates use `%`-style lazy formatting; `traceback.format_exc()` is passed
+  as an argument, so every log line reads as before. The module is in `GUARDED_MODULES`
+  and the ratchet holds it.
+- **The quality gate's breaking-change check can be acknowledged (#1311).**
+  Check 4 of `scripts/pr/quality_gate.sh` blocked on every breaking change the model
+  reported, with no override. Removing a field from a response is how an
+  information-disclosure advisory is fixed, so a correct security fix could never pass
+  the gate (GHSA-7w86-2vmv-fqwm, #1305). A `Breaking-Change-Acknowledged: <reason>` line
+  in the PR body or a commit message now turns the finding into a printed notice with
+  that reason, and the summary reports it as acknowledged. A staged run takes the reason
+  from `BREAKING_CHANGE_ACKNOWLEDGED`. A line without a reason does not count.
+- **`storage/graph.py` cleared of unsanitised logger calls (#1314, massimiliano1991; part of #1146).**
+  The file carried 25 f-string logger calls on the gate's pattern (26 by AST: one spans
+  four lines, which check 6.5 cannot see), so the gate blocked any pull request touching
+  it. Hashes, relationship type, direction, similarity, the database path and the
+  exception in every `except` branch go through `_sanitize_log_value`; node, edge and
+  hop counters use `%`-style lazy formatting. Every log line reads as before. The module
+  is in `GUARDED_MODULES` and the ratchet holds it.
+- **The README carried the Codeberg archive banner, and the reference material it duplicates now lives in the docs it links to.**
+  `README.md` opened with "This repository has moved to GitHub" — a banner written for
+  the Codeberg archive on 2026-09-05 that travelled to GitHub with the migration and
+  had been telling every visitor, and every directory crawler, that the repository they
+  were reading was not the live one. Removed. Alongside it, the reference blocks the
+  README had accumulated moved to their proper homes ahead of a README cut: DevBench and
+  LoCoMo numbers to `docs/BENCHMARKS.md`, embedding-model selection and the `0.0.0.0`
+  bind warning to `docs/mastery/configuration-guide.md`, the openai-compatible quality
+  provider to `docs/guides/memory-quality-guide.md`, the client roster to
+  `docs/integrations.md`, the inter-agent tag pattern to `docs/agents/README.md`, the
+  Cloudflare tunnel hardening to `docs/deployment/production-guide.md`, and a ChatGPT
+  Developer Mode section to `docs/remote-mcp-setup.md`, which the README had been
+  pointing at for ChatGPT setup although it never mentioned ChatGPT. The deployment
+  stories, comparison tables and SHODH compatibility moved to the landing page.
+  Corrections found on the way: `MCP_HTTP_HOST` defaults to `127.0.0.1`, not `0.0.0.0`
+  as the configuration guide claimed; the MemPalace issue link in `docs/BENCHMARKS.md`
+  was a 404; the landing page's test count was 3007 against 3484 collected; and nested
+  `<a>` elements split the second media card in every browser.
+- **The README is 265 lines instead of 589, and no longer has to be edited on every release.**
+  It had grown to 41% marketing and 30% install instructions, stating "5ms" four times,
+  "76 endpoints" twice against an actual route count near 90, and listing the supported
+  clients in four separate places. The reference material moved to the documents it
+  duplicated and the deployment stories, comparison tables and benchmark numbers moved
+  to the landing page; what stays is what someone deciding whether to install this needs
+  in one screen. Two consequences worth knowing: every documentation link is now an
+  absolute `github.com/.../blob/main/` URL, because the README is also the PyPI long
+  description and relative links are dead there; and the hand-maintained "Latest
+  Release" section is gone, so `.claude/commands/release.md`,
+  `.claude/directives/version-management.md` and the rationale comment in
+  `scripts/ci/check_versions.sh` no longer tell a release to edit the README.
+- **Five `Pre-existing bug` xfail markers removed, and the tests behind them run again (#1333).**
+  Three tests had been passing behind stale markers, and two markers named the wrong cause.
+  The markers on `test_graph_visualization_node_colors_by_type`,
+  `test_graph_visualization_memory_type_preservation` and `test_server_modules_importable`
+  are removed. `test_get_by_exact_content_parse_rows` uses the valid memory
+  type `note` instead of `standard`, which is normalized to `observation`.
+  `test_http_api_client_hostname_header` patches `ALLOW_ANONYMOUS_ACCESS` on the
+  already-imported OAuth middleware, because the environment variable is read once at
+  import time and the test got 401. All five now run as ordinary tests. The sixth,
+  `test_hybrid_graph_methods_error_handling`, was already fixed in #1334.
+- **`storage/mixins/migrations.py` cleared of unsanitised logger calls (#1341, massimiliano1991; part of #1146).**
+  The file carried 16 f-string logger calls on the gate's pattern, plus one `%`-style
+  call that passed the exception unwrapped. Exceptions, the migration runner's
+  `result['error']` and the pragma names and values read from `MCP_MEMORY_SQLITE_PRAGMAS`
+  go through `_sanitize_log_value`; schema version, counters and retry timings use
+  `%`-style lazy formatting. Every log line reads as before. The module is in
+  `GUARDED_MODULES` and the ratchet holds it.
+- **Consolidation storage calls now have an AST contract guard (#1319, ducanhnguyen223).**
+  Direct calls from `consolidation/` are checked against `StorageProtocol` and every
+  concrete storage backend, so a missing method is caught in CI instead of being
+  swallowed by a background consolidation exception.
+- **Serialize SQLite rollback cleanup through the connection lock (#1328).**
+  Delete and batch metadata error handlers now wait for the shared connection lock before rolling back an in-flight savepoint.
+- **The triage digest listed the maintainer's own trackers as awaiting a reply (#1359).**
+  `maintainer_spoke_last()` in `scripts/maintenance/github_triage_digest.py` treated every
+  issue without comments as unanswered, so the "Quiet 14+ days, awaiting my reply" section
+  filled up with issues the maintainer had opened and nobody had commented on yet. On
+  2026-09-29 all six of its entries were such trackers. An uncommented issue now counts
+  its author as the last speaker; an unanswered report from anyone else is still listed.
+- **`storage/mixins/embeddings.py` cleared of unsanitised logger calls (#1360, massimiliano1991; part of #1146).**
+  The embeddings mixin carried 14 f-string logger calls on the gate's pattern (18 by AST) and
+  two `%`-style calls passing the exception unwrapped, so check 6.5 blocked every unrelated
+  pull request touching the file. Outside values (the exception in each `except` branch,
+  `MCP_EXTERNAL_EMBEDDING_URL`, `MCP_MEMORY_STORAGE_BACKEND`, the configured model name, the
+  HF cache path) now go through `_sanitize_log_value`; embedding dimensions, cache counters
+  and the device string use `%`-style lazy formatting, so every log line reads as before.
+  The module is in `GUARDED_MODULES` and the ratchet holds it.
+- **`discovery/mdns_service.py` cleared of unsanitised logger calls (#1369, massimiliano1991; part of #1146).**
+  The mDNS module carried 16 f-string logger calls on the gate's pattern, so check 6.5 blocked
+  every unrelated pull request touching the file. Values that arrive over the network — the
+  service name another host announces, the name and URL parsed out of its `ServiceInfo`, and the
+  exception in each `except` branch — now go through `_sanitize_log_value`; the configured
+  service name and type, the local IP, the port and the discovered-service count use `%`-style
+  lazy formatting, so every log line reads as before. The module is in `GUARDED_MODULES` and the
+  ratchet holds it.
+- **The README linked to no funding option since the Codeberg migration (#1370).**
+  The sponsor badge was removed in Codeberg #129 because GitHub Sponsors has no active
+  listing, and nothing replaced it. A short section at the end of the README now links
+  SPONSORS.md. SPONSORS.md also displayed `paypal.me/doobidoo` while linking
+  `paypal.me/heinrichkrupp1`; the link text now matches the target.
+- **`sync/importer.py` cleared of unsanitised logger calls (#1374, massimiliano1991; part of #1146).**
+  The importer reads another machine's JSON export, and its log lines carried 15 f-string logger
+  calls on the gate's pattern, so check 6.5 blocked every unrelated pull request touching the file.
+  Values the export or the command line bring in — the export's `source_machine`, each file's
+  path, and the exception in every `except` branch — now go through `_sanitize_log_value`; the
+  counters use `%`-style lazy formatting, so every line reads as before. The module is in
+  `GUARDED_MODULES` and the ratchet holds it.
+- **`backup/scheduler.py` cleared of unsanitised logger calls (#1394, massimiliano1991; part of #1146).**
+  The backup service logs names it did not choose — the backup filenames it reads off the backups
+  directory, the filename handed to `restore_backup()`, the configured paths, the error carried back
+  in a result, and the exception in every `except` branch — and its 15 f-string logger calls on the
+  gate's pattern blocked every unrelated pull request touching the file. Those values now go through
+  `_sanitize_log_value`; sizes, durations and the generated backup filename use `%`-style lazy
+  formatting, so every line reads as before. The module is in `GUARDED_MODULES`, `filename` is in
+  `EXTERNAL_NAMES` with a sample that fails if it is dropped, and the ratchet holds it.
+- **`web/api/analytics.py` cleared of unsanitised logger calls (#1398, massimiliano1991; part of #1146).**
+  The analytics endpoints log the exception in every `except` branch and the dict `storage.get_stats()`
+  returns, which the Cloudflare backend fills with `str(e)` on failure; their 15 f-string logger calls
+  on the gate's pattern blocked every unrelated pull request touching the file. Those values now go
+  through `_sanitize_log_value` with `%`-style lazy formatting, so every line reads as before. The
+  module is in `GUARDED_MODULES`, and `tests/web/api/test_analytics_logging.py` runs the overview
+  endpoint under `caplog` so a newline in an exception message stays inside one record.
+- **`storage/mixins/base.py` cleared of unsanitised logger calls (#1406, massimiliano1991; part of #1146).**
+  The base mixin logs the exception in every `except` branch, the excerpt of the `metadata` column
+  `_safe_json_loads` failed to parse, the pragma pairs split out of `MCP_MEMORY_SQLITE_PRAGMAS` and
+  the configured database path; its 13 f-string logger calls on the gate's pattern blocked every
+  unrelated pull request touching the file. Those values now go through `_sanitize_log_value` with
+  `%`-style lazy formatting, so every line reads as before. The module is in `GUARDED_MODULES`,
+  `json_str`, `pragma_name`, `pragma_value` and `db_path` are in `EXTERNAL_NAMES` with samples, and
+  `tests/unit/test_base_mixin_logging.py` runs `_safe_json_loads` under `caplog` so a newline in
+  stored text stays inside one record.
+- **Markdown links are checked now (#1414).** `scripts/ci/check_md_links.py` checks
+  relative and own-repo links in every tracked `.md` file on every pull request
+  (`links.yml`, including docs-only PRs, and check 6.9 of `pre_pr_check.sh`). External
+  links are checked weekly, where only 404, 410 and connection failures count. The 13
+  internal and 4 external links that were broken are fixed.
+- **`web/oauth/middleware.py` cleared of unsanitised logger calls (#1415, mrhard9090; part of #1146).**
+  Authentication logged the `client_id` and `scope` of a bearer token, the JWT `sub` and the exception
+  text through f-strings, so a caller that asked for a scope containing a newline could write forged
+  lines into the server log. Those values now go through `_sanitize_log_value` with `%`-style
+  lazy formatting; the part count, the configured algorithm, the missing claim names and the
+  exception type stay lazy and unwrapped. The module is in `GUARDED_MODULES`, `client_id` and `scope`
+  are in `EXTERNAL_NAMES` with samples, and `tests/web/test_oauth_middleware_logging.py` authenticates
+  a real JWT whose `scope` carries a newline, and a stored token whose record does, under `caplog`. Every line reads as
+  before, and the token itself is still never logged.
+- **`storage/mixins/metadata.py` cleared of unsanitised logger calls (#1416, massimiliano1991; part of #1146).**
+  The mixin that writes metadata, conflicts and version links carried 15 f-string
+  logger calls, so check 6.5 blocked every unrelated pull request touching the file.
+  Outside values (the exception in each `except` branch, `content_hash`, the
+  winner/loser hashes off the request body, the hash `_record_conflicts` is handed)
+  now go through `_sanitize_log_value`; the batch counters use `%`-style lazy
+  formatting, so every log line reads as before. The module is in `GUARDED_MODULES`
+  and the ratchet holds it; a `caplog` test reads the records two of its methods emit.
+- **`server/environment.py` cleared of unsanitised logger calls (#1429, mrhard9090; part of #1146).**
+  Startup logged the site-packages paths, the installed package version, the detected platform and
+  exception text through f-strings, so a value carrying a newline could write forged lines into the server
+  log. Those values now go through `_sanitize_log_value` with `%`-style lazy formatting and every line
+  reads as before. The module is in `GUARDED_MODULES`, `venv_path`, `user_path` and `installed_version` are
+  in `EXTERNAL_NAMES` with samples, and `tests/unit/test_environment_logging.py` runs the three startup
+  functions under `caplog` with a newline in each value.
+- **`web/sse.py` cleared of unsanitised logger calls (#1430, mrhard9090; part of #1146).**
+  The SSE manager logged the client address, the `Last-Event-ID` and exception text through f-strings,
+  so a value carrying a newline could write forged lines into the server log. Those values now go
+  through `_sanitize_log_value` with `%`-style lazy formatting and every line reads as before. The
+  module is in `GUARDED_MODULES`, `client_ip` is in `EXTERNAL_NAMES` with a sample, and
+  `tests/web/test_sse_logging.py` logs a connection with a newline in its address and a failed send
+  with one in its error under `caplog`.
+- **`web/api/memories.py` cleared of unsanitised logger calls (#1431, mrhard9090; part of #1146).**
+  The store and delete endpoints logged the exception text, and that of their SSE broadcast fallbacks,
+  through f-strings, so a storage error that echoed a newline could write forged lines into the server
+  log. Those values now go through `_sanitize_log_value` with `%`-style lazy formatting and every
+  line reads as before. The module is in `GUARDED_MODULES`, and `tests/web/test_memories_api_logging.py`
+  runs `delete_memory()` under `caplog` with a newline in a storage error and in a broadcast error.
+- **CI starts on every pull request, so the test jobs can be required checks.** `ci.yml`
+  no longer carries `paths-ignore` on `pull_request`; a new `changes` job runs
+  `is_docs_only()` from the base commit's `scripts/pr/pre_pr_check.sh` over the PR diff (a PR cannot redefine what skips its own tests), and the test
+  jobs skip when it reports docs-only. A skipped job reports success to a required
+  check, which a workflow that never starts cannot. Until now the only required check
+  was CodeQL's `Analyze Python Code`, so auto-merge did not wait for the tests: #1416
+  merged while `Tests with ML Extras` was still running. If the classifier itself fails,
+  the tests run rather than skip. Push to main keeps `paths-ignore`.
+- **The pre-PR gate runs only the tests a change can reach.** `scripts/pr/lib/select_tests.py`
+  maps the PR diff to test targets: changed test files, the test files that import a
+  changed `src/` module, and its `tests/<subpackage>/`. Dependency, pytest-config and
+  conftest changes still run the full suite, as does a `src/` module nothing names. A
+  change no Python test can reach runs none. CI's `Tests + Coverage` still runs the full
+  suite as a required check, and `PRE_PR_FULL_SUITE=1` runs it locally. On this branch
+  the gate went from more than seven minutes to 41 seconds.
+- **`server/handlers/utility.py` and `server/handlers/documents.py` cleared of unsanitised logger calls (#1433, mrhard9090; part of #1146).**
+  The health, cache-stats and ingestion handlers logged backend and parser error text, the logged
+  health result and tracebacks through f-strings or unwrapped arguments, so a value carrying a newline
+  could write forged lines into the server log. Those values now go through `_sanitize_log_value`
+  with `%`-style lazy formatting and every line reads as before. Both modules are in `GUARDED_MODULES`,
+  and `tests/server/test_handlers_logging.py` drives the handlers under `caplog` with a newline in
+  each error.
+- **`web/api/server.py`, `web/api/mcp.py` and `web/api/oauth_status.py` cleared of unsanitised logger calls (#1434, mrhard9090; part of #1146).**
+  The restart and update endpoints logged the executable path, the exception and git/pip output, the MCP
+  endpoint logged request-driven errors, and the OAuth status endpoint logged storage errors, through
+  f-strings, so a value carrying a newline could write forged lines into the server log. Those values now
+  go through `_sanitize_log_value` with `%`-style lazy formatting and every line reads as before. The three
+  modules are in `GUARDED_MODULES`, and `tests/web/test_web_api_misc_logging.py` drives the endpoints under
+  `caplog` with a newline in each error.
+- **`/merge-sweep` command for merge rounds over open PRs (#1435).**
+  The prompt that worked for clearing cheap-to-merge PRs now lives in
+  `.claude/commands/merge-sweep.md`: it checks CI per head SHA, open review threads,
+  conflicts and Dependabot bounds, classifies each PR, and merges nothing until the
+  maintainer approves the table.
+- **`web/api/quality.py` cleared of unsanitised logger calls (#1436, mrhard9090; part of #1146).**
+  The rate, evaluate and get-quality endpoints logged the exception text of a failed request unwrapped,
+  and the rest of the module logged through f-strings, so a value carrying a newline could write forged
+  lines into the server log. Those values now go through `_sanitize_log_value` with `%`-style lazy
+  formatting and every line reads as before. The module is in `GUARDED_MODULES`, and
+  `tests/web/test_quality_api_logging.py` drives the three endpoints under `caplog` with a newline in
+  each error.
+- **`mcp_server.py` cleared of unsanitised logger calls (#1437, massimiliano1991; part of #1146).**
+  The FastMCP entry point logged the storage backend name, the storage cache key,
+  the HTTP host and the exception text of a failing graph storage straight into
+  the record. Those values now go through `_sanitize_log_value`; the cache
+  counters and timings use `%`-style lazy formatting, so every log line reads as
+  before. The module is in `GUARDED_MODULES` and the ratchet holds it; a `caplog`
+  test drives the lifespan with pre-filled caches and reads what it emits.
+- **`storage/mixins/delete.py` cleared of unsanitised logger calls (#1439, mrhard9090; part of #1146).**
+  The delete operations logged the content hash, the tags and the backend error text through f-strings
+  or unwrapped arguments, so a value carrying a newline could write forged lines into the server log.
+  Those values now go through `_sanitize_log_value` with `%`-style lazy formatting and every line
+  reads as before. The module is in `GUARDED_MODULES`, and `tests/storage/test_delete_mixin_logging.py`
+  runs eight delete operations under `caplog` with a newline in the backend error.
+- **`utils/db_utils.py` and `utils/health_check.py` cleared of unsanitised logger calls (#1440, mrhard9090; part of #1146).**
+  Database validation, repair and the backend health checks logged the error a backend raised through
+  f-strings or unwrapped arguments, so a value carrying a newline could write forged lines into the server
+  log. Those values now go through `_sanitize_log_value` with `%`-style lazy formatting and every line
+  reads as before. Both modules are in `GUARDED_MODULES`, and `tests/utils/test_db_health_logging.py`
+  runs the validation, repair and checker functions under `caplog` with a newline in each error.
+- **`storage/mixins/store.py` cleared of unsanitised logger calls (#1441, mrhard9090; part of #1146).**
+  The store operations logged the content hash and the embedding, conflict and transaction error text
+  through f-strings or unwrapped arguments, so a value carrying a newline could write forged lines into
+  the server log. Those values now go through `_sanitize_log_value` with `%`-style lazy formatting and
+  every line reads as before. The module is in `GUARDED_MODULES`, and
+  `tests/storage/test_store_mixin_logging.py` runs `store()` and `store_batch()` under `caplog` with a
+  newline in the embedding error.
+- **`api/client.py` and `api/operations.py` cleared of unsanitised logger calls (#1442, mrhard9090; part of #1146).**
+  The code execution API logged storage, health, consolidation and scheduler errors through f-strings,
+  so a value carrying a newline could write forged lines into the server log. Those values now go
+  through `_sanitize_log_value` with `%`-style lazy formatting and every line reads as before. Both
+  modules are in `GUARDED_MODULES`, and `tests/api/test_api_logging.py` drives the failing paths
+  under `caplog` with a newline in each error.
+
+## [11.14.0] - 2026-09-25
+
+### Added
+
+- **Optional `agent_id` author identity on `memory_store` (#1100 Phase 1).** A memory can now carry the id of the agent that wrote it: pass `agent_id` explicitly or set the `MCP_AGENT_ID` env var; it is stored in metadata (no schema change). Absent both, nothing is written (`null` = unknown), so existing behavior is unchanged. `Memory.agent_id` is a metadata-backed property. Groundwork for cross-agent attribution and conflict handling in a shared multi-agent database (Phases 2-3: search filter, NLI cross-agent awareness).
+- **`force_reharvest` on `memory_harvest` bypasses the tracker filter (R8).** A harvest can now re-process sessions already recorded in the harvest tracker — e.g. to re-run sessions whose earlier run stored nothing. Off by default (tracker-respecting, unchanged). The tracker-filter decision is a pure `should_filter_tracker(already_harvested, session_ids, force_reharvest)` helper so the truth table is testable directly.
+- **`agent_id` filter on `memory_search`/`memory_list` + `X-Agent-ID` header on `/mcp` (#1100 Phase 2).**
+  Follow-up to the Phase 1 author-identity work. `memory_search` and `memory_list` gain an optional `agent_id` filter that matches either `metadata.agent_id` (MCP-authored) or the `agent:<id>` tag (Web-API-authored), so attribution written by either transport is filterable through one parameter. The filter is **opt-in**: omitting `agent_id` returns memories from all agents (no per-agent bubble), and `MCP_AGENT_ID` is never inherited into the read path — it only stamps authorship on write. The `/mcp` endpoint now reads an `X-Agent-ID` request header and injects it when a tool call omits an explicit `agent_id`, so multiple agents sharing one server are attributed per-request (explicit arg wins over header). Filtering is implemented for the sqlite-vec backend (used by hybrid); cloudflare/milvus accept the parameter for interface parity, with native filtering left as a follow-up.
+
+### Fixed
+
+- **Log injection guard protection added to `config/base.py`.** Converted f-string logging to `%`-style lazy formatting with `_sanitize_log_value` and added `config/base.py` to `GUARDED_MODULES` in `test_log_injection_guard.py` to prevent log injection vulnerabilities.
+- **Belief quarantine is reachable again: a naturally-phrased value-swap is filed as a contradiction instead of being silently dropped as a duplicate (#1216, massimiliano1991).**
+  Semantic dedup and belief grouping no longer share one threshold — belief grouping reads
+  `MCP_BELIEF_SIMILARITY_THRESHOLD` (default unchanged). When on-store NLI is enabled
+  (`MCP_NLI_ON_STORE=true`), a write rejected as a near-duplicate is re-examined: if it
+  contradicts the memory it collided with, it is stored (bypassing dedup) and quarantined
+  rather than dropped. The quarantine confidence gate is now configurable via
+  `MCP_QUARANTINE_NLI_THRESHOLD` (default 0.7), and a startup warning fires when the gate
+  exceeds the active NLI backend's achievable ceiling — the heuristic tops out at 0.55, so the
+  default config needs `MCP_NLI_BACKEND=cascade` or a lowered gate to quarantine on store.
+  `HEURISTIC_MAX_CONFIDENCE` is corrected to the value the heuristic actually returns and is
+  now read. Both new knobs fall back to their defaults (with an error log) on an invalid
+  value instead of disabling the feature; a rescued value-swap is recorded as contradicting a
+  *memory* (`contradicted_memory`), distinct from belief contradictions; and if the quarantine
+  step fails the store response says so (`contradiction_filing_failed`) instead of reporting
+  the memory filed. Default behaviour is unchanged.
+- **Cloudflare tag-filtered retrieval no longer hides that it hit the Vectorize recall ceiling (#1236, massimiliano1991).**
+  `retrieve()` over-fetches and filters tags client-side, but Vectorize caps the query at 50 neighbours, so a tagged memory beyond the 50th nearest was silently unreachable and a clipped result looked like complete recall. Every result now carries a `debug_info["retrieval"]` block (ceiling, candidates wanted / requested / returned, dropped by the tag filter, truncated to `n_results`, and a `recall_may_be_incomplete` flag), and a WARNING is logged when the page came back full at the ceiling — including the zero-result case, which has no result to carry it.
+- **The scheduled harvest tracker only marks sessions that stored something (R7).** A session harvested with `stored==0` (e.g. the LLM chain was down and every candidate was dropped) was recorded as harvested and skipped forever. `sessions_to_track()` now returns only session ids with `stored>0`, so an empty run leaves the session pending for a later re-harvest.
+- **`get_access_patterns()` now reads `last_accessed` instead of `updated_at_iso`.** Previously, the consolidation decay system used edit timestamps instead of access timestamps to calculate memory access patterns, causing frequently-read but old memories to lose relevance protection. The function now queries `last_accessed` (Unix timestamps) without the artificial LIMIT 100, ensuring all accessed memories contribute to access pattern statistics.
+- **`GET /mcp/health` no longer discloses storage statistics to unauthenticated callers (#1305, GHSA-7w86-2vmv-fqwm, manus-pi).**
+  The MCP transport's health route returned the full `get_stats()` payload — total memory
+  count, unique tag count, recent activity, database size, embedding model and dimension,
+  storage backend class name and tool count — to any anonymous caller, in every
+  authentication mode. `MCP_ALLOW_ANONYMOUS_ACCESS` never applied, because it is evaluated
+  inside the authentication dependency the handler did not declare. GHSA-73hc-m4hx-79pj had
+  already moved this class of data behind `require_read_access` on the REST side, but that
+  fix only touched `health.py` and left the parallel MCP route open. The route stays
+  unauthenticated so liveness probes keep working without credentials; the response is now
+  `{"status": "healthy", "protocol": "mcp"}` and nothing else. Authenticated callers read the
+  statistics from `/api/health/detailed`, unchanged.
+
+### Internal
+
+- **The release-bump exemption knows about changelog fragments now.** `scripts/pr/lib/is_release_bump.py` exempts a release version bump from the quality gate's test-coverage requirement, but it matched against a fixed file list that predates the `changelog.d/` workflow below. Since then every release deletes one fragment per PR merged in the range — 14 of them for this one — and those deletions read as paths outside the release set, so the exemption never applied and the gate reported `No test files added/modified despite 1 code file(s) changed`. A `changelog.d/*.md` path is now part of the release set. The allowance is deliberately narrow: a nested path such as `changelog.d/nested/x.md` is still rejected, as is any other deleted file.
+- **Changelog entries are collected from `changelog.d/` fragments now (#1273).** A `src/` change has to leave `changelog.d/<number>.<category>.md`, checked by a CI job; `scripts/release/collect_changelog.py` merges the fragments into `[Unreleased]` at release time and deletes them. Entries used to go straight into `CHANGELOG.md`, where every open branch edited the same lines — which is why almost nobody added one: 1 of the 19 pull requests between v11.12.0 and v11.13.0 left an entry, and the other 18 were reconstructed from commit messages days later. Release version bumps and Dependabot are exempt, and the `skip-changelog` label covers the rest.
+- **The tombstone review rule no longer exempts whole functions (#1277).** `greptile.json` said the exception covered the tombstone operations "and their callers", which takes a mixed-purpose function out of scope entirely: `HybridMemoryStorage._sync_memories_from_cloudflare()` calls `is_deleted()` to skip a locally deleted memory and, in the same loop, `get_by_hash()`, which must keep filtering. The exception is now the individual call.
+- **Home Assistant setup is documented (#1282, closes #1281).**
+  Generic MCP clients such as Home Assistant only offer an OAuth prompt, so users patched the
+  authentication out of the source to connect. `docs/integration/home-assistant.md` now covers
+  `MCP_ALLOW_ANONYMOUS_ACCESS=true` with OAuth and the API key unset, the stale `Authorization`
+  header that still returns 401, and the LAN-only warning, and the README links to it.
+- **Consolidation loaded the access time of every memory ever accessed, on every run (#1291, massimiliano1991; closes #1289).**
+  `get_access_patterns()` returned the whole ever-accessed population although the decay and
+  forgetting phases only look up hashes in the current batch. It now takes an optional
+  `content_hashes` window on sqlite-vec, milvus and hybrid (`None` keeps the previous behaviour,
+  an empty window returns nothing), and the consolidator passes its candidate window down,
+  calling backends that predate the parameter with no arguments.
+- **Log-injection hygiene in `storage/milvus.py` (#1298, massimiliano1991).** The 53 `%`-style logger calls the lazy scan flagged now wrap outside data in `_sanitize_log_value`, and the module joins `GUARDED_MODULES` so the three scans enforce it. Message text unchanged.
+
+## [11.13.0] - 2026-09-19
+
+Nineteen merged pull requests in the five days after v11.12.0, most of them from outside the maintainer. Thanks to filhocf, massimiliano1991, VijaySreekar, tomatotomata and ZGN827.
+
+### Added
+
+- **Harvest provenance tagging (#1243, filhocf).** Stored insights now carry how they were produced: a `harvest:method:llm` or `harvest:method:heuristic` tag plus `harvest_method`, `harvest_model`, `harvest_pipeline_version` and `harvest_session_id` in metadata. Additive — existing tags and metadata are preserved. RFC-harvest-provenance phase 1.
+- **`verify_session_coverage` — a pre-deletion safety check for transcripts (#1252, filhocf).** Before deleting a source transcript, it re-harvests the file in memory and compares each insight against what is stored, returning `coverage`, `missing_insights`, `low_quality_matches` and `safe_to_delete`. A method on the harvester, deliberately not an MCP tool. The same change restores provenance stamping on the evolve path, which the #1243 trim had dropped.
+- **The NLI cascade reuses the harvest provider chain and says when it falls back (#1265, filhocf, follow-up to #1215).** `_llm_classify` resolves provider configuration once per run instead of per call, skips the LLM request entirely when no provider is configured, and emits one bounded, sanitized warning per run covering both the exception and the empty-response path. The heuristic label and confidence survive the fallback, so a degraded run is now visible rather than silent. Memory contents are never logged.
+
+### Fixed
+
+#### Storage and retrieval
+
+- **`get_by_hash` hid nothing on Milvus (#1262, massimiliano1991, closes #1261).** Soft-deleted rows came back from the lookup, so a re-store saw a tombstone as a live duplicate. sqlite-vec already filtered and Cloudflare was fixed in #1255; Milvus is the third backend, and it needed the lookup split rather than filtered in place, because `is_deleted()` depends on the unfiltered one.
+- **Vectorize rejected tag-filtered retrieval above 16 results (#1259, massimiliano1991).** Every Cloudflare query sets `returnMetadata="all"`, for which Vectorize caps `topK` at 50, but `retrieve()` passed `min(n_results * 3, 4096)` — 4096 being the sqlite-vec KNN ceiling, not a Vectorize one. Any `n_results >= 17` produced a 4xx and raised instead of returning results; `recall()` failed the same way above 50. Both are clamped to 50 now, and the borrowed constant is gone.
+- **Hybrid pull sync compared counts instead of diffing hashes (#1255, massimiliano1991).** Equal totals on both sides were read as "in sync", so divergent sets of equal size were read as "in sync". The pull now diffs content hashes and fetches the known-missing ones directly, instead of a paginated scan that could abandon an old cloud-only memory behind `HYBRID_MAX_EMPTY_BATCHES` of shared ones and still report success. The same change stops `CloudflareStorage.get_by_hash` resurfacing soft-deleted rows; the guard that was supposed to catch that in hybrid could never fire, because `Memory` carries no `deleted_at` field.
+
+#### Configuration and quality
+
+- **OpenAI-compatible quality scoring now uses a larger bounded input window and tolerates common wrapped score responses (#1267, VijaySreekar, closes #1102).** The endpoint scorer receives roughly 2,000 characters instead of 500, closer to the local ranker's 512-token input window, while other prompt users retain the existing 500-character default. Responses such as `Score: 0.7`, fenced numeric output, and a trailing period are parsed without discarding the AI score.
+- **An intuitive but wrong env-var name no longer lands the database somewhere unexpected (#1253, filhocf).** Only `MCP_MEMORY_SQLITE_PATH` and `MCP_MEMORY_SQLITEVEC_PATH` are read; something like `MCP_MEMORY_DB_PATH` was ignored without a word and the service fell back to the default path. When falling back, it now warns once — naming the variable it saw and the one it wanted — but only if no recognized path variable is set. The variable name is sanitized before it reaches the log.
+
+#### CI and release gates
+
+- **Release version bumps no longer block on the test gates (#1250, filhocf, closes #1247).** A bump touches `_version.py` and `pyproject.toml` and adds no test, which is exactly what check 3 and the prove-fix gate are built to reject. Both now detect a version-bump diff and exempt it, so a release PR stops needing a manual override.
+
+### Internal
+
+- **The five Greptile findings the v11.12.0 merges went over (#1249).** Including a stale `og:description` on the landing page and the dropped empty `## [Unreleased]` heading. The review comments had been there; the merge read the check buckets instead.
+- **Greptile now reviews against this repository's rules (#1271).** `greptile.json` carries six of them, each tied to a mistake that actually happened: reading a file mode out of a diff header, `metadata.get('tags')` on a `Memory` instance, unwrapped user values in logger f-strings, reads that ignore the `deleted_at` tombstone, issue numbers below #341 that belong to Codeberg, and complexity findings on functions a diff never touched. Four of the six ask for more findings, not fewer.
+- **Coverage omit lists no longer name deleted modules (#1263, tomatotomata, closes #1260).** `utils/http_server_manager.py` and `utils/port_detection.py` went out with #1161 and #1228; their exclusions stayed. What surfaced underneath is tracked in #1269: coverage.py reads `.coveragerc` and stops, so the `[tool.coverage.run]` list in `pyproject.toml` is never read at all, which is how the two drifted apart.
+- **Dependency bumps.** Seven uv-group updates including mcp 1.30.0, transformers 5.17.0 and huggingface-hub 1.31.0 (#1257); `codeql-action` init and analyze to 4.38.0 in one commit, as they have to move together (#1256); and anyio 4.14.2 (#1268).
+- **Documentation.** The `skip-prove-fix` label needs a new event rather than a re-run — a re-run replays the original payload, so the label the PR carried when the event fired is the one the job sees, measured on #1262 (#1266); Greptile auto-approves maintainer pull requests only (#1251); the ProtectMain description corrected, including the strict status-check rule the directive had described backwards (#1248); and `check_dead_refs.sh` documented as what it is since #1162, a CI step, rather than a gate wired nowhere (#1270, ZGN827).
+
 ## [11.12.0] - 2026-09-14
 
 The first release since development moved back to GitHub: 73 merged pull requests, 43 of them from outside the maintainer. Thanks to filhocf, massimiliano1991, be-student (eunwoo song), zsxh1990, DivyamTalwar, VijaySreekar, dchaudhari7177, breken-ai, LouisDeconinck, chiranjeevi7777, TonMtt, mikemikimike, danielle060821, ikorfale, L4XB, 2160039878-cyber, 7487, FBISiri and timkjr. The last two carried over from pull requests opened on Codeberg before the move.

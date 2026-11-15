@@ -30,6 +30,7 @@ import time
 from collections import deque
 from unittest.mock import MagicMock, call, patch
 
+import psutil
 from click import Command
 from click.testing import CliRunner
 
@@ -196,7 +197,8 @@ def test_stop_refuses_to_kill_foreign_listener_without_force(monkeypatch, tmp_pa
 
         assert result.exit_code != 0
         assert str(proc.pid) in result.output
-        assert sys.executable in result.output
+        # Framework builds on macOS can expose a different path in argv[0].
+        assert psutil.Process(proc.pid).cmdline()[0] in result.output
         assert "Refusing to stop" in result.output
         assert "--force" in result.output
         assert proc.poll() is None
@@ -267,6 +269,24 @@ def test_stop_does_not_kill_pid_file_process_on_different_port(monkeypatch, tmp_
     assert result.exit_code != 0, result.output
     assert "Refusing to stop PID 9876" in result.output
     kill_process.assert_not_called()
+
+
+def test_stop_returns_true_when_nothing_is_running(monkeypatch, tmp_path):
+    """Only a refusal returns False; restart() launches on anything else."""
+    port = _unused_local_port()
+    monkeypatch.setattr(lifecycle, "_pid_file", lambda: tmp_path / "server.pid")
+    monkeypatch.setattr(lifecycle, "_read_pid", lambda: None)
+    monkeypatch.setattr(lifecycle, "_find_process_on_port", lambda value: None)
+    monkeypatch.setattr(
+        lifecycle, "_probe_health", lambda *args, **kwargs: (None, False)
+    )
+
+    result = CliRunner().invoke(
+        lifecycle.stop, ["--port", str(port)], standalone_mode=False
+    )
+
+    assert result.return_value is True, result.output
+    assert "Server is not running." in result.output
 
 
 def test_stop_stops_pid_file_process_when_recorded_port_matches(monkeypatch, tmp_path):

@@ -7,14 +7,14 @@
     "test": "mocha test_http_mcp_bridge.js --reporter spec",
     "test:watch": "mocha test_http_mcp_bridge.js --reporter spec --watch"
   },
-  "dependencies": {
+  "devDependencies": {
     "mocha": "^10.0.0",
     "sinon": "^17.0.0"
   },
-  "devDependencies": {},
   "overrides": {
-    "brace-expansion": "^5.0.9",
-    "minimatch": "^10.2.3",
+    "brace-expansion": "^5.0.12",
+    "glob": "^14.0.3",
+    "minimatch": "^11.0.1",
     "serialize-javascript": "^7.0.3"
   },
   "keywords": ["mcp", "bridge", "testing"],

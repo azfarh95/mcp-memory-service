@@ -6,7 +6,7 @@
 
 Migration support depends on which backend you are moving between. See:
 
-- **[ChromaDB → SQLite-vec / Hybrid / Cloudflare](../guides/chromadb-migration.md)** — Historical migration path for users still running the legacy `chromadb-legacy` branch
+- **[ChromaDB → SQLite-vec / Hybrid / Cloudflare](../guides/chromadb-migration.md)** — Historical migration path for users still running the legacy `chromadb-legacy-final` tag (v7.6.0)
 - **[Storage Backends Guide](../guides/STORAGE_BACKENDS.md)** — Choosing between SQLite-vec, Cloudflare, and Hybrid
 - **[Cloudflare Setup](../cloudflare-setup.md)** — Moving from SQLite-vec to Cloudflare / Hybrid
 
@@ -27,4 +27,4 @@ ls scripts/maintenance/
 | **SQLite-vec** | Development / single-user / air-gapped | [sqlite-vec-backend.md](../sqlite-vec-backend.md) |
 | **Cloudflare** | Cloud-only / edge deployment | [cloudflare-setup.md](../cloudflare-setup.md) |
 
-If you are looking for the old ChromaDB-centric migration script, see the [`chromadb-legacy`](https://github.com/doobidoo/mcp-memory-service/tree/chromadb-legacy) branch.
+If you are looking for the old ChromaDB-centric migration script, see the [`chromadb-legacy-final`](https://github.com/doobidoo/mcp-memory-service/tree/chromadb-legacy-final) tag.

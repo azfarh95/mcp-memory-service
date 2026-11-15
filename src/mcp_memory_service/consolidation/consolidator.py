@@ -14,7 +14,8 @@
 
 """Main dream-inspired consolidation orchestrator."""
 
-from typing import List, Dict, Any, Optional, Protocol, Tuple
+import inspect
+from typing import List, Dict, Any, Optional, Protocol, Sequence, Tuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import asyncio
@@ -22,28 +23,72 @@ import logging
 import time
 
 from .base import ConsolidationConfig, ConsolidationReport, ConsolidationError
-from .decay import ExponentialDecayCalculator
+from .decay import ExponentialDecayCalculator, RelevanceScore
 from .associations import CreativeAssociationEngine
 from .clustering import SemanticClusteringEngine
 from .compression import SemanticCompressionEngine
 from .forgetting import ControlledForgettingEngine
 from .health import ConsolidationHealthMonitor
-from ..models.memory import Memory
+from ..models.memory import Memory, MemoryQueryResult
 from ..storage.graph import GraphStorage
-from ..config import GRAPH_STORAGE_MODE, CONSOLIDATION_STORE_ASSOCIATIONS, TYPED_EDGES_ENABLED
-from .relationship_inference import RelationshipInferenceEngine
+from ..config import (
+    GRAPH_STORAGE_MODE,
+    CONSOLIDATION_AUTO_SUPERSEDE,
+    CONSOLIDATION_STORE_ASSOCIATIONS,
+    TYPED_EDGES_ENABLED,
+)
+from .relationship_inference import (
+    DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_MIN_TYPED_CONFIDENCE,
+    DEFAULT_MIN_TYPED_SIMILARITY,
+    RelationshipInferenceEngine,
+    apply_review_band,
+)
 from .run_tracker import RunTracker
 from ..compat import _sanitize_log_value
+from ..utils.time_parser import memory_statement_time
 
 logger = logging.getLogger(__name__)
 
 
+def _said_at(memory: Memory) -> float:
+    """When a memory was said (see memory_statement_time), 0.0 if unknown (#1858)."""
+    return memory_statement_time(memory) or 0.0
+
+
+def _supersede_pair(source: Memory, target: Memory) -> Tuple[str, str]:
+    """``(newer_hash, older_hash)`` for a contradicts pair; a tie keeps the source.
+
+    Ordered by statement time, not ingest time: a session harvested late must not
+    win against what was said after it (#1858).
+    """
+    if _said_at(source) >= _said_at(target):
+        return source.content_hash, target.content_hash
+    return target.content_hash, source.content_hash
+
+
 # Protocol for storage backend interface
 class StorageProtocol(Protocol):
-    async def get_all_memories(self) -> List[Memory]: pass
+    async def get_all_memories(
+        self, memory_type: Optional[str] = None
+    ) -> List[Memory]: pass
     async def get_memories_by_time_range(
-        self, start_time: float, end_time: float
+        self, start_time: float, end_time: float, include_embeddings: bool = False
     ) -> List[Memory]:
+        pass
+
+    async def get_by_hash(self, content_hash: str) -> Optional[Memory]:
+        pass
+
+    async def count_all_memories(
+        self,
+        memory_type: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        tag_match: str = "any",
+        stale_days: Optional[int] = None,
+        store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
+    ) -> int:
         pass
 
     async def search_by_tag(
@@ -51,19 +96,79 @@ class StorageProtocol(Protocol):
     ) -> List[Memory]:
         pass
 
-    async def store(self, memory: Memory) -> Tuple[bool, str]:
+    async def store(
+        self, memory: Memory, skip_semantic_dedup: bool = False
+    ) -> Tuple[bool, str]:
+        pass
+
+    async def store_batch(self, memories: List[Memory]) -> List[Tuple[bool, str]]:
+        pass
+
+    async def retrieve(
+        self,
+        query: str,
+        n_results: int = 5,
+        tags: Optional[List[str]] = None,
+        min_confidence: float = 0.0,
+        include_superseded: bool = False,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+    ) -> List[MemoryQueryResult]:
+        pass
+
+    async def search_memories(
+        self,
+        query: Optional[str] = None,
+        mode: str = "semantic",
+        time_expr: Optional[str] = None,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        tag_match: str = "any",
+        quality_boost: float = 0.0,
+        limit: int = 10,
+        include_debug: bool = False,
+        include_superseded: bool = False,
+        ranking_weights: Optional[Dict[str, float]] = None,
+        store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         pass
 
     async def update_memory(self, memory: Memory) -> bool:
         pass
 
+    async def update_memories_batch(
+        self, memories: List[Memory], preserve_timestamps: bool = False
+    ) -> List[bool]:
+        pass
+
+    async def update_memory_metadata(
+        self,
+        content_hash: str,
+        updates: Dict[str, Any],
+        preserve_timestamps: bool = True,
+    ) -> Tuple[bool, str]:
+        pass
+
+    async def mark_superseded_batch(self, pairs: List[Tuple[str, str]]) -> int:
+        pass
+
+    async def get_stats(self) -> Dict[str, Any]:
+        pass
+
     async def delete_memory(self, content_hash: str) -> bool:
+        pass
+
+    async def delete(self, content_hash: str) -> Tuple[bool, str]:
         pass
 
     async def get_memory_connections(self) -> Dict[str, int]:
         pass
 
-    async def get_access_patterns(self) -> Dict[str, datetime]:
+    async def get_access_patterns(
+        self, content_hashes: Optional[Sequence[str]] = None
+    ) -> Dict[str, datetime]:
         pass
 
 
@@ -160,7 +265,9 @@ class DreamInspiredConsolidator:
         self.compression_engine = SemanticCompressionEngine(config)
         self.forgetting_engine = ControlledForgettingEngine(config)
         self.relationship_inference = RelationshipInferenceEngine(
-            min_confidence=getattr(config, "relationship_confidence_threshold", 0.6),
+            min_confidence=DEFAULT_MIN_CONFIDENCE,
+            min_typed_confidence=DEFAULT_MIN_TYPED_CONFIDENCE,
+            min_typed_similarity=DEFAULT_MIN_TYPED_SIMILARITY,
             typed_edges_enabled=TYPED_EDGES_ENABLED,
         )
 
@@ -249,7 +356,13 @@ class DreamInspiredConsolidator:
             self.graph_storage = None
 
     def _resolve_tracker_db_path(self) -> Optional[Path]:
-        """Resolve path for the run tracker SQLite DB (next to main memory DB)."""
+        """Resolve path for the run tracker SQLite DB (next to main memory DB).
+
+        The tracker is always SQLite regardless of the memory backend — it only
+        records run watermarks. Returning None disables it, which silently
+        pins incremental consolidation to its 24h bootstrap window forever, so
+        every backend needs a resolvable location.
+        """
         db_path = None
         if hasattr(self.storage, "primary") and hasattr(self.storage.primary, "db_path"):
             db_path = getattr(self.storage.primary, "db_path", None)
@@ -257,6 +370,21 @@ class DreamInspiredConsolidator:
             db_path = getattr(self.storage, "db_path", None)
         if isinstance(db_path, (str, Path)):
             return Path(db_path).parent / "consolidation_runs.db"
+
+        # Milvus Lite: co-locate with the local Milvus file.
+        lite_path = getattr(self.storage, "lite_db_path", None)
+        if isinstance(lite_path, (str, Path)):
+            return Path(lite_path).parent / "consolidation_runs.db"
+
+        # Remote backends (Milvus server, Zilliz, Cloudflare) have no local
+        # data file — fall back to the configured base directory so the
+        # watermark still persists across runs.
+        try:
+            from ..config import BASE_DIR
+            if BASE_DIR:
+                return Path(BASE_DIR) / "consolidation_runs.db"
+        except Exception:  # noqa: BLE001
+            self.logger.debug("BASE_DIR unavailable for consolidation run tracker")
         return None
 
     async def consolidate(self, time_horizon: str, **kwargs) -> ConsolidationReport:
@@ -322,8 +450,15 @@ class DreamInspiredConsolidator:
 
     async def _run_relevance_phase(
         self, memories: List[Memory], time_horizon: str
-    ) -> Dict[str, float]:
-        """Phase 1/6: score memories by relevance, returning {hash: score}."""
+    ) -> List[RelevanceScore]:
+        """Phase 1/6: score memories by relevance and persist the scores.
+
+        Skipped when decay is disabled (#1354). The flag is checked here rather
+        than in :meth:`_run_phase_schedule` to keep that method's complexity down.
+        """
+        if not self.config.decay_enabled:
+            self.logger.info("Decay disabled, skipping Phase 1/6 (relevance scoring)")
+            return []
         self.logger.info(
             "📊 Phase 1/6: Calculating relevance scores for %s memories...",
             len(memories),
@@ -610,10 +745,13 @@ class DreamInspiredConsolidator:
             self.logger.info("No stale-tail candidates for forgetting")
             return []
 
+        # Forgetting needs scores even with decay off; it just must not persist them (#1354).
         forgetting_scores = await self._update_relevance_scores(
-            forgetting_candidates, time_horizon
+            forgetting_candidates, time_horizon, persist=self.config.decay_enabled
         )
-        access_patterns = await self._get_access_patterns()
+        access_patterns = await self._get_access_patterns(
+            [m.content_hash for m in forgetting_candidates]
+        )
         forgetting_results = await self.forgetting_engine.process(
             forgetting_candidates,
             forgetting_scores,
@@ -659,20 +797,24 @@ class DreamInspiredConsolidator:
         return memories
 
     async def _update_relevance_scores(
-        self, memories: List[Memory], time_horizon: str
-    ) -> List:
-        """Calculate and update relevance scores for memories."""
+        self, memories: List[Memory], time_horizon: str, persist: bool = True
+    ) -> List[RelevanceScore]:
+        """Calculate relevance scores; write them to memory metadata when *persist*."""
         # Get connection and access data
         connections = await self._get_memory_connections()
-        access_patterns = await self._get_access_patterns()
+        access_patterns = await self._get_access_patterns(
+            [m.content_hash for m in memories]
+        )
 
         # Calculate relevance scores
         relevance_scores = await self.decay_calculator.process(
             memories,
             connections=connections,
             access_patterns=access_patterns,
-            reference_time=datetime.now(),
+            reference_time=datetime.now(timezone.utc),
         )
+        if not persist:
+            return relevance_scores
 
         # Update memory metadata with relevance scores (v8.47.1 - batch optimization)
         # Collect all memories to update, then use single batch operation for 50-100x speedup
@@ -705,16 +847,78 @@ class DreamInspiredConsolidator:
             self.logger.warning("Storage backend doesn't support connection tracking")
             return {}
 
-    async def _get_access_patterns(self) -> Dict[str, datetime]:
-        """Get memory access patterns from storage."""
+    async def _get_access_patterns(
+        self, content_hashes: Optional[Sequence[str]] = None
+    ) -> Dict[str, datetime]:
+        """Get memory access patterns from storage, scoped to the candidate window.
+
+        Consumers (decay boost, forgetting) only look up hashes that are in the current
+        batch, so passing the window keeps per-run memory and latency proportional to
+        the batch instead of the whole ever-accessed population.
+
+        Backends that predate the ``content_hashes`` parameter (including third-party
+        implementations of the storage protocol) are detected by signature and called
+        with no arguments, so they keep working unchanged.
+        """
         try:
-            return await self.storage.get_access_patterns()
+            getter = self.storage.get_access_patterns
         except AttributeError:
             # Fallback if storage doesn't implement access tracking
             self.logger.warning(
                 "Storage backend doesn't support access pattern tracking"
             )
             return {}
+        try:
+            style = (
+                None if content_hashes is None
+                else self._access_window_call_style(getter)
+            )
+            if style == "keyword":
+                return await getter(content_hashes=content_hashes)
+            if style == "positional":
+                return await getter(content_hashes)
+            return await getter()
+        except AttributeError:
+            self.logger.warning(
+                "Storage backend doesn't support access pattern tracking"
+            )
+            return {}
+
+    @staticmethod
+    def _access_window_call_style(getter) -> Optional[str]:
+        """How to hand the candidate window to a backend's ``get_access_patterns``.
+
+        Returns ``"keyword"`` or ``"positional"`` when the signature can take the
+        window, and ``None`` for a backend that predates the parameter (it is then
+        called with no arguments).
+
+        Checked by signature rather than by catching ``TypeError``, so a genuine
+        ``TypeError`` raised *inside* a backend is not silently downgraded to a
+        full-population query. Accepting the window and passing it are decided
+        together: a ``**kwargs`` forwarder or a keyword-only ``content_hashes``
+        accepts it only by name, a ``*args`` forwarder or a positional-only
+        parameter only by position. Keyword is preferred whenever it binds, because
+        it cannot land on an unrelated first parameter the way a positional value can.
+        """
+        try:
+            params = inspect.signature(getter).parameters
+        except (TypeError, ValueError):
+            return None
+        named = params.get("content_hashes")
+        if named is not None:
+            if named.kind is inspect.Parameter.POSITIONAL_ONLY:
+                return "positional"
+            if named.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                return "keyword"
+        kinds = {p.kind for p in params.values()}
+        if inspect.Parameter.VAR_KEYWORD in kinds:
+            return "keyword"
+        if inspect.Parameter.VAR_POSITIONAL in kinds:
+            return "positional"
+        return None
 
     async def _get_existing_associations(self) -> set:
         """Get existing memory associations to avoid duplicates."""
@@ -878,6 +1082,7 @@ class DreamInspiredConsolidator:
                             target_timestamp=target_memory.created_at,
                             source_tags=source_memory.tags,
                             target_tags=target_memory.tags,
+                            similarity=association.similarity_score,
                         )
                         if inferred_rel != "related":
                             relationship_type = inferred_rel
@@ -890,11 +1095,18 @@ class DreamInspiredConsolidator:
                             f"Failed to infer relationship type for {source_hash[:8]} <-> {target_hash[:8]}: {e}"
                         )
 
-                # Prepare metadata
+                relationship_type, needs_review = apply_review_band(
+                    relationship_type, confidence
+                )
+
+                # Inference owns these fields, even when discovery metadata
+                # contains stale confidence or review values.
                 metadata = {
                     "discovery_method": association.discovery_method,
                     "discovery_date": association.discovery_date.isoformat(),
                     **association.metadata,
+                    "relationship_confidence": round(confidence, 3),
+                    "needs_review": needs_review,
                 }
 
                 # Store in graph table with inferred relationship type
@@ -910,19 +1122,15 @@ class DreamInspiredConsolidator:
                 if success:
                     stored_count += 1
 
-                    # Collect contradiction pairs for batch superseding (#732)
+                    # Only the top band is eligible for opt-in superseding.
+                    # Keyword-only contradictions remain review candidates.
                     if (
                         relationship_type == "contradicts"
-                        and confidence >= 0.75
+                        and not needs_review
                         and source_memory
                         and target_memory
                     ):
-                        source_ts = source_memory.created_at or 0.0
-                        target_ts = target_memory.created_at or 0.0
-                        if source_ts >= target_ts:
-                            supersede_pairs.append((source_memory.content_hash, target_memory.content_hash))
-                        else:
-                            supersede_pairs.append((target_memory.content_hash, source_memory.content_hash))
+                        supersede_pairs.append(_supersede_pair(source_memory, target_memory))
                 else:
                     failed_count += 1
 
@@ -930,20 +1138,35 @@ class DreamInspiredConsolidator:
                 failed_count += 1
                 self.logger.warning("Failed to store association in graph table: %s", _sanitize_log_value(e))
 
-        # Batch-mark superseded memories in a single transaction (#732)
-        if supersede_pairs:
-            storage = getattr(self.storage, "primary_storage", None) or self.storage
-            if hasattr(storage, 'mark_superseded_batch'):
-                marked = await storage.mark_superseded_batch(supersede_pairs)
-                self.logger.info(
-                    f"Auto-superseded {marked} memories on contradiction detection"
-                )
+        await self._auto_supersede(supersede_pairs)
 
         self.logger.info(
             f"Stored {stored_count} associations in graph table ({failed_count} failed)"
             if failed_count > 0
             else f"Stored {stored_count} associations in graph table"
         )
+
+    async def _auto_supersede(self, supersede_pairs) -> None:
+        """Batch-mark older memories from eligible top-band contradictions.
+
+        Disabled by default (MCP_CONSOLIDATION_AUTO_SUPERSEDE=false); the contradicts
+        edges are already stored at this point either way.
+        """
+        if not supersede_pairs:
+            return
+        if not CONSOLIDATION_AUTO_SUPERSEDE:
+            self.logger.info(
+                "Auto-supersede disabled: left %s contradicts pairs visible",
+                _sanitize_log_value(len(supersede_pairs)),
+            )
+            return
+        storage = getattr(self.storage, "primary_storage", None) or self.storage
+        if hasattr(storage, 'mark_superseded_batch'):
+            marked = await storage.mark_superseded_batch(supersede_pairs)
+            self.logger.info(
+                "Auto-superseded %s memories on contradiction detection",
+                _sanitize_log_value(marked),
+            )
 
     async def _handle_compression_results(self, compression_results) -> None:
         """Handle storage of compressed memories — batched for efficiency."""

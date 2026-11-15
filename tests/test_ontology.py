@@ -134,7 +134,8 @@ class TestBurst13RelationshipTypes:
     """Tests for Burst 1.3: Relationship Types Definition"""
 
     def test_relationship_types_defined(self):
-        """Should include core Burst 1.3 types plus derived_from (auto-capture / insights)."""
+        """Should include core Burst 1.3 types plus derived_from (auto-capture / insights)
+        and has_entity (entity links, a proper entry since #1897)."""
         expected_types = {
             "causes",
             "fixes",
@@ -144,6 +145,7 @@ class TestBurst13RelationshipTypes:
             "related",
             "derived_from",
             "shares_entity",
+            "has_entity",
         }
         actual_types = set(RELATIONSHIPS.keys())
         assert actual_types == expected_types
@@ -470,6 +472,24 @@ class TestBurst21CustomMemoryTypeConfiguration:
         """Clear caches and environment after each test."""        # Remove any custom types from environment
         os.environ.pop('MCP_CUSTOM_MEMORY_TYPES', None)
         ontology.clear_ontology_caches()
+
+    def test_custom_subtypes_do_not_leak_into_builtin_taxonomy(self, monkeypatch):
+        """Merging custom subtypes must not extend the TAXONOMY lists in place.
+
+        A shallow dict copy shared the subtype lists, so a custom subtype stayed
+        valid after the env var was removed and the caches were cleared.
+        """
+        snapshot = {base: list(subtypes) for base, subtypes in ontology.TAXONOMY.items()}
+
+        monkeypatch.setenv('MCP_CUSTOM_MEMORY_TYPES', json.dumps({"observation": ["leaky_subtype"]}))
+        ontology.clear_ontology_caches()
+        assert ontology.validate_memory_type("leaky_subtype")
+
+        monkeypatch.delenv('MCP_CUSTOM_MEMORY_TYPES')
+        ontology.clear_ontology_caches()
+
+        assert ontology.TAXONOMY == snapshot
+        assert not ontology.validate_memory_type("leaky_subtype")
 
     def test_load_custom_types_json(self, monkeypatch):
         """Test loading custom types from JSON environment variable."""

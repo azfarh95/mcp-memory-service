@@ -2,6 +2,8 @@
 import os
 import logging
 
+from ..compat import _sanitize_log_value
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -18,10 +20,14 @@ GRAPH_STORAGE_MODE = os.getenv('MCP_GRAPH_STORAGE_MODE', 'dual_write').lower()
 # Validate graph storage mode
 VALID_GRAPH_MODES = ['memories_only', 'dual_write', 'graph_only']
 if GRAPH_STORAGE_MODE not in VALID_GRAPH_MODES:
-    logger.warning(f"Invalid graph storage mode: {GRAPH_STORAGE_MODE}, must be one of {VALID_GRAPH_MODES}. Using default 'dual_write'")
+    logger.warning(
+        "Invalid graph storage mode: %s, must be one of %s. Using default 'dual_write'",
+        _sanitize_log_value(GRAPH_STORAGE_MODE),
+        VALID_GRAPH_MODES,
+    )
     GRAPH_STORAGE_MODE = 'dual_write'
 
-logger.info(f"Graph Storage Mode: {GRAPH_STORAGE_MODE}")
+logger.info("Graph Storage Mode: %s", GRAPH_STORAGE_MODE)
 
 # Whether consolidation should write association entries to the memories table.
 # Associations are already stored in memory_graph (the structured store).
@@ -30,16 +36,29 @@ logger.info(f"Graph Storage Mode: {GRAPH_STORAGE_MODE}")
 CONSOLIDATION_STORE_ASSOCIATIONS = os.getenv(
     'MCP_CONSOLIDATION_STORE_ASSOCIATIONS', 'true'
 ).lower() == 'true'
-logger.info(f"Consolidation store associations in memories table: {CONSOLIDATION_STORE_ASSOCIATIONS}")
+logger.info("Consolidation store associations in memories table: %s", CONSOLIDATION_STORE_ASSOCIATIONS)
+
+# Whether consolidation supersedes the older memory of a pair that relationship
+# inference labels "contradicts" in the top confidence band, which hides it
+# from default retrieval. Review-band edges never trigger supersession.
+# Default: false until a dedicated contradiction judge is selected and validated
+# (#1460). Keyword evidence alone must not hide memories.
+CONSOLIDATION_AUTO_SUPERSEDE = os.getenv(
+    'MCP_CONSOLIDATION_AUTO_SUPERSEDE', 'false'
+).lower() == 'true'
+logger.info("Consolidation auto-supersede on contradicts edges: %s", CONSOLIDATION_AUTO_SUPERSEDE)
 
 # Whether the RelationshipInferenceEngine assigns typed edges (fixes, causes,
-# contradicts, etc.) during consolidation. Set to false to keep all inferred
-# edges as "related", avoiding false-positive typed labels.
-# Default: true for backward compatibility.
+# contradicts, etc.) during consolidation. When false, inferred edges are kept
+# as "related".
+# Default: false (#1883). Today's typed labels come from the pair of memory
+# types, not from what the two memories say: hand-checked samples from three
+# stores found 0 of 139 typed edges correct. Set MCP_TYPED_EDGES_ENABLED=true
+# to keep typed labels (the #1457 gates still apply).
 TYPED_EDGES_ENABLED = os.getenv(
-    'MCP_TYPED_EDGES_ENABLED', 'true'
+    'MCP_TYPED_EDGES_ENABLED', 'false'
 ).lower() == 'true'
-logger.info(f"Typed edge inference enabled: {TYPED_EDGES_ENABLED}")
+logger.info("Typed edge inference enabled: %s", TYPED_EDGES_ENABLED)
 
 # =============================================================================
 # End Graph Database Configuration
