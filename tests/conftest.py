@@ -67,6 +67,21 @@ for _dimension_var in (
         print(f"[Test Safety] Ignoring host {_dimension_var} so the embedding dimension is deterministic")
         del os.environ[_dimension_var]
 
+# Voyage is the production-default embedding backend, but it is a cloud API: the
+# test harness is deterministic and offline, so force the local backend and scrub
+# ambient Voyage settings. Tests that exercise the voyage/parallel paths set
+# these explicitly via monkeypatch (the ladder reads the env at initialize time;
+# the factory reads the config module attributes at call time).
+for _voyage_var in (
+    'MCP_MEMORY_EMBED_BACKEND',
+    'MCP_MEMORY_PARALLEL_INDEX',
+    'MCP_VOYAGE_API_KEY',
+    'MCP_VOYAGE_MODEL',
+    'MCP_VOYAGE_OUTPUT_DIM',
+):
+    os.environ.pop(_voyage_var, None)
+os.environ['MCP_MEMORY_EMBED_BACKEND'] = 'local'
+
 # CRITICAL: Force sqlite_vec backend for tests to prevent accidental Cloudflare operations
 # This prevents tests from soft-deleting production memories in Cloudflare D1
 #
