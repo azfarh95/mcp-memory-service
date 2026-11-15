@@ -32,6 +32,7 @@ _MAX_TAGS_FOR_SEARCH = 100
 # hold value -> loop -> key and never collect (review round 5). Lifetime now
 # follows the loop exactly.
 _EMBED_SEMAPHORE_LIMIT = 4
+_FALLBACK_EMBED_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
 
 def _embed_semaphore() -> asyncio.Semaphore:
@@ -39,7 +40,17 @@ def _embed_semaphore() -> asyncio.Semaphore:
     sem = getattr(loop, "_memory_embed_semaphore", None)
     if sem is None:
         sem = asyncio.Semaphore(_EMBED_SEMAPHORE_LIMIT)
-        loop._memory_embed_semaphore = sem
+        try:
+            loop._memory_embed_semaphore = sem
+        except AttributeError:
+            # A loop implementation without a __dict__ (e.g. uvloop). Fall back to
+            # a module-level single semaphore: correct on the single-loop servers
+            # this service runs, and never raises inside retrieve's except (which
+            # would degrade every search to a silent []).
+            global _FALLBACK_EMBED_SEMAPHORE
+            if _FALLBACK_EMBED_SEMAPHORE is None:
+                _FALLBACK_EMBED_SEMAPHORE = sem
+            sem = _FALLBACK_EMBED_SEMAPHORE
     return sem
 
 

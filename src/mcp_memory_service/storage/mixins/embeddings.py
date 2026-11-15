@@ -209,7 +209,8 @@ class EmbeddingsMixin:
                         raise RuntimeError(
                             "Voyage embedding backend was selected but no API key is available "
                             "now (one was present when this store was constructed). Set "
-                            "MCP_VOYAGE_API_KEY or the keyring entry, or set "
+                            "MCP_VOYAGE_API_KEY, or the keyring entry named by "
+                            "MCP_VOYAGE_KEYRING_SERVICE/MCP_VOYAGE_KEYRING_USERNAME, or set "
                             "MCP_MEMORY_EMBED_BACKEND=local."
                         )
                 except ImportError as e:

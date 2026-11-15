@@ -199,6 +199,10 @@ def main() -> None:
             "AND deleted_at IS NULL",
             tuple(chunk),
         ).fetchall()
+        if not batch:
+            # Rows can be soft-deleted between the id scan and this fetch; never
+            # hand the API a zero-input batch (review round 6).
+            continue
         if not embed_and_store(voyage_conn, model, batch):
             failures += len(batch)
             print("  stopping after the first failed batch — rerun to resume")
