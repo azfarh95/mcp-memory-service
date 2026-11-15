@@ -80,6 +80,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Max rows to embed this run")
     parser.add_argument("--dry-run", action="store_true", help="Report counts only")
     args = parser.parse_args()
+    if args.batch_size < 1:
+        raise SystemExit("--batch-size must be >= 1")
 
     local_path, voyage_path = default_db_paths()
     local_path = args.local or local_path
@@ -193,7 +195,9 @@ def main() -> None:
         chunk = todo_ids[start : start + args.batch_size]
         placeholders = ",".join("?" * len(chunk))
         batch = voyage_conn.execute(
-            f"SELECT rowid, content FROM memories WHERE rowid IN ({placeholders})", tuple(chunk)
+            f"SELECT rowid, content FROM memories WHERE rowid IN ({placeholders}) "
+            "AND deleted_at IS NULL",
+            tuple(chunk),
         ).fetchall()
         if not embed_and_store(voyage_conn, model, batch):
             failures += len(batch)

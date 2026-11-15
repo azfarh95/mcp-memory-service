@@ -332,3 +332,23 @@ async def test_initialize_initializes_both():
     await wrapper.initialize()
     assert "initialize" in primary.calls
     assert "initialize" in secondary.calls
+
+
+@pytest.mark.asyncio
+async def test_pinned_voyage_without_key_fails_at_construction(tmp_path, monkeypatch):
+    """The parallel wrapper builds its primary with embed_backend='voyage'. If the
+    key is absent that MUST raise at init rather than silently run a 384-dim local
+    model against a 1024-dim voyage file (round-5 reviewer asked for this proof).
+
+    The keyring target is a config constant read at import time, so it is patched on
+    the config module: monkeypatch.setenv would never reach it, which is why the
+    first version of this test passed without exercising the raise.
+    """
+    from mcp_memory_service.config import embedding as emb_cfg
+    from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
+
+    monkeypatch.delenv("MCP_VOYAGE_API_KEY", raising=False)
+    monkeypatch.setattr(emb_cfg, "VOYAGE_KEYRING_USERNAME", "definitely-not-a-real-key")
+    storage = SqliteVecMemoryStorage(str(tmp_path / "voyage.db"), embed_backend="voyage")
+    with pytest.raises(RuntimeError, match="no API key"):
+        await storage.initialize()

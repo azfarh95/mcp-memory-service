@@ -7,7 +7,6 @@ import os
 import time
 import traceback
 import asyncio
-import weakref
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Set
@@ -28,17 +27,19 @@ _MAX_TAGS_FOR_SEARCH = 100
 
 # Bounds concurrent embedding work handed to worker threads. Local encode is
 # GIL-bound and Voyage is rate-limited, so a cap helps rather than hurts.
-# Keyed by running loop: a module-global Semaphore binds to the first loop that
-# awaits it, and a second loop then raises inside retrieve's except -> silent [].
-_EMBED_SEMAPHORES: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+# Attached TO the loop rather than held in a module dict: a Semaphore caches a
+# strong ref to its loop on first use, so a WeakKeyDictionary keyed by loop would
+# hold value -> loop -> key and never collect (review round 5). Lifetime now
+# follows the loop exactly.
+_EMBED_SEMAPHORE_LIMIT = 4
 
 
 def _embed_semaphore() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
-    sem = _EMBED_SEMAPHORES.get(loop)
+    sem = getattr(loop, "_memory_embed_semaphore", None)
     if sem is None:
-        sem = asyncio.Semaphore(4)
-        _EMBED_SEMAPHORES[loop] = sem
+        sem = asyncio.Semaphore(_EMBED_SEMAPHORE_LIMIT)
+        loop._memory_embed_semaphore = sem
     return sem
 
 
