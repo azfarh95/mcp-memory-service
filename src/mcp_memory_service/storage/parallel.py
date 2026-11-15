@@ -28,7 +28,7 @@ vector spaces can never share a table. This wrapper keeps BOTH indexes live:
   which always holds the complete memory set.
 - **Deletes/updates** apply to both.
 
-Anything not explicitly overridden is delegated to the primary via
+Anything not explicitly overridden is delegated to the SECONDARY via
 ``__getattr__`` (the primary and secondary are both full
 ``SqliteVecMemoryStorage`` instances).
 """
@@ -123,9 +123,14 @@ class ParallelSqliteVecStorage:
                 pass
         return results
 
-    async def _store_secondary_only(self, memory: Memory) -> Tuple[bool, str]:
-        self._mark_embed_pending(memory)
-        return await self.secondary.store(memory, store="default")
+    def _is_embed_failure(self, message: str) -> bool:
+        """Both store paths report embedding failure in their own words: the
+        single store says 'Failed to generate embedding', store_batch says
+        'Batch embedding generation failed'. Match on the shared substring, in
+        one place, so a wording change in either cannot silently disable the
+        primary-down detection (review finding, 2026-11-15)."""
+        text = (message or "").lower()
+        return "embedding" in text and ("fail" in text or "unavailable" in text)
 
     # --------------------------------------------------------------- writes
 
@@ -138,7 +143,7 @@ class ParallelSqliteVecStorage:
         if self._primary_available():
             try:
                 primary_result = await self.primary.store(memory, skip_semantic_dedup=True, store=store)
-                if not primary_result[0] and "Failed to generate embedding" in primary_result[1]:
+                if not primary_result[0] and self._is_embed_failure(primary_result[1]):
                     self._mark_primary_down(primary_result[1])
                     await self._mark_embed_pending(memory)
             except Exception as exc:
@@ -146,13 +151,13 @@ class ParallelSqliteVecStorage:
                 await self._mark_embed_pending(memory)
         return result
 
-    async def store_batch(self, memories: List[Memory]) -> List[Tuple[bool, str]]:
-        secondary_results = await self.secondary.store_batch(memories)
+    async def store_batch(self, memories: List[Memory], store: str = 'default') -> List[Tuple[bool, str]]:
+        secondary_results = await self.secondary.store_batch(memories, store=store)
         if self._primary_available():
             try:
-                primary_results = await self.primary.store_batch(memories)
+                primary_results = await self.primary.store_batch(memories, store=store)
                 for i, (ok, msg) in enumerate(primary_results):
-                    if not ok and "Failed to generate embedding" in msg:
+                    if not ok and self._is_embed_failure(msg):
                         self._mark_primary_down(msg)
                         await self._mark_embed_pending(memories[i])
                         break
@@ -167,19 +172,30 @@ class ParallelSqliteVecStorage:
     async def retrieve(self, query: str, n_results: int = 5, **kwargs) -> List[MemoryQueryResult]:
         if self._primary_available():
             try:
-                return await self.primary.retrieve(query, n_results, **kwargs)
+                results = await self.primary.retrieve(query, n_results, **kwargs)
+                # retrieve() catches embedder failures and returns [] — an empty
+                # list alone is also a legitimate "no matches", so the child's
+                # embedding_last_error is what distinguishes an outage. Without
+                # this the fallback never fires and search silently returns
+                # nothing (review finding, 2026-11-15).
+                if results or not getattr(self.primary, "embedding_last_error", None):
+                    return results
+                self._mark_primary_down(self.primary.embedding_last_error)
             except Exception as exc:
                 self._mark_primary_down(str(exc))
         results = await self.secondary.retrieve(query, n_results, **kwargs)
         return self._flag_degraded(results)
 
-    async def recall(self, query: str, n_results: int = 5, **kwargs) -> List[Memory]:
+    async def recall(self, query: Optional[str] = None, n_results: int = 5, **kwargs) -> List[MemoryQueryResult]:
         if self._primary_available():
             try:
-                return await self.primary.recall(query, n_results, **kwargs)
+                results = await self.primary.recall(query, n_results, **kwargs)
+                if results or not getattr(self.primary, "embedding_last_error", None):
+                    return results
+                self._mark_primary_down(self.primary.embedding_last_error)
             except Exception as exc:
                 self._mark_primary_down(str(exc))
-        return await self.secondary.recall(query, n_results, **kwargs)
+        return self._flag_degraded(await self.secondary.recall(query, n_results, **kwargs))
 
     async def recall_memory(self, query: str, n_results: int = 5) -> List[Memory]:
         return await self.recall(query, n_results)
@@ -187,7 +203,10 @@ class ParallelSqliteVecStorage:
     async def search(self, query: str, n_results: int = 5) -> List[MemoryQueryResult]:
         if self._primary_available():
             try:
-                return await self.primary.search(query, n_results)
+                results = await self.primary.search(query, n_results)
+                if results or not getattr(self.primary, "embedding_last_error", None):
+                    return results
+                self._mark_primary_down(self.primary.embedding_last_error)
             except Exception as exc:
                 self._mark_primary_down(str(exc))
         return self._flag_degraded(await self.secondary.search(query, n_results))

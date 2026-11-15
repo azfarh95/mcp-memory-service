@@ -30,6 +30,8 @@ class FakeChild:
         self.backend_type = backend_type
         self.calls = []
         self.stored = []
+        self.returns_empty = False
+        self.embedding_last_error = None
         self.embed_error = None  # when set, store returns the embed-failure string
         self.retrieve_error = None
         self.db_path = f"/tmp/{name}.db"
@@ -56,25 +58,34 @@ class FakeChild:
         self.calls.append(("update_memory_metadata", content_hash, dict(updates)))
         return True, "updated"
 
-    async def store_batch(self, memories):
-        self.calls.append(("store_batch", len(memories)))
+    async def store_batch(self, memories, store='default'):
+        self.calls.append(("store_batch", store))
         if self.embed_error:
-            return [(False, f"Failed to generate embedding: {self.embed_error}")] * len(memories)
+            return [(False, f"Batch embedding generation failed: {self.embed_error}")] * len(memories)
         for m in memories:
             self.stored.append(m.content)
         return [(True, "stored")] * len(memories)
+
+    async def delete(self, content_hash):
+        self.calls.append(("delete", content_hash))
+        return True, "deleted"
 
     async def retrieve(self, query, n_results=5, **kwargs):
         self.calls.append(("retrieve", query))
         if self.retrieve_error:
             raise RuntimeError(self.retrieve_error)
+        if self.returns_empty:
+            return []
         return [FakeQueryResult(f"hit-for:{query}")]
 
     async def search(self, query, n_results=5):
         return await self.retrieve(query, n_results)
 
-    async def recall(self, query, n_results=5, **kwargs):
-        return [FakeMemory(f"recall-for:{query}")]
+    async def recall(self, query=None, n_results=5, **kwargs):
+        self.calls.append(("recall", query))
+        if self.returns_empty:
+            return []
+        return [FakeQueryResult(f"recall-for:{query}")]
 
     async def get_stats(self):
         return {"total_memories": len(self.stored), "storage_backend": f"fake-{self.name}"}
@@ -146,16 +157,66 @@ async def test_retrieve_falls_back_to_secondary_with_flag():
 
 
 @pytest.mark.asyncio
+async def test_retrieve_falls_back_when_primary_returns_empty_after_embed_error():
+    """A Voyage outage makes the mixin return [] (it catches and logs); an empty
+    list alone is also 'no matches', so the wrapper must use the child's
+    embedding_last_error to tell them apart (review finding 2026-11-15)."""
+    primary, secondary = FakeChild("primary", "fake-voyage"), FakeChild("secondary", "fake-local")
+    primary.returns_empty = True
+    primary.embedding_last_error = "voyage 503 after retries"
+    wrapper = ParallelSqliteVecStorage(primary, secondary)
+    results = await wrapper.retrieve("query text")
+    assert results[0].memory.content == "hit-for:query text"
+    assert results[0].memory.metadata.get("_degraded_backend") == "local"
+
+
+@pytest.mark.asyncio
+async def test_retrieve_empty_without_error_stays_empty():
+    """Genuine no-match must not be reported as a degraded backend."""
+    primary, secondary = FakeChild("primary", "fake-voyage"), FakeChild("secondary", "fake-local")
+    primary.returns_empty = True
+    primary.embedding_last_error = None
+    wrapper = ParallelSqliteVecStorage(primary, secondary)
+    assert await wrapper.retrieve("query text") == []
+    assert "retrieve" not in [c[0] for c in secondary.calls if c]
+
+
+@pytest.mark.asyncio
+async def test_store_batch_detects_batch_worded_embed_failure():
+    """store_batch words the failure differently ('Batch embedding generation
+    failed'); primary-down detection must not depend on the single-store wording."""
+    primary, secondary = FakeChild("primary", "fake-voyage"), FakeChild("secondary", "fake-local")
+    primary.embed_error = "voyage unreachable"
+    wrapper = ParallelSqliteVecStorage(primary, secondary)
+    await wrapper.store_batch([make_memory("one"), make_memory("two")])
+    assert wrapper.primary_last_error, "batch embed failure was not detected"
+    assert wrapper._primary_available() is False
+
+
+@pytest.mark.asyncio
+async def test_store_batch_forwards_store_partition():
+    primary, secondary = FakeChild("primary", "fake-voyage"), FakeChild("secondary", "fake-local")
+    wrapper = ParallelSqliteVecStorage(primary, secondary)
+    await wrapper.store_batch([make_memory("p")], store="work")
+    assert ("store_batch", "work") in secondary.calls
+
+
+@pytest.mark.asyncio
+async def test_recall_accepts_time_only_query():
+    """Base recall allows query=None (time-only recall); the wrapper must match."""
+    primary, secondary = FakeChild("primary", "fake-voyage"), FakeChild("secondary", "fake-local")
+    wrapper = ParallelSqliteVecStorage(primary, secondary)
+    results = await wrapper.recall(None, 5, start_timestamp=1.0)
+    assert results
+
+
+@pytest.mark.asyncio
 async def test_delete_applies_to_both():
     primary, secondary = FakeChild("primary", "fake-voyage"), FakeChild("secondary", "fake-local")
-    async def ok_delete(hash): return True, "deleted"
-    primary.delete = ok_delete
-    secondary.delete = ok_delete
     wrapper = ParallelSqliteVecStorage(primary, secondary)
     await wrapper.delete("abc123")
-    # both children got the delete (they are the patched ok_delete — verify via call log)
-    assert ("store", "abc123") not in primary.calls  # sanity
-    assert wrapper.primary_last_error is None
+    assert ("delete", "abc123") in primary.calls
+    assert ("delete", "abc123") in secondary.calls
 
 
 @pytest.mark.asyncio

@@ -127,6 +127,22 @@ class EmbeddingsMixin:
             logger.debug("Could not read embedding dimension from sqlite_master: %s", exc)
         return None
 
+    @staticmethod
+    def _voyage_key_present() -> bool:
+        """True when a Voyage key is resolvable (env or keyring), without a network call."""
+        from ...config.embedding import (
+            VOYAGE_KEYRING_SERVICE,
+            VOYAGE_KEYRING_USERNAME,
+        )
+
+        try:
+            from ...embeddings.voyage_embeddings import VoyageEmbeddingModel
+
+            return bool(VoyageEmbeddingModel._resolve_api_key(VOYAGE_KEYRING_SERVICE, VOYAGE_KEYRING_USERNAME))
+        except Exception as exc:  # keyring import/back-end trouble: treat as no key
+            logger.debug("Could not resolve Voyage key: %s", exc)
+            return False
+
     async def _initialize_embedding_model(self):
         """Initialize the embedding model (ONNX or SentenceTransformer based on configuration)."""
         global _MODEL_CACHE, _HASH_FALLBACK_WARNED
@@ -143,6 +159,36 @@ class EmbeddingsMixin:
                 getattr(self, 'embed_backend_override', None)
                 or os.environ.get('MCP_MEMORY_EMBED_BACKEND', 'voyage').strip().lower()
             )
+            if embed_backend == 'voyage':
+                try:
+                    from ...embeddings.voyage_embeddings import get_voyage_embedding_model
+                    from ...config.embedding import VOYAGE_MODEL, VOYAGE_OUTPUT_DIM
+
+                    # A keyless install must never lose semantic search on the way
+                    # in. When Voyage is merely the ambient default, fall through to
+                    # the local model with a loud warning; when an operator pinned
+                    # the backend explicitly (embed_backend_override, i.e. the
+                    # parallel primary) run it if a key exists, else raise so the
+                    # misconfiguration is visible rather than silently local.
+                    if not self._voyage_key_present():
+                        if getattr(self, 'embed_backend_override', None) == 'voyage':
+                            raise RuntimeError(
+                                "Voyage embedding backend was explicitly selected but no API key "
+                                "is available. Set MCP_VOYAGE_API_KEY or the keyring entry "
+                                "(MCP_VOYAGE_KEYRING_SERVICE/MCP_VOYAGE_KEYRING_USERNAME)."
+                            )
+                        logger.warning(
+                            "MCP_MEMORY_EMBED_BACKEND=voyage (default) but no Voyage API key is "
+                            "configured — falling back to local embeddings for this process. "
+                            "Set MCP_VOYAGE_API_KEY to enable the cloud backend, or set "
+                            "MCP_MEMORY_EMBED_BACKEND=local to make the local choice explicit."
+                        )
+                        embed_backend = 'local'
+                except ImportError as e:
+                    raise RuntimeError(
+                        f"Voyage embedding backend selected but its module failed to import: {e}"
+                    ) from e
+
             if embed_backend == 'voyage':
                 try:
                     from ...embeddings.voyage_embeddings import get_voyage_embedding_model
@@ -529,15 +575,21 @@ class EmbeddingsMixin:
         ``input_type`` (``query`` vs ``document``) only matters for asymmetric
         cloud models like Voyage; local models ignore it.
         """
+        # Callers that degrade on an embedder outage (the parallel wrapper) must
+        # be able to tell "embedder down" from "genuinely no matches": the
+        # retrieve paths catch our exception and return [], which is
+        # indistinguishable from an empty result set. Clear on success.
+        self.embedding_last_error = None
         if not self.embedding_model:
             raise RuntimeError("No embedding model available. Ensure sentence-transformers is installed and model is loaded.")
 
         try:
-            # Key by model name too: the cache is process-global and a voyage
-            # model must never be handed a MiniLM vector for the same text
-            # (or vice versa) when both run in one process (parallel index).
+            # Key by model name AND input_type: the cache is process-global, so a
+            # voyage model must never be handed a MiniLM vector for the same text,
+            # and Voyage is asymmetric — a document vector must not answer a query
+            # of identical text (review finding, 2026-11-15).
             if self.enable_cache:
-                cache_key = hash((self.embedding_model_name, text))
+                cache_key = hash((self.embedding_model_name, input_type, text))
                 if cache_key in _EMBEDDING_CACHE:
                     return _EMBEDDING_CACHE[cache_key]
 
@@ -565,5 +617,6 @@ class EmbeddingsMixin:
             return embedding_list
 
         except Exception as e:
+            self.embedding_last_error = str(e)
             logger.error(f"Failed to generate embedding: {str(e)}")
             raise RuntimeError(f"Failed to generate embedding: {str(e)}") from e

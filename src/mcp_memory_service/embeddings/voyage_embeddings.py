@@ -222,10 +222,18 @@ def get_voyage_embedding_model(
     model_name: Optional[str] = None,
     api_key: Optional[str] = None,
     output_dimension: Optional[int] = None,
+    max_retries: Optional[int] = None,
+    retry_base_delay: Optional[float] = None,
 ) -> VoyageEmbeddingModel:
     """Factory mirroring get_external_embedding_model / get_onnx_embedding_model."""
+    kwargs = {}
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    if retry_base_delay is not None:
+        kwargs["retry_base_delay"] = retry_base_delay
     return VoyageEmbeddingModel(
         model_name=model_name,
         api_key=api_key,
         output_dimension=output_dimension,
+        **kwargs,
     )

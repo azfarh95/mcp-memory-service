@@ -95,14 +95,43 @@ def main() -> None:
     voyage_conn.enable_load_extension(False)
 
     model = VoyageEmbeddingModel(max_retries=8, retry_base_delay=5.0)
+    if args.dry_run:
+        # DDL autocommits in sqlite3, so a "dry" run that created the schema
+        # would still leave a DB file behind. Report what exists instead.
+        print(f"Local DB: {local_path}")
+        print(f"Voyage DB: {voyage_path} ({'exists' if os.path.exists(voyage_path) else 'would be created'})")
+        if os.path.exists(voyage_path):
+            try:
+                todo = voyage_conn.execute(
+                    """SELECT COUNT(*) FROM memories m
+                       WHERE m.deleted_at IS NULL
+                         AND NOT EXISTS (SELECT 1 FROM memory_embeddings me WHERE me.rowid = m.rowid)"""
+                ).fetchone()[0]
+                print(f"Voyage rows missing embeddings: {todo}")
+            except sqlite3.Error as exc:
+                print(f"Voyage DB not yet initialised: {exc}")
+        return
     ensure_voyage_schema(local_conn, voyage_conn, model.embedding_dimension, args.dry_run)
 
     # 1. Sync memory rows that exist only in the local DB (outage-time writes).
     local_hashes = {r[0] for r in local_conn.execute("SELECT content_hash FROM memories WHERE deleted_at IS NULL")}
     voyage_hashes = {r[0] for r in voyage_conn.execute("SELECT content_hash FROM memories WHERE deleted_at IS NULL")}
     missing = local_hashes - voyage_hashes
-    print(f"Rows only in local DB (to copy): {len(missing)}")
-    if missing and not args.dry_run:
+    # Bulk-copy rows missing from the voyage index. deleted_at is copied too, so a
+    # memory soft-deleted while the primary was down does not resurrect there.
+    live_local_hashes = {
+        r[0] for r in local_conn.execute("SELECT content_hash FROM memories WHERE deleted_at IS NULL")
+    }
+    stale = [h for h in voyage_hashes if h not in live_local_hashes]
+    if stale:
+        print(f"Rows deleted locally but live in the voyage index (to soft-delete): {len(stale)}")
+        now = time.time()
+        voyage_conn.executemany(
+            "UPDATE memories SET deleted_at = ? WHERE content_hash = ?",
+            [(now, h) for h in stale],
+        )
+        voyage_conn.commit()
+    if missing:
         placeholders = ",".join("?" * len(missing))
         rows = local_conn.execute(
             f"SELECT * FROM memories WHERE content_hash IN ({placeholders})", tuple(missing)
@@ -139,6 +168,8 @@ def main() -> None:
         if len(batch) >= args.batch_size:
             if not embed_and_store(voyage_conn, model, batch):
                 failures += len(batch)
+                print("  stopping after the first failed batch — rerun to resume")
+                break
             else:
                 done += len(batch)
                 rate = done / max(time.time() - t0, 0.001)
@@ -159,7 +190,7 @@ def embed_and_store(conn: sqlite3.Connection, model: VoyageEmbeddingModel, batch
     """Embed one batch of (rowid, content) and write vectors; commit on success."""
     try:
         vectors = model.encode([c for _, c in batch], convert_to_numpy=True, input_type="document")
-    except RuntimeError as exc:
+    except Exception as exc:  # RuntimeError from the adapter, sqlite3 errors from the write
         print(f"  batch failed ({exc}); committing progress and stopping — rerun to resume")
         conn.commit()
         return False
