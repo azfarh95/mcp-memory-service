@@ -55,13 +55,27 @@ class BaseMixin:
         """SQLite-vec backend supports content chunking with metadata linking."""
         return True
 
-    def __init__(self, db_path: str, embedding_model: str = "all-MiniLM-L6-v2"):
-        """Initialize SQLite-vec storage."""
+    def __init__(self, db_path: str, embedding_model: str = "all-MiniLM-L6-v2", embed_backend: str = None):
+        """Initialize SQLite-vec storage.
+
+        Args:
+            db_path: SQLite database file path.
+            embedding_model: Local model name (ONNX/SentenceTransformer path).
+            embed_backend: Force an embedding backend ('voyage' or 'local') for this
+                instance, overriding MCP_MEMORY_EMBED_BACKEND. Used by the parallel
+                index to run one voyage and one local instance in a single process.
+        """
         self.db_path = db_path
         self.embedding_model_name = embedding_model
+        self.embed_backend_override = embed_backend
         self.conn = None
         self.embedding_model = None
         self.embedding_dimension = 384  # Default for all-MiniLM-L6-v2
+        # Failure signal for callers that must distinguish "embedder down" from
+        # "no matches": a monotonic counter (survives a concurrent success
+        # clearing the message) plus the latest message.
+        self.embedding_failure_count = 0
+        self.embedding_last_error = None
         self._initialized = False
 
         self._savepoint_lock = asyncio.Lock()

@@ -20,6 +20,7 @@ eliminating code duplication between the MCP server and web interface initializa
 """
 
 import logging
+import os
 from typing import Type
 
 from .base import MemoryStorage
@@ -125,11 +126,72 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
 
     # Create storage instance based on backend type
     if StorageClass.__name__ == "SqliteVecMemoryStorage":
-        storage = StorageClass(
-            db_path=sqlite_path,
-            embedding_model=EMBEDDING_MODEL_NAME
-        )
-        logger.info(f"Initialized SQLite-vec storage at {sqlite_path}")
+        from ..config import EMBED_BACKEND, PARALLEL_INDEX, VOYAGE_DATABASE_PATH
+
+        if EMBED_BACKEND == "voyage":
+            # Voyage is the default, but it is a cloud API that needs a key. Decide
+            # ONCE, via the shared resolver that every construction site uses, so a
+            # keyless install degrades identically whether it comes through this
+            # factory or a direct SqliteVecMemoryStorage() call.
+            from .mixins.embeddings import EmbeddingsMixin
+
+            effective_backend, reason = EmbeddingsMixin.resolve_embed_backend(sqlite_path)
+
+            if effective_backend == "voyage" and reason == "key" and PARALLEL_INDEX and VOYAGE_DATABASE_PATH:
+                # Parallel index: Voyage primary (own file — 1024-dim vectors can never
+                # share a table with MiniLM's 384) + the classic local index as the
+                # always-available fallback and source of truth for non-embedding reads.
+                from .parallel import ParallelSqliteVecStorage
+
+                primary = StorageClass(
+                    db_path=VOYAGE_DATABASE_PATH,
+                    embedding_model=EMBEDDING_MODEL_NAME,
+                    embed_backend="voyage",
+                )
+                secondary = StorageClass(
+                    db_path=sqlite_path,
+                    embedding_model=EMBEDDING_MODEL_NAME,
+                    embed_backend="local",
+                )
+                storage = ParallelSqliteVecStorage(primary=primary, secondary=secondary)
+                logger.info(
+                    f"Initialized parallel SQLite-vec storage: voyage at {VOYAGE_DATABASE_PATH} "
+                    f"(primary) + local at {sqlite_path} (fallback)"
+                )
+            elif reason == "explicit-no-key":
+                # The operator asked for Voyage by name. Honour that literally so the
+                # misconfiguration is visible instead of silently running local. Point
+                # at the voyage file: sqlite_path holds a 384-dim vec table, so putting
+                # a 1024-dim model there is a dimension clash, not an actionable error.
+                storage = StorageClass(
+                    db_path=VOYAGE_DATABASE_PATH or sqlite_path,
+                    embedding_model=EMBEDDING_MODEL_NAME,
+                    embed_backend="voyage",
+                )
+                logger.warning(
+                    "MCP_MEMORY_EMBED_BACKEND=voyage was explicitly set but no Voyage API "
+                    "key is configured; storage creation will fail with an actionable error."
+                )
+            else:
+                # Default backend, no key: run the local model. Semantic search keeps
+                # working; the cloud lane simply is not configured on this machine.
+                storage = StorageClass(
+                    db_path=sqlite_path,
+                    embedding_model=EMBEDDING_MODEL_NAME,
+                    embed_backend="local",
+                )
+                logger.warning(
+                    "Voyage is the default embedding backend but no API key is configured "
+                    "(MCP_VOYAGE_API_KEY or the keyring entry) — using local embeddings. "
+                    "Set the key to enable the cloud index, or set "
+                    "MCP_MEMORY_EMBED_BACKEND=local to silence this warning."
+                )
+        else:
+            storage = StorageClass(
+                db_path=sqlite_path,
+                embedding_model=EMBEDDING_MODEL_NAME
+            )
+            logger.info(f"Initialized SQLite-vec storage at {sqlite_path}")
 
     elif StorageClass.__name__ == "CloudflareStorage":
         storage = StorageClass(

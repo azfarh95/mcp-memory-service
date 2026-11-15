@@ -25,6 +25,34 @@ _SQLITE_VEC_MAX_KNN_K = 4096
 _MAX_TAG_SEARCH_CANDIDATES = _SQLITE_VEC_MAX_KNN_K
 _MAX_TAGS_FOR_SEARCH = 100
 
+# Bounds concurrent embedding work handed to worker threads. Local encode is
+# GIL-bound and Voyage is rate-limited, so a cap helps rather than hurts.
+# Attached TO the loop rather than held in a module dict: a Semaphore caches a
+# strong ref to its loop on first use, so a WeakKeyDictionary keyed by loop would
+# hold value -> loop -> key and never collect (review round 5). Lifetime now
+# follows the loop exactly.
+_EMBED_SEMAPHORE_LIMIT = 4
+_FALLBACK_EMBED_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _embed_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = getattr(loop, "_memory_embed_semaphore", None)
+    if sem is None:
+        sem = asyncio.Semaphore(_EMBED_SEMAPHORE_LIMIT)
+        try:
+            loop._memory_embed_semaphore = sem
+        except AttributeError:
+            # A loop implementation without a __dict__ (e.g. uvloop). Fall back to
+            # a module-level single semaphore: correct on the single-loop servers
+            # this service runs, and never raises inside retrieve's except (which
+            # would degrade every search to a silent []).
+            global _FALLBACK_EMBED_SEMAPHORE
+            if _FALLBACK_EMBED_SEMAPHORE is None:
+                _FALLBACK_EMBED_SEMAPHORE = sem
+            sem = _FALLBACK_EMBED_SEMAPHORE
+    return sem
+
 
 def _sanitize_log_value(value: object) -> str:
     return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
@@ -46,10 +74,23 @@ class RetrieveMixin:
 
             if not self.embedding_model:
                 logger.warning("No embedding model available, cannot perform semantic search")
+                # Record the cause: callers distinguish "no matches" from "embedder
+                # unavailable" only by this signal (review round 2, 2026-11-15).
+                self._record_embedding_failure("No embedding model available")
                 return []
 
             try:
-                query_embedding = self._generate_embedding(query)
+                # Off the event loop: the Voyage adapter does blocking HTTP with
+                # retries, so calling it inline would stall every other coroutine
+                # for the whole backoff (review round 2, 2026-11-15). Deliberately
+                # NOT self._run_in_thread — that holds _conn_lock, which network
+                # I/O must never hold. The semaphore bounds thread fan-out: encode
+                # is GIL-bound on the local model, so unlimited workers only add
+                # contention (review round 3).
+                async with _embed_semaphore():
+                    query_embedding = await asyncio.to_thread(
+                        self._generate_embedding, query, "query"
+                    )
             except Exception as e:
                 logger.error("Failed to generate query embedding: %s", _sanitize_log_value(e))
                 return []
@@ -1017,7 +1058,7 @@ class RetrieveMixin:
 
             if query and self.embedding_model:
                 try:
-                    query_embedding = self._generate_embedding(query)
+                    query_embedding = self._generate_embedding(query, input_type="query")
 
                     # Filter eligible rows inside KNN so excluded neighbors do not consume k.
                     memory_filter = "deleted_at IS NULL"

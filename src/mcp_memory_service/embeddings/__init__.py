@@ -10,6 +10,10 @@ from .external_api import (
     ExternalEmbeddingModel,
     get_external_embedding_model
 )
+from .voyage_embeddings import (
+    VoyageEmbeddingModel,
+    get_voyage_embedding_model,
+)
 
 __all__ = [
     'ONNXEmbeddingModel',
@@ -17,5 +21,7 @@ __all__ = [
     'ONNX_AVAILABLE',
     'TOKENIZERS_AVAILABLE',
     'ExternalEmbeddingModel',
-    'get_external_embedding_model'
+    'get_external_embedding_model',
+    'VoyageEmbeddingModel',
+    'get_voyage_embedding_model',
 ]

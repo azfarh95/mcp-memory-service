@@ -262,3 +262,19 @@ if (STORAGE_BACKEND in ['sqlite_vec', 'hybrid']) and SQLITE_VEC_PATH:
 else:
     # Fallback to a default SQLite-vec path for HTTP interface
     DATABASE_PATH = os.path.join(BASE_DIR, 'memory_http.db')
+
+# Voyage parallel index file: same directory/name as SQLITE_VEC_PATH with a
+# `.voyage` infix (sqlite_vec.db -> sqlite_vec.voyage.db). One sqlite-vec file per
+# embedding backend — MiniLM (384) and Voyage (1024) vectors can never share a
+# vec0 table because the dimension is baked into the schema.
+if SQLITE_VEC_PATH:
+    _svp_root, _svp_ext = os.path.splitext(SQLITE_VEC_PATH)
+    VOYAGE_DATABASE_PATH = f"{_svp_root}.voyage{_svp_ext}"
+else:
+    VOYAGE_DATABASE_PATH = None
+
+# Parallel index (default on): when EMBED_BACKEND=voyage, the storage layer keeps
+# BOTH indexes live — Voyage writes here, MiniLM writes the classic path — so a
+# Voyage outage degrades to the local index instead of losing semantic search.
+# Set MCP_MEMORY_PARALLEL_INDEX=0 for single-backend behavior (env-selected file only).
+PARALLEL_INDEX = os.getenv('MCP_MEMORY_PARALLEL_INDEX', '1').strip().lower() not in ('0', 'false', 'no')

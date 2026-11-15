@@ -196,7 +196,12 @@ class StoreMixin:
         try:
             if not self.embedding_model:
                 raise RuntimeError("No embedding model available")
-            raw_embeddings = self.embedding_model.encode(contents, convert_to_numpy=True)
+            if getattr(self.embedding_model, 'supports_input_type', False):
+                raw_embeddings = self.embedding_model.encode(
+                    contents, convert_to_numpy=True, input_type="document"
+                )
+            else:
+                raw_embeddings = self.embedding_model.encode(contents, convert_to_numpy=True)
         except Exception as e:
             error_msg = f"Batch embedding generation failed: {e}"
             logger.error(error_msg)
