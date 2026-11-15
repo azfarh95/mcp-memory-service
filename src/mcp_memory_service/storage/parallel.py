@@ -225,7 +225,7 @@ class ParallelSqliteVecStorage:
             try:
                 primary_results = await self.primary.store_batch(memories, store=store)
                 failed = [i for i, (ok, msg) in enumerate(primary_results)
-                          if not ok and self._is_embed_failure(primary_results[i][1])]
+                          if not ok and self._is_embed_failure(msg)]
                 if failed:
                     self._mark_primary_down(primary_results[failed[0]][1])
                     # Mark every failure, not just the first, so the backfill can find them.

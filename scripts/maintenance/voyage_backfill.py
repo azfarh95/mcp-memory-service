@@ -16,6 +16,7 @@ Model/dimension come from the same env vars as the service
 """
 
 import argparse
+import logging
 import os
 import sqlite3
 import sys
@@ -25,6 +26,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from mcp_memory_service.embeddings.voyage_embeddings import VoyageEmbeddingModel  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 # Hashes copied per INSERT batch: keeps bind variables far under SQLite's limit.
 _COPY_CHUNK = 400
@@ -203,7 +206,7 @@ def main() -> None:
             # Rows can be soft-deleted between the id scan and this fetch; never
             # hand the API a zero-input batch (review round 6).
             continue
-        if not embed_and_store(voyage_conn, model, batch):
+        if not embed_and_store(voyage_conn, model, batch, voyage_path):
             failures += len(batch)
             print("  stopping after the first failed batch — rerun to resume")
             break
@@ -214,7 +217,8 @@ def main() -> None:
     print(f"Done: {done} embedded, {failures} failed (resumable — rerun to continue)")
 
 
-def embed_and_store(conn: sqlite3.Connection, model: VoyageEmbeddingModel, batch) -> bool:
+def embed_and_store(conn: sqlite3.Connection, model: VoyageEmbeddingModel, batch,
+                    conn_path: str = None) -> bool:
     """Embed one batch of (rowid, content) and write vectors; commit on success."""
     try:
         vectors = model.encode([c for _, c in batch], convert_to_numpy=True, input_type="document")
@@ -230,10 +234,16 @@ def embed_and_store(conn: sqlite3.Connection, model: VoyageEmbeddingModel, batch
                 "UPDATE memories SET embedding_pending = 0 WHERE rowid = ?",
                 [(rowid,) for rowid, _ in batch],
             )
-        except sqlite3.OperationalError:
-            # Column absent on an older schema copy: the flag cannot be stuck if the
-            # column does not exist, so continue rather than fail the batch.
-            pass
+        except sqlite3.OperationalError as exc:
+            # ONLY a missing column is recoverable here (an older schema copy has no
+            # stuck flag). Any other OperationalError - disk I/O, database locked,
+            # malformed DB - means the flag was NOT cleared, so the row stays invisible
+            # to v12's KNN filter. Swallowing those would report success on a no-op
+            # (review round 2, 2026-11-16).
+            if "no such column" not in str(exc).lower():
+                raise
+            logger.warning(
+                "memories.embedding_pending absent in %s; skipping the flag clear", conn_path or "this DB")
         conn.commit()
         return True
     except Exception as exc:  # adapter RuntimeError, or a sqlite write error
