@@ -91,13 +91,24 @@ class ParallelSqliteVecStorage:
         self._primary_down_until = time.time() + _PRIMARY_COOLDOWN_SECONDS
         logger.warning("Voyage primary unavailable (%s); using local index", error)
 
-    @staticmethod
-    def _mark_embed_pending(memory: Memory) -> Memory:
+    async def _mark_embed_pending(self, memory: Memory) -> None:
+        """Flag a memory that never reached the Voyage index.
+
+        The in-memory metadata mutation keeps the live object truthful; the
+        update_memory_metadata write persists the flag on the secondary row so
+        operators (and the backfill) can find outage-time writes. Best-effort:
+        the memory itself is already safely stored locally either way.
+        """
         try:
             memory.metadata = {**(memory.metadata or {}), "embed_pending": "voyage"}
         except Exception:
             pass
-        return memory
+        try:
+            await self.secondary.update_memory_metadata(
+                memory.content_hash, {"embed_pending": "voyage"}
+            )
+        except Exception as exc:
+            logger.warning("Could not persist embed_pending flag on %s: %s", memory.content_hash, exc)
 
     @staticmethod
     def _flag_degraded(results: List[MemoryQueryResult]) -> List[MemoryQueryResult]:
@@ -118,7 +129,7 @@ class ParallelSqliteVecStorage:
 
     # --------------------------------------------------------------- writes
 
-    async def store(self, memory: Memory, skip_semantic_dedup: bool = False, store: Optional[str] = "default") -> Tuple[bool, str]:
+    async def store(self, memory: Memory, skip_semantic_dedup: bool = False, store: str = "default") -> Tuple[bool, str]:
         """Write to the local index always; mirror into the Voyage index best-effort."""
         result = await self.secondary.store(memory, skip_semantic_dedup=skip_semantic_dedup, store=store)
         if not result[0]:
@@ -129,10 +140,10 @@ class ParallelSqliteVecStorage:
                 primary_result = await self.primary.store(memory, skip_semantic_dedup=True, store=store)
                 if not primary_result[0] and "Failed to generate embedding" in primary_result[1]:
                     self._mark_primary_down(primary_result[1])
-                    self._mark_embed_pending(memory)
+                    await self._mark_embed_pending(memory)
             except Exception as exc:
                 self._mark_primary_down(str(exc))
-                self._mark_embed_pending(memory)
+                await self._mark_embed_pending(memory)
         return result
 
     async def store_batch(self, memories: List[Memory]) -> List[Tuple[bool, str]]:
@@ -143,12 +154,12 @@ class ParallelSqliteVecStorage:
                 for i, (ok, msg) in enumerate(primary_results):
                     if not ok and "Failed to generate embedding" in msg:
                         self._mark_primary_down(msg)
-                        self._mark_embed_pending(memories[i])
+                        await self._mark_embed_pending(memories[i])
                         break
             except Exception as exc:
                 self._mark_primary_down(str(exc))
                 for memory in memories:
-                    self._mark_embed_pending(memory)
+                    await self._mark_embed_pending(memory)
         return secondary_results
 
     # ------------------------------------------------------ semantic reads

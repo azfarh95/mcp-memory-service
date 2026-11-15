@@ -13,6 +13,7 @@ from mcp_memory_service.storage.parallel import ParallelSqliteVecStorage
 class FakeMemory:
     def __init__(self, content):
         self.content = content
+        self.content_hash = f"hash-{content}"
         self.metadata = {}
 
 
@@ -50,6 +51,10 @@ class FakeChild:
             return False, f"Failed to generate embedding: {self.embed_error}"
         self.stored.append(memory.content)
         return True, "stored"
+
+    async def update_memory_metadata(self, content_hash, updates, preserve_timestamps=True):
+        self.calls.append(("update_memory_metadata", content_hash, dict(updates)))
+        return True, "updated"
 
     async def store_batch(self, memories):
         self.calls.append(("store_batch", len(memories)))
