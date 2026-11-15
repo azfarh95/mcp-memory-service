@@ -96,7 +96,9 @@ def main() -> None:
             return
         print(f"Voyage DB: {voyage_path} (exists)")
         try:
-            ro = sqlite3.connect(f"file:{voyage_path}?mode=ro", uri=True)
+            # as_uri() percent-encodes Windows backslashes/#/? — a raw f-string URI
+            # breaks on those (review round 3).
+            ro = sqlite3.connect(Path(voyage_path).resolve().as_uri() + "?mode=ro", uri=True)
             todo = ro.execute(
                 """SELECT COUNT(*) FROM memories m
                    WHERE m.deleted_at IS NULL
@@ -166,39 +168,40 @@ def main() -> None:
         voyage_conn.commit()
 
     # 2. Embed voyage rows lacking vectors, resumably.
-    #    Materialised up front: the loop writes to memory_embeddings on the same
-    #    connection, so a live cursor's NOT EXISTS would shift under itself.
-    todo_rows = voyage_conn.execute(
-        """SELECT m.rowid, m.content FROM memories m
-           WHERE m.deleted_at IS NULL
-             AND NOT EXISTS (SELECT 1 FROM memory_embeddings me WHERE me.rowid = m.rowid)"""
-    ).fetchall()
-    todo = len(todo_rows)
+    #    Two-phase on purpose: a live cursor scanning `memories` while the loop
+    #    INSERTs into `memory_embeddings` on the same connection would see its own
+    #    writes shift the NOT EXISTS, and fetching every content string up front
+    #    spikes memory on a 41K-row corpus. So: ids first, content per batch.
+    todo_ids = [
+        r[0]
+        for r in voyage_conn.execute(
+            """SELECT m.rowid FROM memories m
+               WHERE m.deleted_at IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM memory_embeddings me WHERE me.rowid = m.rowid)"""
+        ).fetchall()
+    ]
+    todo = len(todo_ids)
     print(f"Voyage rows missing embeddings: {todo}")
     if not todo:
         return
 
     batch, done, failures = [], 0, 0
     t0 = time.time()
-    for rowid, content in todo_rows:
-        batch.append((rowid, content))
-        if len(batch) >= args.batch_size:
-            if not embed_and_store(voyage_conn, model, batch):
-                failures += len(batch)
-                print("  stopping after the first failed batch — rerun to resume")
-                break
-            else:
-                done += len(batch)
-                rate = done / max(time.time() - t0, 0.001)
-                print(f"  {done}/{todo} embedded ({rate:.0f} rows/s, ETA {(todo - done) / max(rate, 0.01) / 60:.1f} min)")
-            batch = []
-            if args.limit and done >= args.limit:
-                break
-    if batch and not (args.limit and done >= args.limit):
+    for start in range(0, todo, args.batch_size):
+        if args.limit and done >= args.limit:
+            break
+        chunk = todo_ids[start : start + args.batch_size]
+        placeholders = ",".join("?" * len(chunk))
+        batch = voyage_conn.execute(
+            f"SELECT rowid, content FROM memories WHERE rowid IN ({placeholders})", tuple(chunk)
+        ).fetchall()
         if not embed_and_store(voyage_conn, model, batch):
             failures += len(batch)
-        else:
-            done += len(batch)
+            print("  stopping after the first failed batch — rerun to resume")
+            break
+        done += len(batch)
+        rate = done / max(time.time() - t0, 0.001)
+        print(f"  {done}/{todo} embedded ({rate:.0f} rows/s, ETA {(todo - done) / max(rate, 0.01) / 60:.1f} min)")
 
     print(f"Done: {done} embedded, {failures} failed (resumable — rerun to continue)")
 

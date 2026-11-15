@@ -32,6 +32,7 @@ class FakeChild:
         self.stored = []
         self.returns_empty = False
         self.embedding_last_error = None
+        self.embedding_failure_count = 0
         self.ready = True   # mirrors _primary_ready()'s corpus-coverage verdict
         self.embed_error = None  # when set, store returns the embed-failure string
         self.retrieve_error = None
@@ -74,8 +75,14 @@ class FakeChild:
     async def retrieve(self, query, n_results=5, **kwargs):
         self.calls.append(("retrieve", query))
         if self.retrieve_error:
+            self.embedding_failure_count += 1
+            self.embedding_last_error = self.retrieve_error
             raise RuntimeError(self.retrieve_error)
         if self.returns_empty:
+            # Mirrors the real mixin: an embed failure is swallowed into [] and
+            # recorded as a monotonic counter increment, not a raised exception.
+            if self.embedding_last_error:
+                self.embedding_failure_count += 1
             return []
         return [FakeQueryResult(f"hit-for:{query}")]
 

@@ -95,20 +95,23 @@ class ParallelSqliteVecStorage:
     def _primary_ready(self) -> bool:
         """Is the Voyage index actually usable for searching?
 
-        An error-free empty result is only trustworthy if the primary index holds
-        the same corpus as the local index. After a default flip (or a fresh
-        install) the Voyage file is empty and every search would return [] for
-        memories that exist locally — exactly the silent-loss class round 1
-        flagged, reached through a cold index instead of an outage. Until the
-        backfill has run, treat the primary as not ready and serve from local
-        with the degraded flag (review round 2, 2026-11-15).
+        An error-free empty result is only trustworthy if the primary holds
+        EMBEDDINGS for the same corpus the local index holds. Counting memory rows
+        is not enough: the backfill copies rows first and embeds second, so a run
+        that stopped after a failed batch leaves a fully-populated ``memories``
+        table with no vectors — coverage would read 100% and every search would
+        return [] for memories that exist locally (review round 3, 2026-11-15).
+        Gate on embedded rows vs. live memories instead.
         """
         # A child may expose its own readiness verdict (the test doubles do).
-        if hasattr(self.primary, "ready"):
-            return bool(self.primary.ready)
+        ready_attr = getattr(self.primary, "ready", None)
+        if isinstance(ready_attr, bool):
+            return ready_attr
         try:
-            primary_rows = self.primary.conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL"
+            primary_vectors = self.primary.conn.execute(
+                """SELECT COUNT(*) FROM memory_embeddings me
+                   JOIN memories m ON m.rowid = me.rowid
+                   WHERE m.deleted_at IS NULL"""
             ).fetchone()[0]
             secondary_rows = self.secondary.conn.execute(
                 "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL"
@@ -116,12 +119,19 @@ class ParallelSqliteVecStorage:
         except Exception as exc:
             logger.debug("Primary readiness check failed (%s); assuming not ready", exc)
             return False
-        if secondary_rows and primary_rows < secondary_rows * _PRIMARY_MIN_COVERAGE:
+        # An empty local corpus has nothing to serve, so the primary is trivially
+        # "ready" and must not be reported as lagging.
+        if secondary_rows == 0:
+            return True
+        if primary_vectors < secondary_rows * _PRIMARY_MIN_COVERAGE:
             self.primary_last_error = (
-                f"voyage index behind: {primary_rows}/{secondary_rows} rows "
+                f"voyage index behind: {primary_vectors}/{secondary_rows} vectors embedded "
                 "(run scripts/maintenance/voyage_backfill.py)"
             )
             return False
+        # Coverage recovered: drop a stale lag notice so health/stats stop lying.
+        if self.primary_last_error and "voyage index behind" in self.primary_last_error:
+            self.primary_last_error = None
         return True
 
     def _mark_primary_down(self, error: str) -> None:
@@ -219,14 +229,20 @@ class ParallelSqliteVecStorage:
         """
         if not self._primary_available() or not self._primary_ready():
             return None
+        # Snapshot BEFORE the call: a concurrent successful embed on the same child
+        # clears its message, so comparing messages after the await can hide a
+        # failure that happened during it (review round 3). The counter only grows.
+        failures_before = getattr(self.primary, "embedding_failure_count", 0)
         try:
             results = await getattr(self.primary, kind)(query, n_results, **kwargs)
         except Exception as exc:
             self._mark_primary_down(str(exc))
             return None
-        error = getattr(self.primary, "embedding_last_error", None)
-        if error:
-            self._mark_primary_down(str(error))
+        failures_after = getattr(self.primary, "embedding_failure_count", 0)
+        if failures_after > failures_before:
+            self._mark_primary_down(
+                getattr(self.primary, "embedding_last_error", None) or "embedding failed"
+            )
             return None
         return results
 

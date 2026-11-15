@@ -130,21 +130,14 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
 
         if EMBED_BACKEND == "voyage":
             # Voyage is the default, but it is a cloud API that needs a key. Decide
-            # ONCE here, from facts available without a network call, what this
-            # process runs as:
-            #  - key present  -> parallel index (Voyage primary + local fallback)
-            #  - key absent   -> local-only, loudly. Never build a pinned Voyage
-            #                    primary without a key: initialize() would raise and
-            #                    the server would not start (review round 2, 2026-11-15).
-            # Explicit opt-in via MCP_MEMORY_EMBED_BACKEND=voyage with no key is a
-            # misconfiguration, but "the default value of an unset env var" is not:
-            # distinguish them by whether the variable was actually set.
+            # ONCE, via the shared resolver that every construction site uses, so a
+            # keyless install degrades identically whether it comes through this
+            # factory or a direct SqliteVecMemoryStorage() call.
             from .mixins.embeddings import EmbeddingsMixin
 
-            voyage_key = EmbeddingsMixin._voyage_key_present()
-            explicitly_set = bool(os.environ.get("MCP_MEMORY_EMBED_BACKEND", "").strip())
+            effective_backend, reason = EmbeddingsMixin.resolve_embed_backend(sqlite_path)
 
-            if voyage_key and PARALLEL_INDEX and VOYAGE_DATABASE_PATH:
+            if effective_backend == "voyage" and reason == "key" and PARALLEL_INDEX and VOYAGE_DATABASE_PATH:
                 # Parallel index: Voyage primary (own file — 1024-dim vectors can never
                 # share a table with MiniLM's 384) + the classic local index as the
                 # always-available fallback and source of truth for non-embedding reads.
@@ -165,11 +158,13 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
                     f"Initialized parallel SQLite-vec storage: voyage at {VOYAGE_DATABASE_PATH} "
                     f"(primary) + local at {sqlite_path} (fallback)"
                 )
-            elif explicitly_set:
+            elif reason == "explicit-no-key":
                 # The operator asked for Voyage by name. Honour that literally so the
-                # misconfiguration is visible instead of silently running local.
+                # misconfiguration is visible instead of silently running local. Point
+                # at the voyage file: sqlite_path holds a 384-dim vec table, so putting
+                # a 1024-dim model there is a dimension clash, not an actionable error.
                 storage = StorageClass(
-                    db_path=VOYAGE_DATABASE_PATH if VOYAGE_DATABASE_PATH else sqlite_path,
+                    db_path=VOYAGE_DATABASE_PATH or sqlite_path,
                     embedding_model=EMBEDDING_MODEL_NAME,
                     embed_backend="voyage",
                 )

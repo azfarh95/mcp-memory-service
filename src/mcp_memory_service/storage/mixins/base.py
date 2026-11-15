@@ -71,6 +71,11 @@ class BaseMixin:
         self.conn = None
         self.embedding_model = None
         self.embedding_dimension = 384  # Default for all-MiniLM-L6-v2
+        # Failure signal for callers that must distinguish "embedder down" from
+        # "no matches": a monotonic counter (survives a concurrent success
+        # clearing the message) plus the latest message.
+        self.embedding_failure_count = 0
+        self.embedding_last_error = None
         self._initialized = False
 
         self._savepoint_lock = asyncio.Lock()

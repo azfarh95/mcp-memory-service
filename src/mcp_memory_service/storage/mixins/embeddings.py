@@ -143,6 +143,33 @@ class EmbeddingsMixin:
             logger.debug("Could not resolve Voyage key: %s", exc)
             return False
 
+    @staticmethod
+    def resolve_embed_backend(db_path=None) -> tuple:
+        """Decide the effective (backend, reason) for ONE construction.
+
+        The single source of truth every construction site shares — factory,
+        direct SqliteVecMemoryStorage() calls in mcp_server/server_impl/cli, and
+        hybrid's own primary. Without it, whether a keyless install starts or
+        loses search depends on which entry point happened to be used (review
+        round 3, 2026-11-15).
+
+        Rules, decided without any network call:
+          - a key exists                       -> ('voyage', 'key')
+          - no key, backend unset (ambient)    -> ('local', 'no-key')
+          - no key, backend explicitly voyage  -> ('voyage', 'explicit-no-key')
+            (the caller honours it so the misconfiguration surfaces loudly)
+        """
+        requested = os.environ.get('MCP_MEMORY_EMBED_BACKEND', '').strip().lower()
+        if requested not in ('', 'voyage', 'local'):
+            raise ValueError(
+                f"MCP_MEMORY_EMBED_BACKEND must be 'voyage' or 'local', got {requested!r}"
+            )
+        if requested == 'local':
+            return ('local', 'explicit-local')
+        if EmbeddingsMixin._voyage_key_present():
+            return ('voyage', 'key')
+        return ('voyage', 'explicit-no-key') if requested == 'voyage' else ('local', 'no-key')
+
     async def _initialize_embedding_model(self):
         """Initialize the embedding model (ONNX or SentenceTransformer based on configuration)."""
         global _MODEL_CACHE, _HASH_FALLBACK_WARNED
@@ -152,38 +179,35 @@ class EmbeddingsMixin:
             logger.info("🐳 Docker environment detected - adjusting model loading strategy")
 
         try:
-            # Voyage cloud backend (MCP_MEMORY_EMBED_BACKEND=voyage, default). Checked
-            # before every other branch; embed_backend_override lets the parallel
-            # storage wrapper run one voyage and one local instance per process.
-            embed_backend = (
-                getattr(self, 'embed_backend_override', None)
-                or os.environ.get('MCP_MEMORY_EMBED_BACKEND', 'voyage').strip().lower()
-            )
+            # Voyage cloud backend. The EFFECTIVE backend comes from the shared
+            # resolver so direct SqliteVecMemoryStorage() construction (mcp_server,
+            # server_impl, cli, hybrid) behaves exactly like the factory: an
+            # ambient default with no key runs local instead of failing to start.
+            embed_backend = getattr(self, 'embed_backend_override', None)
+            if not embed_backend:
+                embed_backend, reason = self.resolve_embed_backend(getattr(self, 'db_path', None))
+                if reason == 'no-key':
+                    logger.warning(
+                        "Voyage is the default embedding backend but no API key is configured "
+                        "(MCP_VOYAGE_API_KEY or the keyring entry) — using local embeddings for "
+                        "%s. Set the key to enable the cloud index, or set "
+                        "MCP_MEMORY_EMBED_BACKEND=local to silence this warning.",
+                        getattr(self, 'db_path', 'this store'),
+                    )
             if embed_backend == 'voyage':
                 try:
                     from ...embeddings.voyage_embeddings import get_voyage_embedding_model
                     from ...config.embedding import VOYAGE_MODEL, VOYAGE_OUTPUT_DIM
 
-                    # A keyless install must never lose semantic search on the way
-                    # in. When Voyage is merely the ambient default, fall through to
-                    # the local model with a loud warning; when an operator pinned
-                    # the backend explicitly (embed_backend_override, i.e. the
-                    # parallel primary) run it if a key exists, else raise so the
-                    # misconfiguration is visible rather than silently local.
+                    # An explicit voyage selection without a key must fail loudly
+                    # rather than silently run a different model.
                     if not self._voyage_key_present():
-                        if getattr(self, 'embed_backend_override', None) == 'voyage':
-                            raise RuntimeError(
-                                "Voyage embedding backend was explicitly selected but no API key "
-                                "is available. Set MCP_VOYAGE_API_KEY or the keyring entry "
-                                "(MCP_VOYAGE_KEYRING_SERVICE/MCP_VOYAGE_KEYRING_USERNAME)."
-                            )
-                        logger.warning(
-                            "MCP_MEMORY_EMBED_BACKEND=voyage (default) but no Voyage API key is "
-                            "configured — falling back to local embeddings for this process. "
-                            "Set MCP_VOYAGE_API_KEY to enable the cloud backend, or set "
-                            "MCP_MEMORY_EMBED_BACKEND=local to make the local choice explicit."
+                        raise RuntimeError(
+                            "Voyage embedding backend was explicitly selected but no API key "
+                            "is available. Set MCP_VOYAGE_API_KEY or the keyring entry "
+                            "(MCP_VOYAGE_KEYRING_SERVICE/MCP_VOYAGE_KEYRING_USERNAME), or set "
+                            "MCP_MEMORY_EMBED_BACKEND=local."
                         )
-                        embed_backend = 'local'
                 except ImportError as e:
                     raise RuntimeError(
                         f"Voyage embedding backend selected but its module failed to import: {e}"
@@ -578,10 +602,12 @@ class EmbeddingsMixin:
         # Callers that degrade on an embedder outage (the parallel wrapper) must
         # be able to tell "embedder down" from "genuinely no matches": the
         # retrieve paths catch our exception and return [], which is
-        # indistinguishable from an empty result set. Clear on success.
-        self.embedding_last_error = None
+        # indistinguishable from an empty result set. A MONOTONIC counter is the
+        # signal, not the error string alone: this method clears the message at
+        # entry, so a concurrent success would otherwise erase a concurrent
+        # failure's evidence (review round 3, 2026-11-15).
         if not self.embedding_model:
-            self.embedding_last_error = "No embedding model available"
+            self._record_embedding_failure("No embedding model available")
             raise RuntimeError("No embedding model available. Ensure sentence-transformers is installed and model is loaded.")
 
         try:
@@ -618,6 +644,11 @@ class EmbeddingsMixin:
             return embedding_list
 
         except Exception as e:
-            self.embedding_last_error = str(e)
+            self._record_embedding_failure(str(e))
             logger.error(f"Failed to generate embedding: {str(e)}")
             raise RuntimeError(f"Failed to generate embedding: {str(e)}") from e
+
+    def _record_embedding_failure(self, message: str) -> None:
+        """Record a failed embed call: monotonic count + the latest message."""
+        self.embedding_failure_count = getattr(self, "embedding_failure_count", 0) + 1
+        self.embedding_last_error = message

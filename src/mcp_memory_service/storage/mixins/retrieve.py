@@ -25,6 +25,18 @@ _SQLITE_VEC_MAX_KNN_K = 4096
 _MAX_TAG_SEARCH_CANDIDATES = _SQLITE_VEC_MAX_KNN_K
 _MAX_TAGS_FOR_SEARCH = 100
 
+# Bounds concurrent embedding work handed to worker threads. Local encode is
+# GIL-bound and Voyage is rate-limited, so a cap helps rather than hurts; the
+# semaphore is created lazily because it must belong to the running loop.
+_EMBED_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _embed_semaphore() -> asyncio.Semaphore:
+    global _EMBED_SEMAPHORE
+    if _EMBED_SEMAPHORE is None:
+        _EMBED_SEMAPHORE = asyncio.Semaphore(4)
+    return _EMBED_SEMAPHORE
+
 
 def _sanitize_log_value(value: object) -> str:
     return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
@@ -47,8 +59,8 @@ class RetrieveMixin:
             if not self.embedding_model:
                 logger.warning("No embedding model available, cannot perform semantic search")
                 # Record the cause: callers distinguish "no matches" from "embedder
-                # unavailable" only by this attribute (review round 2, 2026-11-15).
-                self.embedding_last_error = "No embedding model available"
+                # unavailable" only by this signal (review round 2, 2026-11-15).
+                self._record_embedding_failure("No embedding model available")
                 return []
 
             try:
@@ -56,10 +68,13 @@ class RetrieveMixin:
                 # retries, so calling it inline would stall every other coroutine
                 # for the whole backoff (review round 2, 2026-11-15). Deliberately
                 # NOT self._run_in_thread — that holds _conn_lock, which network
-                # I/O must never hold.
-                query_embedding = await asyncio.to_thread(
-                    self._generate_embedding, query, "query"
-                )
+                # I/O must never hold. The semaphore bounds thread fan-out: encode
+                # is GIL-bound on the local model, so unlimited workers only add
+                # contention (review round 3).
+                async with _embed_semaphore():
+                    query_embedding = await asyncio.to_thread(
+                        self._generate_embedding, query, "query"
+                    )
             except Exception as e:
                 logger.error("Failed to generate query embedding: %s", _sanitize_log_value(e))
                 return []
