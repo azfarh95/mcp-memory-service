@@ -152,6 +152,19 @@ async def create_storage_instance(sqlite_path: str, server_type: str = None) -> 
             logger.info(
                 "Initialized parallel SQLite-vec storage: voyage at %s (primary) + local at %s (fallback)",
                 _sanitize_log_value(VOYAGE_DATABASE_PATH), _sanitize_log_value(sqlite_path))
+        elif EMBED_BACKEND == "voyage" and reason == "key" and not (PARALLEL_INDEX and VOYAGE_DATABASE_PATH):
+            # A key exists and voyage was requested, but the parallel index is off (or
+            # there is no voyage path). Honour voyage on the primary path rather than
+            # silently dropping to local and blaming a missing key (review, 2026-11-16).
+            storage = StorageClass(
+                db_path=sqlite_path,
+                embedding_model=EMBEDDING_MODEL_NAME,
+                embed_backend="voyage",
+            )
+            logger.warning(
+                "Voyage backend active WITHOUT the local fallback index (parallel index "
+                "disabled or no voyage path resolvable). Set MCP_MEMORY_PARALLEL_INDEX=1 for "
+                "the fallback, or accept that a Voyage outage loses semantic search.")
         elif EMBED_BACKEND == "voyage" and reason == "explicit-no-key":
             # Operator named voyage but there is no key: honour it so the misconfiguration
             # is visible, and point at the voyage file (the local one is 384-dim).

@@ -222,6 +222,18 @@ def embed_and_store(conn: sqlite3.Connection, model: VoyageEmbeddingModel, batch
             "INSERT OR REPLACE INTO memory_embeddings (rowid, content_embedding) VALUES (?, ?)",
             [(rowid, vectors[i].tobytes()) for i, (rowid, _) in enumerate(batch)],
         )
+        # v12 filters KNN on `embedding_pending IS NULL OR embedding_pending = 0`, so a
+        # row left flagged by a failed embed stays invisible to search even after its
+        # vector is written. Clear the flag in the same transaction (review, 2026-11-16).
+        try:
+            conn.executemany(
+                "UPDATE memories SET embedding_pending = 0 WHERE rowid = ?",
+                [(rowid,) for rowid, _ in batch],
+            )
+        except sqlite3.OperationalError:
+            # Column absent on an older schema copy: the flag cannot be stuck if the
+            # column does not exist, so continue rather than fail the batch.
+            pass
         conn.commit()
         return True
     except Exception as exc:  # adapter RuntimeError, or a sqlite write error
