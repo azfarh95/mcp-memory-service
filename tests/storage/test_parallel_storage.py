@@ -260,6 +260,51 @@ async def test_time_only_recall_goes_to_secondary():
     assert ("recall", None) not in primary.calls
 
 
+class FakeConn:
+    """Minimal .execute() stand-in for the readiness SQL (no sqlite needed)."""
+
+    def __init__(self, vector_count, row_count):
+        self.vector_count = vector_count
+        self.row_count = row_count
+
+    def execute(self, sql, *args):
+        class _Cur:
+            def __init__(self, value):
+                self.value = value
+
+            def fetchone(self):
+                return (self.value,)
+
+        if "memory_embeddings" in sql:
+            return _Cur(self.vector_count)
+        return _Cur(self.row_count)
+
+
+@pytest.mark.asyncio
+async def test_primary_ready_uses_vector_count_not_row_count():
+    """Rows copied but not embedded must read as NOT ready (round-3 blocker A)."""
+    primary = FakeChild("primary", "fake-voyage")
+    secondary = FakeChild("secondary", "fake-local")
+    del primary.ready   # exercise the real SQL path instead of the test hook
+    primary.conn = FakeConn(vector_count=0, row_count=1000)   # rows yes, vectors no
+    secondary.conn = FakeConn(vector_count=0, row_count=1000)
+    wrapper = ParallelSqliteVecStorage(primary, secondary)
+    assert wrapper._primary_ready() is False
+    assert "voyage index behind" in (wrapper.primary_last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_primary_ready_when_vectors_cover_the_corpus():
+    primary = FakeChild("primary", "fake-voyage")
+    secondary = FakeChild("secondary", "fake-local")
+    del primary.ready
+    primary.conn = FakeConn(vector_count=1000, row_count=1000)
+    secondary.conn = FakeConn(vector_count=0, row_count=1000)
+    wrapper = ParallelSqliteVecStorage(primary, secondary)
+    assert wrapper._primary_ready() is True
+    assert wrapper.primary_last_error is None
+
+
 @pytest.mark.asyncio
 async def test_stats_reports_parallel_info():
     primary, secondary = FakeChild("primary", "fake-voyage"), FakeChild("secondary", "fake-local")

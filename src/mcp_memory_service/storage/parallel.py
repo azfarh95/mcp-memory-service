@@ -52,6 +52,10 @@ _PRIMARY_COOLDOWN_SECONDS = 60.0
 # flag rather than returning a silently short result set.
 _PRIMARY_MIN_COVERAGE = 0.95
 
+# Readiness is a COUNT over the corpus; re-probing on every semantic read would add
+# tens of ms per query on a 41K-row store. Cache the verdict briefly.
+_READY_CACHE_SECONDS = 30.0
+
 
 class ParallelSqliteVecStorage:
     """Voyage-primary storage wrapper over two SqliteVecMemoryStorage instances.
@@ -69,6 +73,8 @@ class ParallelSqliteVecStorage:
         self.secondary = secondary
         self.primary_last_error: Optional[str] = None
         self._primary_down_until: float = 0.0
+        self._ready_cached: bool = True
+        self._ready_cached_at: float = 0.0
 
     # ------------------------------------------------------------------ init
 
@@ -107,6 +113,12 @@ class ParallelSqliteVecStorage:
         ready_attr = getattr(self.primary, "ready", None)
         if isinstance(ready_attr, bool):
             return ready_attr
+        # Counting 41K rowids on every semantic read would add tens of ms per
+        # query. Re-probe at most once per interval; writes/backfill change the
+        # numbers, and a stale "ready" self-corrects on the next window.
+        now = time.time()
+        if self._ready_cached_at and (now - self._ready_cached_at) < _READY_CACHE_SECONDS:
+            return self._ready_cached
         try:
             primary_vectors = self.primary.conn.execute(
                 """SELECT COUNT(*) FROM memory_embeddings me
@@ -122,17 +134,23 @@ class ParallelSqliteVecStorage:
         # An empty local corpus has nothing to serve, so the primary is trivially
         # "ready" and must not be reported as lagging.
         if secondary_rows == 0:
-            return True
+            self.primary_last_error = None
+            return self._cache_ready(True)
         if primary_vectors < secondary_rows * _PRIMARY_MIN_COVERAGE:
             self.primary_last_error = (
                 f"voyage index behind: {primary_vectors}/{secondary_rows} vectors embedded "
                 "(run scripts/maintenance/voyage_backfill.py)"
             )
-            return False
+            return self._cache_ready(False)
         # Coverage recovered: drop a stale lag notice so health/stats stop lying.
         if self.primary_last_error and "voyage index behind" in self.primary_last_error:
             self.primary_last_error = None
-        return True
+        return self._cache_ready(True)
+
+    def _cache_ready(self, value: bool) -> bool:
+        self._ready_cached = value
+        self._ready_cached_at = time.time()
+        return value
 
     def _mark_primary_down(self, error: str) -> None:
         self.primary_last_error = error

@@ -199,12 +199,16 @@ class EmbeddingsMixin:
                     from ...embeddings.voyage_embeddings import get_voyage_embedding_model
                     from ...config.embedding import VOYAGE_MODEL, VOYAGE_OUTPUT_DIM
 
-                    # An explicit voyage selection without a key must fail loudly
-                    # rather than silently run a different model.
+                    # An explicit voyage selection without a key cannot silently run
+                    # a DIFFERENT model here: this instance was built for the voyage
+                    # index (its own file, 1024-dim). Raising is correct — the
+                    # factory's resolver already guarantees this is only reached
+                    # when a key existed at construction time, so a raise now means
+                    # the key vanished mid-run, which must be visible.
                     if not self._voyage_key_present():
                         raise RuntimeError(
-                            "Voyage embedding backend was explicitly selected but no API key "
-                            "is available. Set MCP_VOYAGE_API_KEY or the keyring entry "
+                            "Voyage embedding backend was selected but no API key is available "
+                            "at initialization. Set MCP_VOYAGE_API_KEY or the keyring entry "
                             "(MCP_VOYAGE_KEYRING_SERVICE/MCP_VOYAGE_KEYRING_USERNAME), or set "
                             "MCP_MEMORY_EMBED_BACKEND=local."
                         )
@@ -605,7 +609,9 @@ class EmbeddingsMixin:
         # indistinguishable from an empty result set. A MONOTONIC counter is the
         # signal, not the error string alone: this method clears the message at
         # entry, so a concurrent success would otherwise erase a concurrent
-        # failure's evidence (review round 3, 2026-11-15).
+        # failure's evidence (review round 3, 2026-11-15). The message is cleared
+        # here so a recovered embedder stops reporting a stale error (round 4).
+        self.embedding_last_error = None
         if not self.embedding_model:
             self._record_embedding_failure("No embedding model available")
             raise RuntimeError("No embedding model available. Ensure sentence-transformers is installed and model is loaded.")

@@ -7,6 +7,7 @@ import os
 import time
 import traceback
 import asyncio
+import weakref
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Set
@@ -26,16 +27,19 @@ _MAX_TAG_SEARCH_CANDIDATES = _SQLITE_VEC_MAX_KNN_K
 _MAX_TAGS_FOR_SEARCH = 100
 
 # Bounds concurrent embedding work handed to worker threads. Local encode is
-# GIL-bound and Voyage is rate-limited, so a cap helps rather than hurts; the
-# semaphore is created lazily because it must belong to the running loop.
-_EMBED_SEMAPHORE: Optional[asyncio.Semaphore] = None
+# GIL-bound and Voyage is rate-limited, so a cap helps rather than hurts.
+# Keyed by running loop: a module-global Semaphore binds to the first loop that
+# awaits it, and a second loop then raises inside retrieve's except -> silent [].
+_EMBED_SEMAPHORES: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 
 def _embed_semaphore() -> asyncio.Semaphore:
-    global _EMBED_SEMAPHORE
-    if _EMBED_SEMAPHORE is None:
-        _EMBED_SEMAPHORE = asyncio.Semaphore(4)
-    return _EMBED_SEMAPHORE
+    loop = asyncio.get_running_loop()
+    sem = _EMBED_SEMAPHORES.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(4)
+        _EMBED_SEMAPHORES[loop] = sem
+    return sem
 
 
 def _sanitize_log_value(value: object) -> str:
