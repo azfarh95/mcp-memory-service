@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from mcp_memory_service.embeddings.voyage_embeddings import VoyageEmbeddingModel  # noqa: E402
+import sqlite_vec  # noqa: E402  (vec0 virtual tables; needed by both the dry run and the write path)
 
 logger = logging.getLogger(__name__)
 
@@ -104,12 +105,28 @@ def main() -> None:
             # as_uri() percent-encodes Windows backslashes/#/? — a raw f-string URI
             # breaks on those (review round 3).
             ro = sqlite3.connect(Path(voyage_path).resolve().as_uri() + "?mode=ro", uri=True)
-            todo = ro.execute(
+            # vec0 lives in an extension: without it even a COUNT over memory_embeddings
+            # fails with "no such module: vec0", which reads as "not initialised" instead
+            # of a working index (found on the first live dry run, 2026-11-16).
+            ro.enable_load_extension(True)
+            sqlite_vec.load(ro)
+            ro.enable_load_extension(False)
+            # Two distinct gaps: rows not in the voyage index AT ALL (a fresh index),
+            # and rows present but without a vector (an interrupted backfill). Counting
+            # only the second reported "0 missing" against a completely empty index
+            # (found on the first live dry run, 2026-11-16).
+            voyage_rows = ro.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            print(f"Voyage index rows: {voyage_rows}")
+            unembedded = ro.execute(
                 """SELECT COUNT(*) FROM memories m
                    WHERE m.deleted_at IS NULL
                      AND NOT EXISTS (SELECT 1 FROM memory_embeddings me WHERE me.rowid = m.rowid)"""
             ).fetchone()[0]
-            print(f"Voyage rows missing embeddings: {todo}")
+            print(f"Voyage rows missing embeddings: {unembedded}")
+            local_rows = sqlite3.connect(local_path).execute(
+                "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL").fetchone()[0]
+            print(f"Local live rows: {local_rows}")
+            print(f"Rows to copy from local: {max(0, local_rows - voyage_rows)}")
             ro.close()
         except sqlite3.Error as exc:
             print(f"Voyage DB not yet initialised: {exc}")
@@ -117,9 +134,6 @@ def main() -> None:
 
     local_conn = sqlite3.connect(local_path)
     voyage_conn = sqlite3.connect(voyage_path or (local_path + ".voyage.db"))
-    # vec0 virtual tables need the sqlite-vec extension loaded on this connection.
-    import sqlite_vec
-
     voyage_conn.enable_load_extension(True)
     sqlite_vec.load(voyage_conn)
     voyage_conn.enable_load_extension(False)
@@ -222,9 +236,24 @@ def embed_and_store(conn: sqlite3.Connection, model: VoyageEmbeddingModel, batch
     """Embed one batch of (rowid, content) and write vectors; commit on success."""
     try:
         vectors = model.encode([c for _, c in batch], convert_to_numpy=True, input_type="document")
+        # `store` is a PARTITION KEY in v12's vec0 table. Writing NULL here makes every
+        # vector invisible to v12's retrieve(), which filters `store = ?` INSIDE the vec0
+        # query — the live symptom was a fully-populated index returning 0 hits
+        # (found during the 2026-11-16 cutover). Copy each row's partition from memories.
+        partitions = {
+            r[0]: r[1]
+            for r in conn.execute(
+                f"SELECT rowid, store FROM memories WHERE rowid IN ({','.join('?' * len(batch))})",
+                tuple(rowid for rowid, _ in batch),
+            )
+        }
         conn.executemany(
-            "INSERT OR REPLACE INTO memory_embeddings (rowid, content_embedding) VALUES (?, ?)",
-            [(rowid, vectors[i].tobytes()) for i, (rowid, _) in enumerate(batch)],
+            "INSERT OR REPLACE INTO memory_embeddings (rowid, content_embedding, store) "
+            "VALUES (?, ?, ?)",
+            [
+                (rowid, vectors[i].tobytes(), partitions.get(rowid) or "default")
+                for i, (rowid, _) in enumerate(batch)
+            ],
         )
         # v12 filters KNN on `embedding_pending IS NULL OR embedding_pending = 0`, so a
         # row left flagged by a failed embed stays invisible to search even after its
