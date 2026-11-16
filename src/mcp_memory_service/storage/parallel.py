@@ -202,15 +202,23 @@ class ParallelSqliteVecStorage:
 
     # --------------------------------------------------------------- writes
 
-    async def store(self, memory: Memory, skip_semantic_dedup: bool = False, store: str = "default") -> Tuple[bool, str]:
-        """Write to the local index always; mirror into the Voyage index best-effort."""
-        result = await self.secondary.store(memory, skip_semantic_dedup=skip_semantic_dedup, store=store)
+    async def store(self, memory: Memory, skip_semantic_dedup: bool = False,
+                    store: str = "default", recreate: bool = None) -> Tuple[bool, str]:
+        """Write to the local index always; mirror into the Voyage index best-effort.
+
+        ``recreate`` is part of v12's MemoryStorage.store() contract (ADR-0012 v2); the
+        wrapper must accept and forward it or every write fails with an unexpected-kwarg
+        TypeError (found live during the 2026-11-16 cutover).
+        """
+        result = await self.secondary.store(
+            memory, skip_semantic_dedup=skip_semantic_dedup, store=store, recreate=recreate)
         if not result[0]:
             return result
 
         if self._primary_available():
             try:
-                primary_result = await self.primary.store(memory, skip_semantic_dedup=True, store=store)
+                primary_result = await self.primary.store(
+                    memory, skip_semantic_dedup=True, store=store, recreate=recreate)
                 if not primary_result[0] and self._is_embed_failure(primary_result[1]):
                     self._mark_primary_down(primary_result[1])
                     await self._mark_embed_pending(memory)
@@ -219,8 +227,9 @@ class ParallelSqliteVecStorage:
                 await self._mark_embed_pending(memory)
         return result
 
-    async def store_batch(self, memories: List[Memory], store: str = 'default') -> List[Tuple[bool, str]]:
-        secondary_results = await self.secondary.store_batch(memories, store=store)
+    async def store_batch(self, memories: List[Memory], store: str = 'default',
+                          recreate: bool = None) -> List[Tuple[bool, str]]:
+        secondary_results = await self.secondary.store_batch(memories, store=store, recreate=recreate)
         if self._primary_available():
             try:
                 primary_results = await self.primary.store_batch(memories, store=store)
