@@ -83,19 +83,19 @@ async def test_store_batch_forwards_the_recreate_kwarg():
 
 def test_embed_text_tolerates_a_legacy_one_argument_override():
     """Defect 4: a monkeypatched _generate_embedding(text) must not raise TypeError."""
-    from mcp_memory_service.storage.mixins.embeddings import EmbeddingsMixin
+    from mcp_memory_service.storage.mixins.embeddings import call_generate_embedding
 
-    class Legacy(EmbeddingsMixin):
+    class Legacy:
         def _generate_embedding(self, text):  # old signature, no input_type
             return [0.0, 1.0]
 
-    assert Legacy()._embed_text("hello", input_type="query") == [0.0, 1.0]
+    assert call_generate_embedding(Legacy(), "hello", input_type="query") == [0.0, 1.0]
 
-    class Modern(EmbeddingsMixin):
+    class Modern:
         def _generate_embedding(self, text, input_type="document"):
             return [float(len(text)), float(input_type == "query")]
 
-    assert Modern()._embed_text("hello", input_type="query") == [5.0, 1.0]
+    assert call_generate_embedding(Modern(), "hello", input_type="query") == [5.0, 1.0]
 
 
 def test_backfill_writes_the_vec0_partition_key(tmp_path):

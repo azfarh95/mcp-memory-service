@@ -24,6 +24,29 @@ from ..shared import _embedding_cache_get, _embedding_cache_put, _embedding_cach
 logger = logging.getLogger(__name__)
 
 # Module-level caches
+def call_generate_embedding(owner, text: str, input_type: str = "document"):
+    """Call ``owner._generate_embedding`` with input_type when the callable accepts it.
+
+    Module-level, not a mixin method: retrieve-style code is exercised in tests by
+    minimal stubs that provide only ``_generate_embedding`` and do not inherit
+    EmbeddingsMixin, and a helper they cannot see is a new failure mode (CI, 2026-11-16).
+
+    Tests and third-party backends monkeypatch the older one-argument signature;
+    passing the keyword unconditionally raised "unexpected keyword argument
+    'input_type'". The signature is inspected rather than a TypeError caught, because
+    a TypeError can equally come from inside the embedding call and would then be
+    swallowed.
+    """
+    func = owner._generate_embedding
+    try:
+        accepts = "input_type" in inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        accepts = False
+    if accepts:
+        return func(text, input_type=input_type)
+    return func(text)
+
+
 _MODEL_CACHE = {}
 _DIMENSION_CACHE = {}
 
@@ -145,7 +168,7 @@ class EmbeddingsMixin:
             return bool(VoyageEmbeddingModel._resolve_api_key(
                 VOYAGE_KEYRING_SERVICE, VOYAGE_KEYRING_USERNAME))
         except Exception as exc:
-            logger.debug("Could not resolve Voyage key: %s", exc)
+            logger.debug("Could not resolve Voyage key: %s", _sanitize_log_value(exc))
             return False
 
     @staticmethod
@@ -189,7 +212,7 @@ class EmbeddingsMixin:
                         "(MCP_VOYAGE_API_KEY or the keyring entry) - using local embeddings for "
                         "%s. Set the key to enable the cloud index, or set "
                         "MCP_MEMORY_EMBED_BACKEND=local to silence this warning.",
-                        getattr(self, 'db_path', 'this store'))
+                        _sanitize_log_value(getattr(self, 'db_path', 'this store')))
             if embed_backend == 'voyage':
                 from ...embeddings.voyage_embeddings import get_voyage_embedding_model
                 from ...config.embedding import VOYAGE_MODEL, VOYAGE_OUTPUT_DIM
@@ -578,24 +601,6 @@ class EmbeddingsMixin:
         # with the fallback's pseudo-vectors in the shared cache (Greptile #1367).
         self._embedding_cache_namespace = f"__hash_fallback__::{self.embedding_dimension}"
         self.embedding_backend_degraded = True
-
-    def _embed_text(self, text: str, input_type: str = "document") -> List[float]:
-        """Call _generate_embedding with input_type, tolerating overrides that predate it.
-
-        Tests and third-party backends monkeypatch `_generate_embedding` with the older
-        one-argument signature; passing the keyword unconditionally raised
-        "got an unexpected keyword argument 'input_type'" and broke semantic dedup
-        (CI, 2026-11-16). Inspect the actual callable rather than guessing from a
-        TypeError, which could also come from inside the embedding call.
-        """
-        func = self._generate_embedding
-        try:
-            accepts = "input_type" in inspect.signature(func).parameters
-        except (TypeError, ValueError):
-            accepts = False
-        if accepts:
-            return func(text, input_type=input_type)
-        return func(text)
 
     def _generate_embedding(self, text: str, input_type: str = "document") -> List[float]:
         """Generate embedding for text.
