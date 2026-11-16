@@ -360,11 +360,24 @@ class ParallelSqliteVecStorage:
     def get_backend_type(self) -> str:
         return "sqlite_vec+voyage_parallel"
 
+    @staticmethod
+    def _child_backend_name(child) -> str:
+        """v12 removed SqliteVecMemoryStorage.get_backend_type(); derive the label
+        without depending on a method the child may not have (live-cutover finding,
+        2026-11-16 — this raised in /api/health/detailed and blanked total_memories)."""
+        fn = getattr(child, "get_backend_type", None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                pass
+        return type(child).__name__
+
     async def get_stats(self) -> Dict[str, Any]:
         stats = await self.secondary.get_stats()
         stats["storage_backend"] = self.get_backend_type()
         stats["parallel_index"] = {
-            "primary_backend": self.primary.get_backend_type(),
+            "primary_backend": self._child_backend_name(self.primary),
             "primary_model": getattr(self.primary, "embedding_model_name", None),
             "primary_dimension": getattr(self.primary, "embedding_dimension", None),
             "primary_last_error": self.primary_last_error,
