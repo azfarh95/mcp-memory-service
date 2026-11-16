@@ -82,7 +82,7 @@ class RetrieveMixin:
                 return []
 
             try:
-                query_embedding = self._generate_embedding(query, input_type="query")
+                query_embedding = self._embed_text(query, input_type="query")
             except Exception as e:
                 logger.error("Failed to generate query embedding: %s", _sanitize_log_value(e))
                 return []
@@ -1278,7 +1278,7 @@ class RetrieveMixin:
 
             if query and self.embedding_model:
                 try:
-                    query_embedding = self._generate_embedding(query, input_type="query")
+                    query_embedding = self._embed_text(query, input_type="query")
 
                     # Filter eligible rows inside KNN so excluded neighbors do not consume k.
                     memory_filter = "deleted_at IS NULL AND (embedding_pending IS NULL OR embedding_pending = 0)"

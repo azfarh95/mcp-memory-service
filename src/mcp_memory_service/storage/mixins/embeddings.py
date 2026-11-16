@@ -1,6 +1,7 @@
 """EmbeddingsMixin: embedding model initialization, generation, and fallback."""
 
 import hashlib
+import inspect
 import logging
 import math
 import os
@@ -577,6 +578,24 @@ class EmbeddingsMixin:
         # with the fallback's pseudo-vectors in the shared cache (Greptile #1367).
         self._embedding_cache_namespace = f"__hash_fallback__::{self.embedding_dimension}"
         self.embedding_backend_degraded = True
+
+    def _embed_text(self, text: str, input_type: str = "document") -> List[float]:
+        """Call _generate_embedding with input_type, tolerating overrides that predate it.
+
+        Tests and third-party backends monkeypatch `_generate_embedding` with the older
+        one-argument signature; passing the keyword unconditionally raised
+        "got an unexpected keyword argument 'input_type'" and broke semantic dedup
+        (CI, 2026-11-16). Inspect the actual callable rather than guessing from a
+        TypeError, which could also come from inside the embedding call.
+        """
+        func = self._generate_embedding
+        try:
+            accepts = "input_type" in inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            accepts = False
+        if accepts:
+            return func(text, input_type=input_type)
+        return func(text)
 
     def _generate_embedding(self, text: str, input_type: str = "document") -> List[float]:
         """Generate embedding for text.
